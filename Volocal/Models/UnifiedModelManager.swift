@@ -9,6 +9,8 @@ private let selectedLLMKey = "volocal.selectedLLM.spec"
 private let selectedSTTKey = "volocal.selectedSTT.engine"
 private let selectedTTSKey = "volocal.selectedTTS.engine"
 private let selectedTTSVoiceKey = "volocal.selectedTTS.voice"
+private let instructionsKey = "volocal.customInstructions"
+private let contextSizeKey = "volocal.contextSize"
 private let onboardedKey = "volocal.hasCompletedOnboarding"
 
 /// Unified model manager tracking download state for STT, TTS, and the selected GGUF.
@@ -20,6 +22,8 @@ final class UnifiedModelManager: ObservableObject {
     @Published var selectedSTT: STTEngine
     @Published var selectedTTS: TTSEngine
     @Published var selectedTTSVoice: String
+    @Published var customInstructions: String
+    @Published var contextSize: UInt32
     @Published var hasCompletedOnboarding: Bool
 
     enum ModelState: Equatable {
@@ -74,6 +78,14 @@ final class UnifiedModelManager: ObservableObject {
         } else {
             selectedTTSVoice = selectedTTS.defaultVoice
         }
+        if let saved = UserDefaults.standard.string(forKey: instructionsKey),
+           !saved.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            customInstructions = saved
+        } else {
+            customInstructions = LLMManager.defaultInstructions
+        }
+        let storedCtx = UInt32(UserDefaults.standard.integer(forKey: contextSizeKey))
+        contextSize = (storedCtx == 4096) ? 4096 : 2048
         hasCompletedOnboarding = UserDefaults.standard.bool(forKey: onboardedKey)
         checkExistingModels()
     }
@@ -85,6 +97,8 @@ final class UnifiedModelManager: ObservableObject {
         UserDefaults.standard.set(selectedSTT.rawValue, forKey: selectedSTTKey)
         UserDefaults.standard.set(selectedTTS.rawValue, forKey: selectedTTSKey)
         UserDefaults.standard.set(selectedTTSVoice, forKey: selectedTTSVoiceKey)
+        UserDefaults.standard.set(customInstructions, forKey: instructionsKey)
+        UserDefaults.standard.set(Int(contextSize), forKey: contextSizeKey)
         checkExistingModels()
     }
 
@@ -118,6 +132,40 @@ final class UnifiedModelManager: ObservableObject {
         guard selectedTTS.voiceNames.contains(name), name != selectedTTSVoice else { return }
         selectedTTSVoice = name
         persistSelection()
+    }
+
+    func setInstructions(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        customInstructions = trimmed.isEmpty ? LLMManager.defaultInstructions : text
+        persistSelection()
+    }
+
+    func setContextSize(_ size: UInt32) {
+        let clamped: UInt32 = size >= 4096 ? 4096 : 2048
+        guard clamped != contextSize else { return }
+        contextSize = clamped
+        persistSelection()
+    }
+
+    func deleteLLM(_ spec: LLMModelSpec) {
+        let url = spec.localURL
+        try? FileManager.default.removeItem(at: url)
+        let parent = url.deletingLastPathComponent()
+        if parent.lastPathComponent != "models",
+           let leftover = try? FileManager.default.contentsOfDirectory(atPath: parent.path),
+           leftover.isEmpty {
+            try? FileManager.default.removeItem(at: parent)
+        }
+        if selectedLLM.id == spec.id || selectedLLM.filename == spec.filename {
+            let remaining = installedLLMSpecs().filter { $0.id != spec.id }
+            selectedLLM = remaining.first ?? .default
+        }
+        persistSelection()
+        objectWillChange.send()
+    }
+
+    func deleteSelectedLLM() {
+        deleteLLM(selectedLLM)
     }
 
     func checkExistingModels() {
@@ -400,11 +448,6 @@ final class UnifiedModelManager: ObservableObject {
             self.error = "TTS download failed: \(error.localizedDescription)"
             logger.error("TTS download failed: \(error.localizedDescription)")
         }
-    }
-
-    func deleteSelectedLLM() {
-        try? FileManager.default.removeItem(at: selectedLLM.localURL)
-        checkExistingModels()
     }
 }
 

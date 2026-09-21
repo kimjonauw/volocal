@@ -57,6 +57,8 @@ targets:
         CFBundleExecutable: $(EXECUTABLE_NAME)
         UILaunchScreen: {}
         LSRequiresIPhoneOS: true
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
         UIRequiredDeviceCapabilities:
           - arm64
         UISupportedInterfaceOrientations:

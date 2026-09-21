@@ -26,18 +26,21 @@ final class LLMManager: ObservableObject {
     private var llamaContext: LlamaContext?
     private var generationTask: Task<Void, Never>?
 
-    private let systemPrompt = """
+    static let defaultInstructions = """
     You are Volocal, a helpful voice assistant running entirely on-device. \
     Keep replies to 1-2 short spoken sentences. No markdown, lists, or inner monologue. \
     Answer immediately.
     """
+
+    var systemPrompt: String = LLMManager.defaultInstructions
+    var contextSize: UInt32 = 2048
 
     init() {}
 
     func loadModel(path: String, displayName: String? = nil) async throws {
         unload()
         await Task.yield()
-        llamaContext = try LlamaContext.create(path: path, contextSize: 2048)
+        llamaContext = try LlamaContext.create(path: path, contextSize: contextSize)
         loadedModelName = displayName ?? URL(fileURLWithPath: path).lastPathComponent
     }
 

@@ -16,6 +16,8 @@ Pick any Hugging Face GGUF for the language model, and swap STT/TTS engines. Git
 - Real-time voice conversations with interrupt (barge-in)
 - Hardware echo cancellation so the mic doesn't pick up its own output
 - Pick any llama.cpp **GGUF** from Hugging Face
+- Custom conversation instructions (system prompt) and a 2048/4096 token context window
+- Swipe-delete unused GGUFs on the phone
 - Pick STT (Parakeet EOU 160/320 or Nemotron 560) and TTS (PocketTTS v2.1 or Kokoro ANE)
 - First-launch downloads from Hugging Face with per-model progress
 
@@ -48,6 +50,14 @@ STT on [FluidAudio](https://github.com/FluidInference/FluidAudio) (CoreML / Neur
 One shared `AVAudioEngine` for both STT input and TTS output, with Voice Processing AEC enabled on both nodes. This is what lets barge-in work — the mic stays open during playback and the hardware cancels the echo, so there is no need to mute the mic while speaking.
 
 Runtime memory: ~1.2 GB with the small default stack. Larger GGUFs need `increased-memory-limit` (entitlement + GetMoreRAM). That raises the process cap; it does not add physical RAM.
+
+### Your context, window size, deleting GGUFs
+
+Open the language-model screen (CPU icon). Three things live there:
+
+- **Your context / instructions** — this is the system prompt sent every turn. Edit it with who you are, how it should talk, or facts to remember. It applies on the next reply; the GGUF does not reload. Tap **Reset to default** to restore the short spoken-assistant prompt.
+- **Context window** — llama.cpp `n_ctx`, default **2048** tokens. That is how much of (instructions + recent chat) fits in one generation. **4096** remembers more of the same turn but uses more RAM (jetsam risk in LiveContainer). Chat history is still trimmed to the last **4 exchanges** (~8 messages) so a long thread cannot blow the window. Changing 2048/4096 reloads the model.
+- **Delete GGUFs** — swipe left on **On this iPhone** (or Files → On My iPhone → Volocal → `models`, when the IPA is a normal install). LiveContainer guests should swipe-delete in-app. Speech models stay in the FluidAudio cache until you delete the whole app.
 
 ## Privacy / network
 

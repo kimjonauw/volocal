@@ -75,7 +75,9 @@ final class VoicePipeline: ObservableObject {
         displayName: String? = nil,
         stt: STTEngine = .parakeetEou320,
         tts: TTSEngine = .pocketTts,
-        ttsVoice: String? = nil
+        ttsVoice: String? = nil,
+        instructions: String? = nil,
+        contextSize: UInt32 = 2048
     ) async {
         configureGeneration += 1
         let gen = configureGeneration
@@ -105,6 +107,8 @@ final class VoicePipeline: ObservableObject {
             loadingStatus = nil
             return
         }
+        applyInstructions(instructions ?? LLMManager.defaultInstructions)
+        llmManager.contextSize = contextSize >= 4096 ? 4096 : 2048
         metrics?.beginTracking("LLM (llama.cpp)")
         do {
             try await llmManager.loadModel(path: path, displayName: displayName ?? URL(fileURLWithPath: path).lastPathComponent)
@@ -134,6 +138,11 @@ final class VoicePipeline: ObservableObject {
 
     func setTTSVoice(_ name: String) {
         ttsManager.selectedVoice = name
+    }
+
+    func applyInstructions(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        llmManager.systemPrompt = trimmed.isEmpty ? LLMManager.defaultInstructions : text
     }
 
     func invalidateForReload() {

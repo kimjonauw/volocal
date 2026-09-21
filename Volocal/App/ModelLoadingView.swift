@@ -54,10 +54,17 @@ struct ModelLoadingView: View {
         }
         .frame(maxWidth: .infinity)
         .sheet(isPresented: $showLLMPicker) {
-            LLMPickerView { _ in
-                pipeline.invalidateForReload()
-                Task { await load() }
-            }
+            LLMPickerView(
+                onModelReady: { _ in
+                    pipeline.invalidateForReload()
+                    Task { await load() }
+                },
+                onInstructionsChanged: { pipeline.applyInstructions($0) },
+                onNeedsReload: {
+                    pipeline.invalidateForReload()
+                    Task { await load() }
+                }
+            )
             .environmentObject(modelManager)
         }
         .sheet(isPresented: $showVoicePicker) {
@@ -83,7 +90,9 @@ struct ModelLoadingView: View {
             displayName: modelManager.selectedLLM.displayName,
             stt: modelManager.selectedSTT,
             tts: modelManager.selectedTTS,
-            ttsVoice: modelManager.selectedTTSVoice
+            ttsVoice: modelManager.selectedTTSVoice,
+            instructions: modelManager.customInstructions,
+            contextSize: modelManager.contextSize
         )
     }
 }

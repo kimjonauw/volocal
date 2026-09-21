@@ -5,6 +5,8 @@ struct LLMPickerView: View {
     @Environment(\.dismiss) private var dismiss
 
     var onModelReady: ((LLMModelSpec) -> Void)?
+    var onInstructionsChanged: ((String) -> Void)?
+    var onNeedsReload: (() -> Void)?
 
     @State private var searchText = ""
     @State private var repoHits: [HuggingFaceHub.RepoHit] = []
@@ -15,6 +17,7 @@ struct LLMPickerView: View {
     @State private var pasteText = ""
     @State private var localError: String?
     @State private var searchGeneration = 0
+    @State private var instructionsDraft = ""
 
     var body: some View {
         NavigationStack {
@@ -33,6 +36,8 @@ struct LLMPickerView: View {
                         .foregroundStyle(.secondary)
                 }
 
+                instructionsSection
+                contextSection
                 installedSection
                 suggestedSection
                 pasteSection
@@ -48,11 +53,61 @@ struct LLMPickerView: View {
             .onChange(of: searchText) { _, newValue in
                 scheduleSearch(newValue)
             }
+            .onAppear {
+                instructionsDraft = modelManager.customInstructions
+                modelManager.checkExistingModels()
+            }
+            .onDisappear {
+                saveInstructions()
+            }
         }
     }
 
+    private var instructionsSection: some View {
+        Section {
+            TextEditor(text: $instructionsDraft)
+                .frame(minHeight: 120)
+                .font(.body)
+            Button("Reset to default") {
+                instructionsDraft = LLMManager.defaultInstructions
+            }
+            .font(.caption)
+        } header: {
+            Text("Your context / instructions")
+        } footer: {
+            Text("Sent as the system prompt on every turn. Use this for who you are, how it should talk, or facts it should remember. Takes effect on the next reply — no reload.")
+        }
+    }
+
+    private var contextSection: some View {
+        Section {
+            Picker("Tokens", selection: contextSizeBinding) {
+                Text("2048").tag(UInt32(2048))
+                Text("4096").tag(UInt32(4096))
+            }
+            .pickerStyle(.segmented)
+        } header: {
+            Text("Context window")
+        } footer: {
+            Text("llama.cpp n_ctx: how many tokens of instructions + recent chat fit in one pass. 2048 is the default (~1.2 GB stack). 4096 remembers more but uses more RAM and can jetsam inside LiveContainer. Chat history is still trimmed to the last 4 exchanges. Changing this reloads the GGUF.")
+        }
+    }
+
+    private var contextSizeBinding: Binding<UInt32> {
+        Binding(
+            get: { modelManager.contextSize },
+            set: { newValue in
+                let previous = modelManager.contextSize
+                modelManager.setContextSize(newValue)
+                if modelManager.contextSize != previous {
+                    onNeedsReload?()
+                }
+            }
+        )
+    }
+
     private var installedSection: some View {
-        Section("On this iPhone") {
+        Section {
             let installed = modelManager.installedLLMSpecs()
             if installed.isEmpty {
                 Text("None yet")
@@ -60,8 +115,26 @@ struct LLMPickerView: View {
             } else {
                 ForEach(installed) { spec in
                     modelRow(spec, trailing: spec.isDownloaded ? "Ready" : nil)
+                        .buttonStyle(.plain)
+                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                            Button(role: .destructive) {
+                                deleteInstalled(spec)
+                            } label: {
+                                Label("Delete", systemImage: "trash")
+                            }
+                        }
+                }
+                .onDelete { offsets in
+                    let specs = modelManager.installedLLMSpecs()
+                    for index in offsets where specs.indices.contains(index) {
+                        deleteInstalled(specs[index])
+                    }
                 }
             }
+        } header: {
+            Text("On this iPhone")
+        } footer: {
+            Text("Swipe left to delete a GGUF and free disk. Files app → On My iPhone → Volocal → models also works if this IPA is a normal install; LiveContainer guests should use swipe-delete here. STT/TTS packs stay in the FluidAudio cache until you delete the app.")
         }
     }
 
@@ -164,6 +237,20 @@ struct LLMPickerView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+        }
+    }
+
+    private func saveInstructions() {
+        modelManager.setInstructions(instructionsDraft)
+        onInstructionsChanged?(modelManager.customInstructions)
+    }
+
+    private func deleteInstalled(_ spec: LLMModelSpec) {
+        let wasSelected = modelManager.selectedLLM.id == spec.id
+            || modelManager.selectedLLM.filename == spec.filename
+        modelManager.deleteLLM(spec)
+        if wasSelected {
+            onNeedsReload?()
         }
     }
 

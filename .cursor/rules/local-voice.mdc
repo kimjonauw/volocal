@@ -15,3 +15,4 @@ Full context: `AGENTS.md`. Trust review: `docs/SECURITY.md`.
 - `project.yml` is the XcodeGen source of truth. FluidAudio is FluidInference **exact 0.15.8** (`ModelHub`, not `DownloadUtils`). llama.swift is **exact 2.10549.0**.
 - No local Mac: ship IPAs via `.github/workflows/ios-ipa.yml` as a rolling GitHub Release (`sidestore` / `Volocal.ipa`). Do not compile iOS on Linux. Do not accumulate Actions artifact zips.
 - Do not commit model weights, IPAs, or secrets.
+- System prompt is user-editable (`volocal.customInstructions`). llama.cpp `n_ctx` is 2048 or 4096 (`volocal.contextSize`), not a free-form number. GGUF delete is in-app swipe; do not leave orphan huge files with no UI.
