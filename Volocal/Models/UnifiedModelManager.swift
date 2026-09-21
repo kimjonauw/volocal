@@ -18,13 +18,13 @@ private let onboardedKey = "volocal.hasCompletedOnboarding"
 final class UnifiedModelManager: ObservableObject {
     @Published var modelStates: [ModelRegistry.ModelType: ModelState] = [:]
     @Published var error: String?
-    @Published var selectedLLM: LLMModelSpec
-    @Published var selectedSTT: STTEngine
-    @Published var selectedTTS: TTSEngine
-    @Published var selectedTTSVoice: String
-    @Published var customInstructions: String
-    @Published var contextSize: UInt32
-    @Published var hasCompletedOnboarding: Bool
+    @Published var selectedLLM: LLMModelSpec = .default
+    @Published var selectedSTT: STTEngine = .parakeetEou320
+    @Published var selectedTTS: TTSEngine = .pocketTts
+    @Published var selectedTTSVoice: String = TTSEngine.pocketTts.defaultVoice
+    @Published var customInstructions: String = LLMManager.defaultInstructions
+    @Published var contextSize: UInt32 = 2048
+    @Published var hasCompletedOnboarding: Bool = false
 
     enum ModelState: Equatable {
         case notDownloaded
