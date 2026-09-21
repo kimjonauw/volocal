@@ -1,9 +1,8 @@
 import Foundation
 
-/// Central registry of all models used by Volocal.
-/// Defines metadata, download sources, and local paths.
+/// Paths and labels for the on-device model stack.
+/// The LLM itself is not hardcoded here — see `LLMModelSpec` / `UnifiedModelManager.selectedLLM`.
 enum ModelRegistry {
-    /// All model types used in the app
     enum ModelType: String, CaseIterable, Identifiable {
         case llm
         case stt
@@ -29,32 +28,20 @@ enum ModelRegistry {
 
         var sizeDescription: String {
             switch self {
-            case .llm: return "~1.26 GB"
-            case .stt: return "~450 MB"
-            case .tts: return "~600 MB"
+            case .llm: return "GGUF from Hugging Face"
+            case .stt: return "On-device ASR"
+            case .tts: return "On-device voice"
             }
         }
 
         var detail: String {
             switch self {
-            case .llm: return "Qwen3.5-2B Q4_K_S"
-            case .stt: return "Parakeet EOU 320"
-            case .tts: return "PocketTTS"
+            case .llm: return "Any llama.cpp GGUF"
+            case .stt: return "Parakeet EOU or Nemotron"
+            case .tts: return "PocketTTS v2.1 or Kokoro"
             }
         }
     }
-
-    // MARK: - LLM
-
-    static let llmFilename = "Qwen_Qwen3.5-2B-Q4_K_S.gguf"
-
-    static let llmBaseURL = "https://huggingface.co/bartowski/Qwen_Qwen3.5-2B-GGUF/resolve/main"
-
-    static var llmDownloadURL: String {
-        "\(llmBaseURL)/\(llmFilename)"
-    }
-
-    // MARK: - Paths
 
     static var modelsDirectory: URL {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
@@ -63,12 +50,9 @@ enum ModelRegistry {
         return dir
     }
 
-    static var llmModelPath: String? {
-        let path = modelsDirectory.appendingPathComponent(llmFilename).path
-        guard FileManager.default.fileExists(atPath: path),
-              let attrs = try? FileManager.default.attributesOfItem(atPath: path),
-              let size = attrs[.size] as? UInt64,
-              size > 1024 else { return nil }
-        return path
+    static var llmDirectory: URL {
+        let dir = modelsDirectory.appendingPathComponent("llm", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
     }
 }

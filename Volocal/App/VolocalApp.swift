@@ -9,7 +9,7 @@ struct VolocalApp: App {
 
     var body: some Scene {
         WindowGroup {
-            if !modelManager.allModelsReady {
+            if !modelManager.hasCompletedOnboarding {
                 OnboardingView()
                     .environmentObject(modelManager)
             } else if !pipeline.isReady {
@@ -19,7 +19,10 @@ struct VolocalApp: App {
                         pipeline.metrics = metrics
                         metrics.startMonitoring()
                         await pipeline.configure(
-                            llmModelPath: modelManager.llmModelPath
+                            llmModelPath: modelManager.llmModelPath,
+                            displayName: modelManager.selectedLLM.displayName,
+                            stt: modelManager.selectedSTT,
+                            tts: modelManager.selectedTTS
                         )
                     }
             } else {

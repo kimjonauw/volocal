@@ -4,6 +4,8 @@ import SwiftUI
 struct OnboardingView: View {
     @EnvironmentObject var modelManager: UnifiedModelManager
     @State private var isDownloading = false
+    @State private var showLLMPicker = false
+    @State private var showVoicePicker = false
 
     var body: some View {
         NavigationStack {
@@ -30,16 +32,27 @@ struct OnboardingView: View {
                         ModelStatusCard(
                             type: type,
                             state: modelManager.modelStates[type] ?? .notDownloaded,
+                            subtitle: subtitle(for: type),
                             onRetry: {
                                 Task { await modelManager.retryModel(type) }
                             }
                         )
                     }
+
+                    Button("Choose a different GGUF…") {
+                        showLLMPicker = true
+                    }
+                    .font(.subheadline)
+
+                    Button("Change speech or voice engine…") {
+                        showVoicePicker = true
+                    }
+                    .font(.subheadline)
                 }
                 .padding(.horizontal)
 
                 // Wi-Fi recommendation
-                Text("Recommended: download over Wi-Fi (~2.3 GB total)")
+                Text("Recommended: Wi-Fi for first download. STT + TTS ~1 GB, plus whatever GGUF you pick.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -76,9 +89,31 @@ struct OnboardingView: View {
                         .padding(.horizontal)
                 }
 
+                Text("Speech + voice stay local. The language model is any GGUF you pull from Hugging Face.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+
                 Spacer().frame(height: 20)
             }
             .navigationTitle("")
+            .sheet(isPresented: $showLLMPicker) {
+                LLMPickerView()
+                    .environmentObject(modelManager)
+            }
+            .sheet(isPresented: $showVoicePicker) {
+                VoiceEnginePickerView()
+                    .environmentObject(modelManager)
+            }
+        }
+    }
+
+    private func subtitle(for type: ModelRegistry.ModelType) -> String {
+        switch type {
+        case .llm: return modelManager.selectedLLM.displayName
+        case .stt: return modelManager.selectedSTT.displayName
+        case .tts: return modelManager.selectedTTS.displayName
         }
     }
 }
@@ -88,6 +123,7 @@ struct OnboardingView: View {
 struct ModelStatusCard: View {
     let type: ModelRegistry.ModelType
     let state: UnifiedModelManager.ModelState
+    var subtitle: String?
     var onRetry: (() -> Void)?
 
     var body: some View {
@@ -103,6 +139,13 @@ struct ModelStatusCard: View {
                         .font(.body.weight(.medium))
                     Spacer()
                     statusLabel
+                }
+
+                if let subtitle {
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
 
                 if case .downloading(let progress) = state {

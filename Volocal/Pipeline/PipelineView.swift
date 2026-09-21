@@ -3,6 +3,9 @@ import SwiftUI
 struct PipelineView: View {
     @EnvironmentObject var metrics: SystemMetrics
     @EnvironmentObject var pipeline: VoicePipeline
+    @EnvironmentObject var modelManager: UnifiedModelManager
+    @State private var showLLMPicker = false
+    @State private var showVoicePicker = false
 
     var body: some View {
         NavigationStack {
@@ -48,6 +51,16 @@ struct PipelineView: View {
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
 
+                    Text(modelManager.selectedLLM.displayName)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+
+                    Text("\(modelManager.selectedSTT.displayName) · \(modelManager.selectedTTS.displayName)")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+
                     // Current transcript while listening (uses pipeline.partialTranscript)
                     if pipeline.state == .listening && !pipeline.partialTranscript.isEmpty {
                         Text(pipeline.partialTranscript)
@@ -84,6 +97,22 @@ struct PipelineView: View {
             }
             .navigationTitle("Volocal")
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        showLLMPicker = true
+                    } label: {
+                        Image(systemName: "cpu")
+                    }
+                    .accessibilityLabel("Change language model")
+                }
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        showVoicePicker = true
+                    } label: {
+                        Image(systemName: "waveform")
+                    }
+                    .accessibilityLabel("Change speech and voice engines")
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         pipeline.resetChat()
@@ -92,6 +121,24 @@ struct PipelineView: View {
                     }
                     .disabled(pipeline.conversationHistory.isEmpty)
                 }
+            }
+            .sheet(isPresented: $showLLMPicker) {
+                LLMPickerView { spec in
+                    guard let path = spec.isDownloaded ? spec.localURL.path : modelManager.llmModelPath else { return }
+                    Task {
+                        await pipeline.reloadLanguageModel(
+                            path: path,
+                            displayName: spec.displayName
+                        )
+                    }
+                }
+                .environmentObject(modelManager)
+            }
+            .sheet(isPresented: $showVoicePicker) {
+                VoiceEnginePickerView {
+                    pipeline.invalidateForReload()
+                }
+                .environmentObject(modelManager)
             }
         }
     }

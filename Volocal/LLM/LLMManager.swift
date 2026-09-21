@@ -4,12 +4,14 @@ import os
 private let logger = Logger(subsystem: "com.volocal.app", category: "llm")
 
 /// Manages LLM inference using llama.cpp via the LlamaContext actor.
+/// Prompt formatting comes from the loaded GGUF, not a hardcoded model family.
 @MainActor
 final class LLMManager: ObservableObject {
     @Published var response: String = ""
     @Published var isGenerating: Bool = false
     @Published var error: String?
     @Published var tokensPerSecond: Double = 0
+    @Published var loadedModelName: String?
 
     private var llamaContext: LlamaContext?
     private var generationTask: Task<Void, Never>?
@@ -23,14 +25,21 @@ final class LLMManager: ObservableObject {
 
     init() {}
 
-    func loadModel(path: String) async throws {
-        llamaContext = try LlamaContext.create(path: path, contextSize: 2048)
+    func loadModel(path: String, displayName: String? = nil) async throws {
+        unload()
+        llamaContext = try LlamaContext.create(path: path, contextSize: 4096)
+        loadedModelName = displayName ?? URL(fileURLWithPath: path).lastPathComponent
+    }
+
+    func unload() {
+        stopGeneration()
+        llamaContext = nil
+        loadedModelName = nil
     }
 
     /// Generate response from conversation history.
     /// History should already contain the latest user message.
     func generate(history: [ConversationMessage] = []) -> AsyncStream<String> {
-        // Cancel any previous generation first
         generationTask?.cancel()
         generationTask = nil
 
@@ -47,19 +56,16 @@ final class LLMManager: ObservableObject {
                     self.tokensPerSecond = 0
                 }
 
-                // Build multi-turn ChatML prompt from history
-                var fullPrompt = "<|im_start|>system\n\(systemPrompt)<|im_end|>\n"
-                for message in history {
-                    let role = message.role == .user ? "user" : "assistant"
-                    fullPrompt += "<|im_start|>\(role)\n\(message.text)<|im_end|>\n"
+                let turns: [(role: String, content: String)] = history.map {
+                    ($0.role == .user ? "user" : "assistant", $0.text)
                 }
-                // Pre-fill past <think> block to force non-thinking mode
-                fullPrompt += "<|im_start|>assistant\n<think>\n</think>\n"
 
                 let startTime = CFAbsoluteTimeGetCurrent()
                 var tokenCount = 0
+                var thinkFilter = ThinkTagFilter()
 
                 do {
+                    let fullPrompt = try await ctx.formatChat(system: systemPrompt, history: turns)
                     await ctx.clear()
                     try await ctx.completionInit(text: fullPrompt)
 
@@ -67,25 +73,27 @@ final class LLMManager: ObservableObject {
                         guard let token = await ctx.completionLoop() else { break }
 
                         tokenCount += 1
-
                         let elapsed = CFAbsoluteTimeGetCurrent() - startTime
                         let tps = elapsed > 0 ? Double(tokenCount) / elapsed : 0
 
-                        #if DEBUG
-                        let hex = token.utf8.map { String(format: "%02x", $0) }.joined(separator: " ")
-                        logger.debug("token[\(tokenCount)]: \"\(token)\" hex=[\(hex)]")
-                        #endif
+                        let spoken = thinkFilter.push(token)
+                        guard !spoken.isEmpty else {
+                            await MainActor.run { self.tokensPerSecond = tps }
+                            continue
+                        }
 
-                        // Strip non-ASCII characters
-                        let cleaned = String(token.unicodeScalars.filter { $0.isASCII })
-                        guard !cleaned.isEmpty else { continue }
-
-                        continuation.yield(cleaned)
+                        continuation.yield(spoken)
 
                         await MainActor.run {
-                            self.response += cleaned
+                            self.response += spoken
                             self.tokensPerSecond = tps
                         }
+                    }
+
+                    let tail = thinkFilter.flush()
+                    if !tail.isEmpty {
+                        continuation.yield(tail)
+                        await MainActor.run { self.response += tail }
                     }
                 } catch {
                     await MainActor.run {

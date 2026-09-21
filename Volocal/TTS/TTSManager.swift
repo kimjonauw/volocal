@@ -5,15 +5,17 @@ import os
 
 private let logger = Logger(subsystem: "com.volocal.app", category: "tts")
 
-/// Wraps FluidAudio's PocketTtsManager for on-device streaming text-to-speech.
+/// Wraps FluidAudio TTS (streaming PocketTTS or batched Kokoro ANE).
 /// Uses SharedAudioEngine for audio output instead of creating its own AVAudioEngine.
 @MainActor
 final class TTSManager: ObservableObject {
     @Published var isSpeaking: Bool = false
-    @Published var selectedVoice: String = "alba"
+    @Published var selectedVoice: String = PocketTtsConstants.defaultVoice
     @Published var error: String?
+    @Published private(set) var engineKind: TTSEngine = .pocketTts
 
-    private var engine: PocketTtsManager?
+    private var pocket: PocketTtsManager?
+    private var kokoro: KokoroAneManager?
     private var speakTask: Task<Void, Never>?
     private var hasTrackedFirstInference = false
     var metrics: SystemMetrics?
@@ -21,34 +23,48 @@ final class TTSManager: ObservableObject {
     /// Shared audio engine — injected by VoicePipeline
     weak var sharedAudio: SharedAudioEngine?
 
-    static let voiceNames = [
-        "alba", "marius", "javert", "jean",
-        "fantine", "cosette", "eponine", "azelma"
-    ]
+    var voiceNames: [String] { engineKind.voiceNames }
 
     init() {}
 
-    /// Initialize the TTS engine. Downloads CoreML models on first use,
+    /// Initialize the selected TTS engine. Downloads CoreML models on first use,
     /// then runs a dummy generation to warm up.
-    func initialize() async {
-        do {
-            let manager = PocketTtsManager()
-            try await manager.initialize()
-            self.engine = manager
+    func initialize(engine: TTSEngine) async {
+        stop()
+        pocket = nil
+        kokoro = nil
+        engineKind = engine
+        selectedVoice = engine.defaultVoice
+        error = nil
 
-            // Warm up: force CoreML to compile models
-            logger.info("TTS warmup: running dummy generation...")
-            let stream = try await manager.synthesizeStreaming(text: "Hi", voice: "alba")
-            for try await _ in stream {
-                break // One frame is enough
+        do {
+            switch engine {
+            case .pocketTts:
+                let manager = PocketTtsManager(
+                    defaultVoice: engine.defaultVoice,
+                    language: .english,
+                    placement: .gpu
+                )
+                try await manager.initialize()
+                self.pocket = manager
+                logger.info("TTS warmup: PocketTTS dummy generation…")
+                let stream = try await manager.synthesizeStreaming(text: "Hi", voice: selectedVoice)
+                for try await _ in stream { break }
+            case .kokoroAne:
+                let manager = KokoroAneManager(variant: .english, defaultVoice: engine.defaultVoice)
+                try await manager.initialize()
+                self.kokoro = manager
+                logger.info("TTS warmup: Kokoro dummy generation…")
+                _ = try await manager.synthesizeDetailed(text: "Hi", voice: selectedVoice)
             }
-            logger.info("TTS warmup done")
+            logger.info("TTS warmup done (\(engine.displayName))")
         } catch {
             self.error = "TTS init failed: \(error.localizedDescription)"
+            logger.error("TTS init failed: \(error.localizedDescription)")
         }
     }
 
-    /// Synthesize text via streaming and play frames through shared audio engine.
+    /// Synthesize text and play through the shared audio engine.
     func speak(_ text: String) async {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
 
@@ -60,9 +76,6 @@ final class TTSManager: ObservableObject {
         let speakTimeout: TimeInterval = 30
         let task = Task {
             do {
-                guard let engine = engine else {
-                    throw TTSError.engineNotLoaded
-                }
                 guard let sharedAudio else {
                     throw TTSError.noSharedAudio
                 }
@@ -70,33 +83,37 @@ final class TTSManager: ObservableObject {
                 logger.info("speak start: \"\(text)\"")
 
                 if !hasTrackedFirstInference {
-                    metrics?.beginTracking("TTS (PocketTTS)")
+                    metrics?.beginTracking("TTS (\(self.engineKind.displayName))")
                 }
 
                 let genStart = CFAbsoluteTimeGetCurrent()
                 var chunkCount = 0
 
-                let stream = try await engine.synthesizeStreaming(
-                    text: text,
-                    voice: selectedVoice,
-                    temperature: 0.4
-                )
-
-                for try await frame in stream {
-                    if !hasTrackedFirstInference {
-                        hasTrackedFirstInference = true
-                        metrics?.endTracking("TTS (PocketTTS)")
+                if let pocket {
+                    let stream = try await pocket.synthesizeStreaming(
+                        text: text,
+                        voice: selectedVoice,
+                        temperature: 0.4
+                    )
+                    for try await frame in stream {
+                        self.markFirstInferenceIfNeeded()
+                        if Task.isCancelled { break }
+                        if CFAbsoluteTimeGetCurrent() - genStart > speakTimeout {
+                            logger.warning("speak timeout after \(speakTimeout)s, aborting")
+                            break
+                        }
+                        chunkCount += 1
+                        sharedAudio.scheduleTTSBuffer(frame.samples)
                     }
-                    if Task.isCancelled { break }
-
-                    if CFAbsoluteTimeGetCurrent() - genStart > speakTimeout {
-                        logger.warning("speak timeout after \(speakTimeout)s, aborting")
-                        break
+                } else if let kokoro {
+                    let result = try await kokoro.synthesizeDetailed(text: text, voice: selectedVoice)
+                    self.markFirstInferenceIfNeeded()
+                    if !Task.isCancelled, !result.samples.isEmpty {
+                        chunkCount = 1
+                        sharedAudio.scheduleTTSBuffer(result.samples)
                     }
-
-                    chunkCount += 1
-                    logger.debug("chunk \(chunkCount): \(frame.samples.count) samples")
-                    sharedAudio.scheduleTTSBuffer(frame.samples)
+                } else {
+                    throw TTSError.engineNotLoaded
                 }
 
                 logger.info("speak generation done: \(chunkCount) chunks")
@@ -115,7 +132,6 @@ final class TTSManager: ObservableObject {
             }
             logger.info("speak end")
         }
-        // Set speakTask BEFORE await to avoid race condition (bug #2.10)
         speakTask = task
         await task.value
     }
@@ -126,6 +142,13 @@ final class TTSManager: ObservableObject {
         speakTask = nil
         sharedAudio?.stopPlayback()
         isSpeaking = false
+    }
+
+    private func markFirstInferenceIfNeeded() {
+        if !hasTrackedFirstInference {
+            hasTrackedFirstInference = true
+            metrics?.endTracking("TTS (\(engineKind.displayName))")
+        }
     }
 }
 

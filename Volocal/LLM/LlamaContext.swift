@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import LlamaSwift
 
 // MARK: - Batch Helpers (from official llama.cpp SwiftUI example)
@@ -98,15 +99,39 @@ actor LlamaContext {
         self.batch = llama_batch_init(512, 0, 1)
         self.vocab = llama_model_get_vocab(model)
 
-        // Set up sampler chain per Qwen3.5 recommended non-thinking params
+        // Generic voice-assistant sampling. Not tied to a single model family.
         let sparams = llama_sampler_chain_default_params()
         self.sampling = llama_sampler_chain_init(sparams)!
-        llama_sampler_chain_add(self.sampling, llama_sampler_init_penalties(0, 0, 0, 2.0))  // presence_penalty=2.0
-        llama_sampler_chain_add(self.sampling, llama_sampler_init_top_k(20))
-        llama_sampler_chain_add(self.sampling, llama_sampler_init_top_p(1.0, 1))
-        llama_sampler_chain_add(self.sampling, llama_sampler_init_min_p(0.0, 1))
-        llama_sampler_chain_add(self.sampling, llama_sampler_init_temp(1.0))
+        llama_sampler_chain_add(self.sampling, llama_sampler_init_penalties(64, 1.05, 0.0, 0.0)) // last_n, repeat, freq, present
+        llama_sampler_chain_add(self.sampling, llama_sampler_init_top_k(40))
+        llama_sampler_chain_add(self.sampling, llama_sampler_init_top_p(0.9, 1))
+        llama_sampler_chain_add(self.sampling, llama_sampler_init_min_p(0.05, 1))
+        llama_sampler_chain_add(self.sampling, llama_sampler_init_temp(0.7))
         llama_sampler_chain_add(self.sampling, llama_sampler_init_dist(1234))
+    }
+
+    /// Format a voice conversation using the GGUF's built-in chat template when
+    /// llama.cpp recognizes it. Falls back to ChatML so Qwen/OpenChat still work.
+    func formatChat(system: String, history: [(role: String, content: String)]) throws -> String {
+        var boxes: [CStringBox] = []
+        boxes.append(CStringBox("system"))
+        boxes.append(CStringBox(system))
+        for turn in history {
+            boxes.append(CStringBox(turn.role))
+            boxes.append(CStringBox(turn.content))
+        }
+
+        var messages: [llama_chat_message] = []
+        messages.reserveCapacity(boxes.count / 2)
+        for i in stride(from: 0, to: boxes.count, by: 2) {
+            messages.append(llama_chat_message(role: boxes[i].ptr, content: boxes[i + 1].ptr))
+        }
+
+        let tmpl = llama_model_chat_template(model, nil)
+        if let formatted = applyChatTemplate(tmpl: tmpl, messages: messages) {
+            return formatted
+        }
+        return ChatMLFallback.format(system: system, history: history)
     }
 
     deinit {
@@ -209,6 +234,61 @@ actor LlamaContext {
         nCur = 0
         nDecode = 0
         isDone = false
+    }
+
+    private func applyChatTemplate(tmpl: UnsafePointer<CChar>?, messages: [llama_chat_message]) -> String? {
+        messages.withUnsafeBufferPointer { buffer in
+            guard let base = buffer.baseAddress else { return nil }
+            var storage = [CChar](repeating: 0, count: 4096)
+            var needed = llama_chat_apply_template(
+                tmpl,
+                base,
+                buffer.count,
+                true,
+                &storage,
+                Int32(storage.count)
+            )
+            if needed < 0 { return nil }
+            if needed >= storage.count {
+                storage = [CChar](repeating: 0, count: Int(needed) + 1)
+                needed = llama_chat_apply_template(
+                    tmpl,
+                    base,
+                    buffer.count,
+                    true,
+                    &storage,
+                    Int32(storage.count)
+                )
+            }
+            guard needed >= 0 else { return nil }
+            return String(cString: storage)
+        }
+    }
+}
+
+private final class CStringBox {
+    let ptr: UnsafeMutablePointer<CChar>
+
+    init(_ string: String) {
+        ptr = strdup(string) ?? {
+            let empty = strdup("")!
+            return empty
+        }()
+    }
+
+    deinit {
+        free(ptr)
+    }
+}
+
+private enum ChatMLFallback {
+    static func format(system: String, history: [(role: String, content: String)]) -> String {
+        var prompt = "<|im_start|>system\n\(system)<|im_end|>\n"
+        for turn in history {
+            prompt += "<|im_start|>\(turn.role)\n\(turn.content)<|im_end|>\n"
+        }
+        prompt += "<|im_start|>assistant\n"
+        return prompt
     }
 }
 

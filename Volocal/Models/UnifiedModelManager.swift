@@ -1,15 +1,24 @@
 import Foundation
+import CryptoKit
 import FluidAudio
 import os
 
 private let logger = Logger(subsystem: "com.volocal.app", category: "models")
 
-/// Unified model manager tracking download state for all 3 models (LLM, STT, TTS).
-/// Downloads LLM from HuggingFace, STT and TTS via FluidAudio with progress.
+private let selectedLLMKey = "volocal.selectedLLM.spec"
+private let selectedSTTKey = "volocal.selectedSTT.engine"
+private let selectedTTSKey = "volocal.selectedTTS.engine"
+private let onboardedKey = "volocal.hasCompletedOnboarding"
+
+/// Unified model manager tracking download state for STT, TTS, and the selected GGUF.
 @MainActor
 final class UnifiedModelManager: ObservableObject {
     @Published var modelStates: [ModelRegistry.ModelType: ModelState] = [:]
     @Published var error: String?
+    @Published var selectedLLM: LLMModelSpec
+    @Published var selectedSTT: STTEngine
+    @Published var selectedTTS: TTSEngine
+    @Published var hasCompletedOnboarding: Bool
 
     enum ModelState: Equatable {
         case notDownloaded
@@ -34,55 +43,87 @@ final class UnifiedModelManager: ObservableObject {
     }
 
     var llmModelPath: String? {
-        ModelRegistry.llmModelPath
+        guard selectedLLM.isDownloaded else { return nil }
+        return selectedLLM.localURL.path
     }
 
     init() {
+        if let data = UserDefaults.standard.data(forKey: selectedLLMKey),
+           let spec = try? JSONDecoder().decode(LLMModelSpec.self, from: data) {
+            selectedLLM = spec
+        } else {
+            selectedLLM = .default
+        }
+        if let raw = UserDefaults.standard.string(forKey: selectedSTTKey),
+           let engine = STTEngine(rawValue: raw) {
+            selectedSTT = engine
+        } else {
+            selectedSTT = .parakeetEou320
+        }
+        if let raw = UserDefaults.standard.string(forKey: selectedTTSKey),
+           let engine = TTSEngine(rawValue: raw) {
+            selectedTTS = engine
+        } else {
+            selectedTTS = .pocketTts
+        }
+        hasCompletedOnboarding = UserDefaults.standard.bool(forKey: onboardedKey)
         checkExistingModels()
     }
 
-    private func checkExistingModels() {
-        // LLM: check if GGUF file exists
-        if ModelRegistry.llmModelPath != nil {
+    func persistSelection() {
+        if let data = try? JSONEncoder().encode(selectedLLM) {
+            UserDefaults.standard.set(data, forKey: selectedLLMKey)
+        }
+        UserDefaults.standard.set(selectedSTT.rawValue, forKey: selectedSTTKey)
+        UserDefaults.standard.set(selectedTTS.rawValue, forKey: selectedTTSKey)
+        checkExistingModels()
+    }
+
+    func select(_ spec: LLMModelSpec) {
+        selectedLLM = spec
+        persistSelection()
+    }
+
+    func selectSTT(_ engine: STTEngine) {
+        guard engine != selectedSTT else { return }
+        selectedSTT = engine
+        persistSelection()
+    }
+
+    func selectTTS(_ engine: TTSEngine) {
+        guard engine != selectedTTS else { return }
+        selectedTTS = engine
+        persistSelection()
+    }
+
+    func checkExistingModels() {
+        if selectedLLM.isDownloaded {
             modelStates[.llm] = .downloaded
         } else {
             modelStates[.llm] = .notDownloaded
         }
 
-        // STT: check if Parakeet EOU models exist
-        let sttDir = ModelRegistry.modelsDirectory.appendingPathComponent(Repo.parakeetEou320.folderName)
-        let encoderPath = sttDir.appendingPathComponent("streaming_encoder.mlmodelc")
-        if FileManager.default.fileExists(atPath: encoderPath.path) {
+        if selectedSTT.isDownloaded(in: FluidAudioCache.asrModelsRoot) {
             modelStates[.stt] = .downloaded
         } else {
             modelStates[.stt] = .notDownloaded
         }
 
-        // TTS: check if PocketTTS models exist in its cache directory
-        if Self.pocketTTSModelsExist() {
+        if selectedTTS.isDownloaded() {
             modelStates[.tts] = .downloaded
         } else {
             modelStates[.tts] = .notDownloaded
         }
+
+        markOnboardedIfReady()
     }
 
-    /// Check if PocketTTS models are cached.
-    /// PocketTTS stores models at ~/Library/Caches/fluidaudio/Models/pocket-tts/
-    private static func pocketTTSModelsExist() -> Bool {
-        guard let cachesDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else {
-            return false
+    private func markOnboardedIfReady() {
+        if allModelsReady {
+            hasCompletedOnboarding = true
+            UserDefaults.standard.set(true, forKey: onboardedKey)
         }
-        let repoDir = cachesDir
-            .appendingPathComponent("fluidaudio")
-            .appendingPathComponent("Models")
-            .appendingPathComponent("pocket-tts")
-
-        // Check for a key model file
-        let condStepPath = repoDir.appendingPathComponent("cond_step.mlmodelc")
-        return FileManager.default.fileExists(atPath: condStepPath.path)
     }
-
-    // MARK: - Download
 
     func downloadAllModels() async {
         await withTaskGroup(of: Void.self) { group in
@@ -95,6 +136,10 @@ final class UnifiedModelManager: ObservableObject {
             if modelStates[.tts]?.isReady != true {
                 group.addTask { await self.downloadTTS() }
             }
+        }
+        if allModelsReady {
+            hasCompletedOnboarding = true
+            UserDefaults.standard.set(true, forKey: onboardedKey)
         }
     }
 
@@ -109,34 +154,75 @@ final class UnifiedModelManager: ObservableObject {
         }
     }
 
-    // MARK: - LLM Download (traditional downloadTask with progress)
+    func downloadSelectedLLM() async {
+        await downloadLLM()
+    }
 
-    /// Known LLM file size for progress fallback (Q4_K_S = 1,261,854,880 bytes).
-    private static let llmExpectedBytes: Int64 = 1_261_854_880
+    func installedLLMSpecs() -> [LLMModelSpec] {
+        var found: [LLMModelSpec] = []
+        let fm = FileManager.default
+
+        if selectedLLM.isDownloaded {
+            found.append(selectedLLM)
+        }
+
+        let llmRoot = ModelRegistry.llmDirectory
+        if let folders = try? fm.contentsOfDirectory(at: llmRoot, includingPropertiesForKeys: nil) {
+            for folder in folders where folder.hasDirectoryPath {
+                if let files = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.fileSizeKey]) {
+                    for file in files where LLMFileFilter.isLoadableGGUF(file.lastPathComponent) {
+                        let repoId = folder.lastPathComponent.replacingOccurrences(of: "__", with: "/")
+                        let size = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize).map { Int64($0) }
+                        let spec = LLMModelSpec(
+                            repoId: repoId,
+                            filename: file.lastPathComponent,
+                            displayName: file.lastPathComponent,
+                            sizeBytes: size,
+                            sha256: nil
+                        )
+                        if !found.contains(where: { $0.id == spec.id }) {
+                            found.append(spec)
+                        }
+                    }
+                }
+            }
+        }
+
+        let legacy = ModelRegistry.modelsDirectory.appendingPathComponent(LLMModelSpec.default.filename)
+        if fm.fileExists(atPath: legacy.path),
+           !found.contains(where: { $0.filename == LLMModelSpec.default.filename }) {
+            found.insert(.default, at: 0)
+        }
+
+        return found
+    }
 
     private func downloadLLM() async {
+        let spec = selectedLLM
         modelStates[.llm] = .downloading(progress: 0)
 
-        let destination = ModelRegistry.modelsDirectory.appendingPathComponent(ModelRegistry.llmFilename)
-
-        if FileManager.default.fileExists(atPath: destination.path) {
+        if spec.isDownloaded {
             modelStates[.llm] = .downloaded
             return
         }
 
-        guard let url = URL(string: ModelRegistry.llmDownloadURL) else {
-            modelStates[.llm] = .error("Invalid URL")
+        guard let url = spec.downloadURL else {
+            modelStates[.llm] = .error("Invalid Hugging Face URL")
             return
         }
 
-        let expectedBytes = Self.llmExpectedBytes
+        let destination = spec.nestedLocalURL
+        try? FileManager.default.createDirectory(
+            at: destination.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
 
-        // Use traditional downloadTask + continuation (not async download API)
-        // because the async API may not reliably call delegate progress methods.
+        let expectedBytes = spec.sizeBytes ?? 0
+
         let result: Result<URL, Error> = await withCheckedContinuation { continuation in
             let delegate = LLMDownloadDelegate(
                 onProgress: { [weak self] bytesWritten, totalExpected in
-                    let total = totalExpected > 0 ? totalExpected : expectedBytes
+                    let total = totalExpected > 0 ? totalExpected : max(expectedBytes, 1)
                     let fraction = Double(bytesWritten) / Double(total)
                     Task { @MainActor in
                         self?.modelStates[.llm] = .downloading(progress: min(fraction, 1.0))
@@ -155,11 +241,14 @@ final class UnifiedModelManager: ObservableObject {
 
             let config = URLSessionConfiguration.default
             config.timeoutIntervalForResource = 3600
+            config.httpAdditionalHeaders = [
+                "User-Agent": "volocal-ios/1.0 (on-device; no-telemetry)"
+            ]
             let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
-            // Store session on delegate to prevent deallocation
             delegate.session = session
 
-            let request = URLRequest(url: url, timeoutInterval: 3600)
+            var request = URLRequest(url: url, timeoutInterval: 3600)
+            request.setValue("volocal-ios/1.0 (on-device; no-telemetry)", forHTTPHeaderField: "User-Agent")
             session.downloadTask(with: request).resume()
         }
 
@@ -167,11 +256,21 @@ final class UnifiedModelManager: ObservableObject {
         case .success(let tempURL):
             do {
                 if FileManager.default.fileExists(atPath: destination.path) {
-                    try? FileManager.default.removeItem(at: destination)
+                    try FileManager.default.removeItem(at: destination)
                 }
                 try FileManager.default.moveItem(at: tempURL, to: destination)
+
+                if let expected = spec.sha256, !expected.isEmpty {
+                    let actual = try Self.sha256Hex(of: destination)
+                    if actual.lowercased() != expected.lowercased() {
+                        try? FileManager.default.removeItem(at: destination)
+                        throw LLMDownloadError.checksumMismatch
+                    }
+                }
+
                 modelStates[.llm] = .downloaded
-                logger.info("LLM downloaded successfully")
+                logger.info("LLM downloaded: \(spec.id)")
+                markOnboardedIfReady()
             } catch {
                 modelStates[.llm] = .error(error.localizedDescription)
                 self.error = "LLM download failed: \(error.localizedDescription)"
@@ -183,19 +282,31 @@ final class UnifiedModelManager: ObservableObject {
         }
     }
 
-    // MARK: - STT Download (FluidAudio with progress)
+    private static func sha256Hex(of url: URL) throws -> String {
+        var hasher = SHA256()
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        while true {
+            let data = handle.readData(ofLength: 1024 * 1024)
+            if data.isEmpty { break }
+            hasher.update(data: data)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
 
     private func downloadSTT() async {
         modelStates[.stt] = .downloading(progress: 0)
+        let engine = selectedSTT
 
         do {
-            try await DownloadUtils.downloadRepo(.parakeetEou320, to: ModelRegistry.modelsDirectory) { [weak self] progress in
+            try await ModelHub.download(engine.repo, to: FluidAudioCache.asrModelsRoot) { [weak self] progress in
                 Task { @MainActor in
                     self?.modelStates[.stt] = .downloading(progress: progress.fractionCompleted)
                 }
             }
             modelStates[.stt] = .downloaded
-            logger.info("STT models downloaded successfully")
+            logger.info("STT models downloaded: \(engine.displayName)")
+            markOnboardedIfReady()
         } catch {
             modelStates[.stt] = .error(error.localizedDescription)
             self.error = "STT download failed: \(error.localizedDescription)"
@@ -203,19 +314,28 @@ final class UnifiedModelManager: ObservableObject {
         }
     }
 
-    // MARK: - TTS Download (FluidAudio PocketTTS with progress)
-
     private func downloadTTS() async {
         modelStates[.tts] = .downloading(progress: 0)
+        let engine = selectedTTS
 
         do {
-            _ = try await PocketTtsResourceDownloader.ensureModels { [weak self] progress in
-                Task { @MainActor in
-                    self?.modelStates[.tts] = .downloading(progress: progress.fractionCompleted)
+            switch engine {
+            case .pocketTts:
+                _ = try await PocketTtsResourceDownloader.ensureModels(language: .english) { [weak self] progress in
+                    Task { @MainActor in
+                        self?.modelStates[.tts] = .downloading(progress: progress.fractionCompleted)
+                    }
+                }
+            case .kokoroAne:
+                _ = try await KokoroAneResourceDownloader.ensureModels(variant: .english) { [weak self] progress in
+                    Task { @MainActor in
+                        self?.modelStates[.tts] = .downloading(progress: progress.fractionCompleted)
+                    }
                 }
             }
             modelStates[.tts] = .downloaded
-            logger.info("TTS models downloaded successfully")
+            logger.info("TTS models downloaded: \(engine.displayName)")
+            markOnboardedIfReady()
         } catch {
             modelStates[.tts] = .error(error.localizedDescription)
             self.error = "TTS download failed: \(error.localizedDescription)"
@@ -223,26 +343,26 @@ final class UnifiedModelManager: ObservableObject {
         }
     }
 
-    // MARK: - Helpers
-
-    func deleteAllModels() {
-        try? FileManager.default.removeItem(at: ModelRegistry.modelsDirectory)
-        try? FileManager.default.createDirectory(at: ModelRegistry.modelsDirectory, withIntermediateDirectories: true)
-        // Also clear PocketTTS cache
-        if let cachesDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first {
-            let ttsCache = cachesDir.appendingPathComponent("fluidaudio")
-            try? FileManager.default.removeItem(at: ttsCache)
-        }
+    func deleteSelectedLLM() {
+        try? FileManager.default.removeItem(at: selectedLLM.localURL)
         checkExistingModels()
     }
 }
 
-// MARK: - URLSession Download Delegate for LLM progress
+enum LLMDownloadError: LocalizedError {
+    case checksumMismatch
+
+    var errorDescription: String? {
+        switch self {
+        case .checksumMismatch:
+            return "Downloaded GGUF failed SHA-256 check. Deleted the file — retry the download."
+        }
+    }
+}
 
 private final class LLMDownloadDelegate: NSObject, URLSessionDownloadDelegate {
     let onProgress: (Int64, Int64) -> Void
     let onComplete: (URL?, Error?) -> Void
-    // Hold session reference to prevent deallocation during download
     var session: URLSession?
     private var hasCompleted = false
 
@@ -269,7 +389,6 @@ private final class LLMDownloadDelegate: NSObject, URLSessionDownloadDelegate {
         downloadTask: URLSessionDownloadTask,
         didFinishDownloadingTo location: URL
     ) {
-        // Copy to temp location before URLSession cleans up
         let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".gguf")
         try? FileManager.default.moveItem(at: location, to: tempURL)
         finish(tempURL: tempURL, error: nil)

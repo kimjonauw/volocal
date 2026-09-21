@@ -61,7 +61,12 @@ final class VoicePipeline: ObservableObject {
 
     var metrics: SystemMetrics?
 
-    func configure(llmModelPath: String?) async {
+    func configure(
+        llmModelPath: String?,
+        displayName: String? = nil,
+        stt: STTEngine = .parakeetEou320,
+        tts: TTSEngine = .pocketTts
+    ) async {
         // Start shared audio engine
         sharedAudio.start()
 
@@ -70,15 +75,20 @@ final class VoicePipeline: ObservableObject {
         ttsManager.sharedAudio = sharedAudio
 
         loadingStatus = "Loading speech recognition..."
-        metrics?.beginTracking("STT (Parakeet EOU)")
-        await sttManager.initialize()
-        metrics?.endTracking("STT (Parakeet EOU)")
+        metrics?.beginTracking("STT (\(stt.displayName))")
+        await sttManager.initialize(engine: stt)
+        metrics?.endTracking("STT (\(stt.displayName))")
+        if let sttError = sttManager.error {
+            currentError = sttError
+            loadingStatus = nil
+            return
+        }
 
         loadingStatus = "Loading language model..."
         if let path = llmModelPath {
             metrics?.beginTracking("LLM (llama.cpp)")
             do {
-                try await llmManager.loadModel(path: path)
+                try await llmManager.loadModel(path: path, displayName: displayName ?? URL(fileURLWithPath: path).lastPathComponent)
             } catch {
                 logger.error("LLM load failed: \(error.localizedDescription)")
                 currentError = "LLM failed to load: \(error.localizedDescription)"
@@ -91,10 +101,49 @@ final class VoicePipeline: ObservableObject {
 
         loadingStatus = "Loading text-to-speech..."
         ttsManager.metrics = metrics
-        await ttsManager.initialize()
+        await ttsManager.initialize(engine: tts)
+        if let ttsError = ttsManager.error {
+            currentError = ttsError
+            loadingStatus = nil
+            return
+        }
 
         loadingStatus = nil
         isReady = true
+    }
+
+    func reloadLanguageModel(path: String, displayName: String?) async {
+        if state == .processing || state == .speaking {
+            interrupt()
+        }
+        resetChat()
+        currentError = nil
+        loadingStatus = "Loading language model..."
+        isReady = false
+        metrics?.beginTracking("LLM (llama.cpp)")
+        do {
+            try await llmManager.loadModel(path: path, displayName: displayName)
+            metrics?.endTracking("LLM (llama.cpp)")
+            loadingStatus = nil
+            isReady = true
+        } catch {
+            logger.error("LLM reload failed: \(error.localizedDescription)")
+            currentError = "LLM failed to load: \(error.localizedDescription)"
+            loadingStatus = nil
+        }
+    }
+
+    /// Drop back to the loading screen so `configure` picks up the current STT/TTS selection.
+    func invalidateForReload() {
+        if state == .processing || state == .speaking {
+            interrupt()
+        }
+        if state == .listening {
+            stopListening()
+        }
+        currentError = nil
+        loadingStatus = "Loading speech recognition..."
+        isReady = false
     }
 
     func toggleListening() {

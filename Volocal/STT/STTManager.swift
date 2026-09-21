@@ -5,8 +5,7 @@ import os
 
 private let logger = Logger(subsystem: "com.volocal.app", category: "stt")
 
-/// Wraps FluidAudio's StreamingEouAsrManager for real-time speech-to-text
-/// with native end-of-utterance detection on Apple Neural Engine.
+/// Wraps FluidAudio streaming ASR (Parakeet EOU or Nemotron) for live speech-to-text.
 /// Uses SharedAudioEngine for mic input instead of creating its own AVAudioEngine.
 @MainActor
 final class STTManager: ObservableObject {
@@ -14,6 +13,7 @@ final class STTManager: ObservableObject {
     @Published var isListening: Bool = false
     @Published var partialResult: String = ""
     @Published var error: String?
+    @Published private(set) var engine: STTEngine = .parakeetEou320
 
     /// Called when a complete utterance is detected (EOU)
     var onUtteranceCompleted: ((String) -> Void)?
@@ -24,9 +24,11 @@ final class STTManager: ObservableObject {
     /// Shared audio engine — injected by VoicePipeline
     weak var sharedAudio: SharedAudioEngine?
 
-    private var asrManager: StreamingEouAsrManager?
+    private var eouManager: StreamingEouAsrManager?
+    private var nemotronManager: StreamingNemotronAsrManager?
     private var hasFiredSpeechDetected = false
     private var isStopping = false
+    private var nemotronDebounceTask: Task<Void, Never>?
 
     /// Serial stream for backpressure — prevents unbounded Task spawning per audio buffer
     private var bufferContinuation: AsyncStream<AVAudioPCMBuffer>.Continuation?
@@ -34,49 +36,25 @@ final class STTManager: ObservableObject {
 
     init() {}
 
-    /// Download Parakeet EOU models from HuggingFace and load into memory.
-    func initialize() async {
+    var isReady: Bool { eouManager != nil || nemotronManager != nil }
+
+    /// Download models from Hugging Face if needed and load into memory.
+    func initialize(engine: STTEngine) async {
+        stopListening()
+        eouManager = nil
+        nemotronManager = nil
+        self.engine = engine
+        error = nil
+
         do {
-            let modelsDir = Self.modelsDirectory()
-            let modelDir = modelsDir.appendingPathComponent(Repo.parakeetEou320.folderName)
-
-            let encoderPath = modelDir.appendingPathComponent("streaming_encoder.mlmodelc")
-            if !FileManager.default.fileExists(atPath: encoderPath.path) {
-                logger.info("Downloading Parakeet EOU models...")
-                try await DownloadUtils.downloadRepo(.parakeetEou320, to: modelsDir)
-                logger.info("Parakeet EOU models downloaded")
+            let asrRoot = FluidAudioCache.asrModelsRoot
+            switch engine {
+            case .parakeetEou320, .parakeetEou160:
+                try await loadParakeet(engine: engine, asrRoot: asrRoot)
+            case .nemotron560:
+                try await loadNemotron(asrRoot: asrRoot)
             }
-
-            let manager = StreamingEouAsrManager(chunkSize: .ms320, eouDebounceMs: 300)
-
-            await manager.setPartialCallback { [weak self] text in
-                Task { @MainActor in
-                    guard let self, !self.isStopping else { return }
-                    self.partialResult = text
-                    let wordCount = text.split(separator: " ").count
-                    if !self.hasFiredSpeechDetected && wordCount >= 2 {
-                        self.hasFiredSpeechDetected = true
-                        self.onSpeechDetected?()
-                    }
-                }
-            }
-
-            await manager.setEouCallback { [weak self] text in
-                Task { @MainActor in
-                    guard let self, !self.isStopping else { return }
-                    let finalText = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !finalText.isEmpty else { return }
-                    self.transcript = finalText
-                    self.partialResult = ""
-                    self.hasFiredSpeechDetected = false
-                    self.onUtteranceCompleted?(finalText)
-                }
-            }
-
-            logger.info("Loading Parakeet EOU models from \(modelDir.path)...")
-            try await manager.loadModels(modelDir: modelDir)
-            self.asrManager = manager
-            logger.info("Parakeet EOU ready")
+            logger.info("STT ready: \(engine.displayName)")
         } catch {
             self.error = "STT init failed: \(error.localizedDescription)"
             logger.error("STT init failed: \(error.localizedDescription)")
@@ -84,8 +62,8 @@ final class STTManager: ObservableObject {
     }
 
     func startListening() {
-        guard !isListening, asrManager != nil else {
-            if asrManager == nil { error = "STT not initialized" }
+        guard !isListening, isReady else {
+            if !isReady { error = "STT not initialized" }
             return
         }
         guard let sharedAudio else {
@@ -95,16 +73,20 @@ final class STTManager: ObservableObject {
 
         isStopping = false
 
-        // Set up serial AsyncStream for backpressure
         let (stream, continuation) = AsyncStream.makeStream(of: AVAudioPCMBuffer.self)
         self.bufferContinuation = continuation
 
-        let manager = asrManager!
+        let eou = eouManager
+        let nemotron = nemotronManager
         processingTask = Task {
             for await buffer in stream {
                 guard !Task.isCancelled else { break }
                 do {
-                    _ = try await manager.process(audioBuffer: buffer)
+                    if let eou {
+                        _ = try await eou.process(audioBuffer: buffer)
+                    } else if let nemotron {
+                        _ = try await nemotron.process(audioBuffer: buffer)
+                    }
                 } catch {
                     await MainActor.run {
                         self.error = "STT error: \(error.localizedDescription)"
@@ -113,8 +95,6 @@ final class STTManager: ObservableObject {
             }
         }
 
-        // Start mic capture with VP AEC (restarts engine with tap installed).
-        // Set bridge continuation so tap handler delivers buffers to our stream.
         sharedAudio.bridge.inputContinuation = continuation
         sharedAudio.beginInputCapture()
 
@@ -123,13 +103,14 @@ final class STTManager: ObservableObject {
         partialResult = ""
         hasFiredSpeechDetected = false
         error = nil
-        logger.info("STT listening started")
+        logger.info("STT listening started (\(self.engine.displayName))")
     }
 
     func stopListening() {
         isStopping = true
+        nemotronDebounceTask?.cancel()
+        nemotronDebounceTask = nil
 
-        // Stop mic capture and disconnect from stream
         sharedAudio?.endInputCapture()
         bufferContinuation?.finish()
         bufferContinuation = nil
@@ -139,8 +120,10 @@ final class STTManager: ObservableObject {
         isListening = false
 
         Task {
-            _ = try? await asrManager?.finish()
-            await asrManager?.reset()
+            _ = try? await eouManager?.finish()
+            await eouManager?.reset()
+            _ = try? await nemotronManager?.finish()
+            await nemotronManager?.reset()
         }
 
         logger.info("STT listening stopped")
@@ -150,8 +133,11 @@ final class STTManager: ObservableObject {
     func resetForNextUtterance() {
         hasFiredSpeechDetected = false
         partialResult = ""
+        nemotronDebounceTask?.cancel()
+        nemotronDebounceTask = nil
         Task {
-            await asrManager?.reset()
+            await eouManager?.reset()
+            await nemotronManager?.reset()
         }
     }
 
@@ -162,12 +148,77 @@ final class STTManager: ObservableObject {
         onUtteranceCompleted?(text)
     }
 
-    // MARK: - Private
+    // MARK: - Loaders
 
-    static func modelsDirectory() -> URL {
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let dir = docs.appendingPathComponent("models", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir
+    private func loadParakeet(engine: STTEngine, asrRoot: URL) async throws {
+        guard let chunk = engine.eouChunkSize else { return }
+        let manager = StreamingEouAsrManager(chunkSize: chunk, eouDebounceMs: 300)
+
+        await manager.setPartialCallback { [weak self] text in
+            Task { @MainActor in
+                guard let self, !self.isStopping else { return }
+                self.partialResult = text
+                self.considerSpeechDetected(text)
+            }
+        }
+
+        await manager.setEouCallback { [weak self] text in
+            Task { @MainActor in
+                self?.emitUtterance(text)
+            }
+        }
+
+        logger.info("Loading \(engine.displayName)…")
+        try await manager.loadModels(to: asrRoot)
+        self.eouManager = manager
+    }
+
+    private func loadNemotron(asrRoot: URL) async throws {
+        let manager = StreamingNemotronAsrManager(requestedChunkSize: .ms560)
+
+        await manager.setPartialCallback { [weak self] text in
+            Task { @MainActor in
+                guard let self, !self.isStopping else { return }
+                self.partialResult = text
+                self.considerSpeechDetected(text)
+                self.scheduleNemotronUtterance(text)
+            }
+        }
+
+        logger.info("Loading Nemotron 560…")
+        try await manager.loadModels(to: asrRoot)
+        self.nemotronManager = manager
+    }
+
+    private func considerSpeechDetected(_ text: String) {
+        let wordCount = text.split(separator: " ").count
+        if !hasFiredSpeechDetected && wordCount >= 2 {
+            hasFiredSpeechDetected = true
+            onSpeechDetected?()
+        }
+    }
+
+    /// Nemotron has no EOU head — treat a ~900 ms stall in the partial as a turn.
+    private func scheduleNemotronUtterance(_ text: String) {
+        nemotronDebounceTask?.cancel()
+        let snapshot = text
+        nemotronDebounceTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(900))
+            guard !Task.isCancelled, !self.isStopping else { return }
+            guard self.partialResult == snapshot else { return }
+            self.emitUtterance(snapshot)
+        }
+    }
+
+    private func emitUtterance(_ text: String) {
+        guard !isStopping else { return }
+        let finalText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !finalText.isEmpty else { return }
+        transcript = finalText
+        partialResult = ""
+        hasFiredSpeechDetected = false
+        nemotronDebounceTask?.cancel()
+        nemotronDebounceTask = nil
+        onUtteranceCompleted?(finalText)
     }
 }
