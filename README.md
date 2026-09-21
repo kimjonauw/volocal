@@ -57,12 +57,15 @@ Voice and chat stay on the phone. The only runtime network is **Hugging Face** f
 
 This repo is **public** so GitHub Actions macOS minutes stay free (private macOS runners need paid credits).
 
-**Install path:** SideStore **real app slot**. LiveContainer guests crash on launch or have broken mic/AEC on iOS 26 (iPhone 17 Pro included). LiveContainer 3.6.65+ is required even to try, and still is not this app’s supported install.
+**Install path (no SideStore slots):** LiveContainer **guest**. That is the supported path on this phone when all 3 slots are taken. Apply GetMoreRAM to **LiveContainer itself** (the guest shares that process).
 
-1. Wait for **Actions → Build IPA** to go green (push to `main` or Run workflow).
-2. Open **Releases → Volocal (SideStore IPA)** and download `Volocal.ipa` (not Actions artifacts — GitHub always wraps those in a zip).
-3. That pre-release tag `sidestore` is **overwritten** on every successful build, so you never collect a pile of broken IPAs.
-4. In SideStore, install into a real app slot. Apply `increased-memory-limit` with GetMoreRAM on the SideStore host, then reinstall.
+1. LiveContainer **3.6.65 or newer** (required on iOS 26.4+ / 26.5.1). Older LC crashes every guest on launch.
+2. In LC Settings: **Import Certificate from SideStore**, then **JIT-Less Mode Diagnose** must pass (green + Test JIT-Less Mode).
+3. If guests still die instantly: tap the LC version number 5–10 times → **Reset Symbol Offset**.
+4. Wait for **Actions → Build IPA** to go green, then download **Volocal.ipa** from [Releases → sidestore](https://github.com/kimjonauw/volocal/releases/tag/sidestore) (not Actions artifacts — those are always a zip).
+5. In LiveContainer, **+** → import that IPA → open Volocal. If it was already imported from the old zip, delete the guest and import again.
+
+Mic / Voice Processing AEC is weaker inside a guest than a real slot. Barge-in may be worse; the app should still launch and run on-device.
 
 Physical iPhone, iOS 17+ (developed against iOS 26 / iPhone 17 Pro). First launch still downloads STT / TTS / GGUF from Hugging Face on-device.
 

@@ -9,7 +9,7 @@ MIT-licensed on-device iOS voice app: modular GGUF LLM, selectable STT/TTS, unsi
 - **On-device voice:** mic audio, transcripts, and LLM tokens must not leave the phone. Hugging Face is allowed **only** for listing/downloading public model weights (GGUF / CoreML packs).
 - **LLM = GGUF only** via llama.cpp (`llama.swift` 2.x). No MLX, safetensors, ONNX, or pirated IPAs.
 - **Barge-in** is the point of this app vs Locally AI. Keep one `AVAudioEngine`, Voice Processing AEC, mic open during TTS.
-- **Install:** SideStore real app slot. LiveContainer guests crash on iOS 26 and have broken mic/AEC. `increased-memory-limit` is in entitlements; GetMoreRAM re-applies it at SideStore sign time (a plist copied into the .app does nothing). Extra RAM does not add barge-in to other apps.
+- **Install:** LiveContainer guest when SideStore has no free slots (this developer’s iPhone). GetMoreRAM / `increased-memory-limit` goes on the **LiveContainer host**. LC must be **3.6.65+** on iOS 26.4+; JIT-Less Diagnose must pass; Reset Symbol Offset if guests crash at launch. Mic/AEC is weaker in a guest; barge-in may degrade. Extra RAM does not add barge-in to other apps.
 - **Do not** add analytics, crash reporters, ads, accounts, or third-party SDKs that open a network path.
 - **Do not** restore a foreign App Store bundle ID or DEVELOPMENT_TEAM. Bundle ID is `com.localiosllm.volocal`.
 - **Do not** commit `.gguf`, CoreML packs, IPAs, or secrets.
@@ -38,7 +38,7 @@ MIT-licensed on-device iOS voice app: modular GGUF LLM, selectable STT/TTS, unsi
 
 ## Build (no local Mac)
 
-Linux cannot compile iOS. Push to GitHub → **Actions → Build IPA** (`macos-15`). Script ad-hoc-signs and embeds `llama` / `NemoTextProcessing` so iOS 26 dyld will map the binary. Publishes **one rolling pre-release** `sidestore` with `Volocal.ipa` (`--clobber`). Do **not** use Actions artifacts (they are a zip). User re-signs in SideStore. Do not ship random IPAs from the web.
+Linux cannot compile iOS. Push to GitHub → **Actions → Build IPA** (`macos-15`). Script ad-hoc-signs and embeds `llama` / `NemoTextProcessing` so iOS 26 dyld / LiveContainer can map the binary. Publishes **one rolling pre-release** `sidestore` with `Volocal.ipa` (`--clobber`). Do **not** use Actions artifacts (they are a zip). LiveContainer re-signs the guest with the imported SideStore cert. Do not ship random IPAs from the web.
 
 ## Hardware note
 
