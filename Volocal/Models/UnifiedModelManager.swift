@@ -23,8 +23,10 @@ final class UnifiedModelManager: ObservableObject {
     @Published var selectedTTS: TTSEngine = .pocketTts
     @Published var selectedTTSVoice: String = TTSEngine.pocketTts.defaultVoice
     @Published var customInstructions: String = LLMManager.defaultInstructions
-    @Published var contextSize: UInt32 = 2048
+    @Published var contextSize: UInt32 = LLMContextWindow.default
     @Published var hasCompletedOnboarding: Bool = false
+    private var llmDownloadGeneration = 0
+    private var llmDownloadDelegate: LLMDownloadDelegate?
 
     enum ModelState: Equatable {
         case notDownloaded
@@ -99,12 +101,24 @@ final class UnifiedModelManager: ObservableObject {
         UserDefaults.standard.set(selectedTTSVoice, forKey: selectedTTSVoiceKey)
         UserDefaults.standard.set(customInstructions, forKey: instructionsKey)
         UserDefaults.standard.set(Int(contextSize), forKey: contextSizeKey)
-        checkExistingModels()
+        checkExistingModels(preservingLLMDownload: true)
     }
 
     func select(_ spec: LLMModelSpec) {
+        if selectedLLM.id != spec.id {
+            cancelLLMDownload()
+        }
         selectedLLM = spec
         persistSelection()
+    }
+
+    func cancelLLMDownload() {
+        llmDownloadGeneration += 1
+        llmDownloadDelegate?.cancel()
+        llmDownloadDelegate = nil
+        if case .downloading = modelStates[.llm], !selectedLLM.isDownloaded {
+            modelStates[.llm] = .notDownloaded
+        }
     }
 
     /// Show onboarding again so the user can pick another engine or GGUF after a load failure.
@@ -168,9 +182,11 @@ final class UnifiedModelManager: ObservableObject {
         deleteLLM(selectedLLM)
     }
 
-    func checkExistingModels() {
+    func checkExistingModels(preservingLLMDownload: Bool = false) {
         if selectedLLM.isDownloaded {
             modelStates[.llm] = .downloaded
+        } else if preservingLLMDownload, case .downloading = modelStates[.llm] {
+            // Leave the in-flight GGUF transfer alone.
         } else {
             modelStates[.llm] = .notDownloaded
         }
@@ -271,6 +287,12 @@ final class UnifiedModelManager: ObservableObject {
 
     private func downloadLLM() async {
         let spec = selectedLLM
+        if case .downloading = modelStates[.llm], llmDownloadDelegate != nil, !spec.isDownloaded {
+            return
+        }
+        llmDownloadGeneration += 1
+        let generation = llmDownloadGeneration
+        error = nil
         modelStates[.llm] = .downloading(progress: 0)
 
         if spec.isDownloaded {
@@ -279,18 +301,18 @@ final class UnifiedModelManager: ObservableObject {
         }
 
         guard HuggingFaceHub.isValidRepoId(spec.repoId), GGUFFile.isSafeHubPath(spec.filename) else {
-            modelStates[.llm] = .error("Invalid Hugging Face repo or file path")
+            failLLM("Invalid Hugging Face repo or file path")
             return
         }
 
         guard let url = spec.downloadURL else {
-            modelStates[.llm] = .error("Invalid Hugging Face URL")
+            failLLM("Invalid Hugging Face URL")
             return
         }
 
         let destination = spec.nestedLocalURL.standardizedFileURL
         guard GGUFFile.isInsideModelsDirectory(destination) else {
-            modelStates[.llm] = .error("Refusing to write GGUF outside the models folder")
+            failLLM("Refusing to write GGUF outside the models folder")
             return
         }
 
@@ -302,12 +324,14 @@ final class UnifiedModelManager: ObservableObject {
         let expectedBytes = spec.sizeBytes ?? 0
 
         let result: Result<URL, Error> = await withCheckedContinuation { continuation in
+            llmDownloadDelegate?.cancel()
             let delegate = LLMDownloadDelegate(
                 onProgress: { [weak self] bytesWritten, totalExpected in
                     let total = totalExpected > 0 ? totalExpected : max(expectedBytes, 1)
                     let fraction = Double(bytesWritten) / Double(total)
                     Task { @MainActor in
-                        self?.modelStates[.llm] = .downloading(progress: min(fraction, 1.0))
+                        guard let self, self.llmDownloadGeneration == generation else { return }
+                        self.modelStates[.llm] = .downloading(progress: min(fraction, 1.0))
                     }
                 },
                 onComplete: { tempURL, error in
@@ -323,16 +347,26 @@ final class UnifiedModelManager: ObservableObject {
 
             let config = URLSessionConfiguration.default
             config.timeoutIntervalForResource = 3600
+            config.waitsForConnectivity = true
             config.httpAdditionalHeaders = [
                 "User-Agent": "volocal-ios/1.0 (on-device; no-telemetry)"
             ]
             let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
             delegate.session = session
+            self.llmDownloadDelegate = delegate
 
             var request = URLRequest(url: url, timeoutInterval: 3600)
             request.setValue("volocal-ios/1.0 (on-device; no-telemetry)", forHTTPHeaderField: "User-Agent")
             session.downloadTask(with: request).resume()
         }
+
+        guard generation == llmDownloadGeneration else {
+            if case .success(let tempURL) = result {
+                try? FileManager.default.removeItem(at: tempURL)
+            }
+            return
+        }
+        llmDownloadDelegate = nil
 
         switch result {
         case .success(let tempURL):
@@ -343,11 +377,11 @@ final class UnifiedModelManager: ObservableObject {
                 }
                 try FileManager.default.moveItem(at: tempURL, to: destination)
 
-                if let expected = spec.sha256, !expected.isEmpty {
+                if let expected = GGUFFile.normalizedSHA256(spec.sha256) {
                     let actual = try Self.sha256Hex(of: destination)
-                    if actual.lowercased() != expected.lowercased() {
-                        try? FileManager.default.removeItem(at: destination)
-                        throw LLMDownloadError.checksumMismatch
+                    if actual.lowercased() != expected {
+                        logger.error("SHA-256 mismatch for \(spec.id); keeping the GGUF if the header is valid")
+                        // Hub LFS oids are not always the file digest (Xet). Do not delete a valid GGUF.
                     }
                 }
 
@@ -362,14 +396,18 @@ final class UnifiedModelManager: ObservableObject {
             } catch {
                 try? FileManager.default.removeItem(at: tempURL)
                 try? FileManager.default.removeItem(at: destination)
-                modelStates[.llm] = .error(error.localizedDescription)
-                self.error = "LLM download failed: \(error.localizedDescription)"
+                failLLM("LLM download failed: \(error.localizedDescription)")
             }
         case .failure(let error):
-            modelStates[.llm] = .error(error.localizedDescription)
-            self.error = "LLM download failed: \(error.localizedDescription)"
+            if (error as? URLError)?.code == .cancelled { return }
+            failLLM("LLM download failed: \(error.localizedDescription)")
             logger.error("LLM download failed: \(error.localizedDescription)")
         }
+    }
+
+    private func failLLM(_ message: String) {
+        modelStates[.llm] = .error(message)
+        error = message
     }
 
     private static func validateDownloadedGGUF(at url: URL, expectedBytes: Int64?) throws {
@@ -475,6 +513,7 @@ private final class LLMDownloadDelegate: NSObject, URLSessionDownloadDelegate {
     let onProgress: (Int64, Int64) -> Void
     let onComplete: (URL?, Error?) -> Void
     var session: URLSession?
+    private let lock = NSLock()
     private var hasCompleted = false
 
     init(
@@ -529,9 +568,18 @@ private final class LLMDownloadDelegate: NSObject, URLSessionDownloadDelegate {
         }
     }
 
+    func cancel() {
+        session?.invalidateAndCancel()
+        session = nil
+        finish(tempURL: nil, error: URLError(.cancelled))
+    }
+
     private func finish(tempURL: URL?, error: Error?) {
-        guard !hasCompleted else { return }
-        hasCompleted = true
+        lock.lock()
+        let shouldFinish = !hasCompleted
+        if shouldFinish { hasCompleted = true }
+        lock.unlock()
+        guard shouldFinish else { return }
         session?.finishTasksAndInvalidate()
         session = nil
         onComplete(tempURL, error)

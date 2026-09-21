@@ -55,11 +55,45 @@ struct LLMPickerView: View {
             }
             .onAppear {
                 instructionsDraft = modelManager.customInstructions
-                modelManager.checkExistingModels()
+                modelManager.checkExistingModels(preservingLLMDownload: true)
             }
             .onDisappear {
                 saveInstructions()
             }
+            .safeAreaInset(edge: .bottom) {
+                llmTransferBanner
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var llmTransferBanner: some View {
+        if case .downloading(let progress) = modelManager.modelStates[.llm] {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    ProgressView()
+                    Text("Downloading \(modelManager.selectedLLM.displayName)")
+                        .font(.subheadline.weight(.medium))
+                    Spacer()
+                    Button("Cancel") {
+                        modelManager.cancelLLMDownload()
+                    }
+                    .font(.caption)
+                }
+                ProgressView(value: progress)
+                Text("\(Int(progress * 100))% · \(modelManager.selectedLLM.sizeDescription). Stay on this screen until it finishes — a GGUF is often 1 GB+.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .padding()
+            .background(.bar)
+        } else if let message = localError ?? modelManager.error, !message.isEmpty {
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.red)
+                .padding()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(.bar)
         }
     }
 
@@ -228,9 +262,15 @@ struct LLMPickerView: View {
                     }
                 }
                 Spacer()
-                if modelManager.selectedLLM.id == spec.id {
+                if isDownloading(spec) {
+                    ProgressView()
+                } else if spec.isDownloaded && modelManager.selectedLLM.id == spec.id {
                     Image(systemName: "checkmark.circle.fill")
                         .foregroundStyle(.green)
+                } else if modelManager.selectedLLM.id == spec.id {
+                    Text("Selected")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                 }
                 if let trailing {
                     Text(trailing)
@@ -239,6 +279,14 @@ struct LLMPickerView: View {
                 }
             }
         }
+        .buttonStyle(.borderless)
+    }
+
+    private func isDownloading(_ spec: LLMModelSpec) -> Bool {
+        if case .downloading = modelManager.modelStates[.llm] {
+            return modelManager.selectedLLM.id == spec.id
+        }
+        return false
     }
 
     private func saveInstructions() {
@@ -257,15 +305,24 @@ struct LLMPickerView: View {
 
     private func choose(_ spec: LLMModelSpec) async {
         localError = nil
+        modelManager.error = nil
         modelManager.select(spec)
-        if !modelManager.selectedLLM.isDownloaded {
-            await modelManager.downloadSelectedLLM()
+        if modelManager.selectedLLM.isDownloaded {
+            onModelReady?(modelManager.selectedLLM)
+            dismiss()
+            return
+        }
+        await modelManager.downloadSelectedLLM()
+        if modelManager.selectedLLM.id != spec.id {
+            return
         }
         if modelManager.selectedLLM.isDownloaded {
             onModelReady?(modelManager.selectedLLM)
             dismiss()
+        } else if case .downloading = modelManager.modelStates[.llm] {
+            return
         } else {
-            localError = modelManager.error
+            localError = modelManager.error ?? "Download did not finish. Stay on Wi-Fi and tap the GGUF again."
         }
     }
 

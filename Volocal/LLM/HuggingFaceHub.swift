@@ -99,7 +99,7 @@ enum HuggingFaceHub {
             return RemoteFile(
                 path: item.path,
                 sizeBytes: item.lfs?.size ?? item.size,
-                sha256: item.lfs?.oid
+                sha256: GGUFFile.normalizedSHA256(item.lfs?.oid)
             )
         }
         .sorted { ($0.sizeBytes ?? 0) < ($1.sizeBytes ?? 0) }

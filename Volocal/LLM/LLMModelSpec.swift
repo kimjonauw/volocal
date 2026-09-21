@@ -26,7 +26,7 @@ struct LLMModelSpec: Codable, Identifiable, Equatable, Hashable {
             .split(separator: "/")
             .map { $0.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? String($0) }
             .joined(separator: "/")
-        return URL(string: "https://huggingface.co/\(encodedRepo)/resolve/main/\(encodedFile)")
+        return URL(string: "https://huggingface.co/\(encodedRepo)/resolve/main/\(encodedFile)?download=true")
     }
 
     var huggingFacePageURL: URL? {
@@ -153,6 +153,20 @@ enum GGUFFile {
         defer { try? handle.close() }
         let header = handle.readData(ofLength: 4)
         return header == magic
+    }
+
+    /// Hub `lfs.oid` is often `sha256:<hex>`. Anything that is not 64 hex digits is ignored.
+    static func normalizedSHA256(_ raw: String?) -> String? {
+        guard var value = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !value.isEmpty else { return nil }
+        if value.hasPrefix("sha256:") {
+            value = String(value.dropFirst(7))
+        }
+        guard value.count == 64,
+              value.unicodeScalars.allSatisfy({ CharacterSet(charactersIn: "0123456789abcdef").contains($0) }) else {
+            return nil
+        }
+        return value
     }
 
     static func isSafeHubPath(_ path: String) -> Bool {
