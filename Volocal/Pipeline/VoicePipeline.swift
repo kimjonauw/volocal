@@ -33,8 +33,10 @@ final class VoicePipeline: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
 
     /// Maximum conversation history entries (system prompt excluded).
-    /// Each exchange is 2 entries (user + assistant). Keep last ~4 exchanges.
-    private let maxHistoryEntries = 8
+    /// Each exchange is 2 entries (user + assistant). Scales with `n_ctx`.
+    private var maxHistoryEntries: Int {
+        LLMContextWindow.historyEntries(for: llmManager.contextSize)
+    }
 
     enum PipelineState: Equatable {
         case idle
@@ -77,7 +79,7 @@ final class VoicePipeline: ObservableObject {
         tts: TTSEngine = .pocketTts,
         ttsVoice: String? = nil,
         instructions: String? = nil,
-        contextSize: UInt32 = 2048
+        contextSize: UInt32 = LLMContextWindow.default
     ) async {
         configureGeneration += 1
         let gen = configureGeneration
@@ -108,7 +110,7 @@ final class VoicePipeline: ObservableObject {
             return
         }
         applyInstructions(instructions ?? LLMManager.defaultInstructions)
-        llmManager.contextSize = contextSize >= 4096 ? 4096 : 2048
+        llmManager.contextSize = LLMContextWindow.clamp(contextSize)
         metrics?.beginTracking("LLM (llama.cpp)")
         do {
             try await llmManager.loadModel(path: path, displayName: displayName ?? URL(fileURLWithPath: path).lastPathComponent)

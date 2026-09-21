@@ -82,14 +82,15 @@ struct LLMPickerView: View {
     private var contextSection: some View {
         Section {
             Picker("Tokens", selection: contextSizeBinding) {
-                Text("2048").tag(UInt32(2048))
-                Text("4096").tag(UInt32(4096))
+                ForEach(LLMContextWindow.choices, id: \.self) { size in
+                    Text(LLMContextWindow.label(size)).tag(size)
+                }
             }
-            .pickerStyle(.segmented)
+            .pickerStyle(.inline)
         } header: {
             Text("Context window")
         } footer: {
-            Text("llama.cpp n_ctx: how many tokens of instructions + recent chat fit in one pass. 2048 is the default (~1.2 GB stack). 4096 remembers more but uses more RAM and can jetsam inside LiveContainer. Chat history is still trimmed to the last 4 exchanges. Changing this reloads the GGUF.")
+            Text("llama.cpp n_ctx: how many tokens of instructions + recent chat fit in one pass. Default 2,048 is light. 8K/16K are fine on an iPhone 17 Pro with a 2B GGUF; 8B + STT + TTS at 16K can jetsam in LiveContainer. History length scales with this. The GGUF’s trained window is a second ceiling. Changing this reloads the model.")
         }
     }
 

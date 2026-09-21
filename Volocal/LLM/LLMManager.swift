@@ -33,7 +33,7 @@ final class LLMManager: ObservableObject {
     """
 
     var systemPrompt: String = LLMManager.defaultInstructions
-    var contextSize: UInt32 = 2048
+    var contextSize: UInt32 = LLMContextWindow.default
 
     init() {}
 
@@ -146,5 +146,34 @@ final class LLMManager: ObservableObject {
 
     var isModelLoaded: Bool {
         llamaContext != nil
+    }
+}
+
+/// llama.cpp `n_ctx`. KV cache grows with this; the GGUF's trained window is the other ceiling.
+enum LLMContextWindow {
+    static let choices: [UInt32] = [2048, 4096, 8192, 16384]
+    static let `default`: UInt32 = 2048
+
+    static func clamp(_ size: UInt32) -> UInt32 {
+        choices.min { abs(Int($0) - Int(size)) < abs(Int($1) - Int(size)) } ?? `default`
+    }
+
+    /// User+assistant messages kept in the voice transcript (system prompt is separate).
+    static func historyEntries(for size: UInt32) -> Int {
+        switch clamp(size) {
+        case 16384: return 32
+        case 8192: return 24
+        case 4096: return 16
+        default: return 8
+        }
+    }
+
+    static func label(_ size: UInt32) -> String {
+        switch clamp(size) {
+        case 2048: return "2,048 · light"
+        case 4096: return "4,096"
+        case 8192: return "8,192"
+        default: return "16,384 · more RAM"
+        }
     }
 }

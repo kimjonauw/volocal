@@ -85,7 +85,7 @@ final class UnifiedModelManager: ObservableObject {
             customInstructions = LLMManager.defaultInstructions
         }
         let storedCtx = UInt32(UserDefaults.standard.integer(forKey: contextSizeKey))
-        contextSize = (storedCtx == 4096) ? 4096 : 2048
+        contextSize = storedCtx == 0 ? LLMContextWindow.default : LLMContextWindow.clamp(storedCtx)
         hasCompletedOnboarding = UserDefaults.standard.bool(forKey: onboardedKey)
         checkExistingModels()
     }
@@ -141,7 +141,7 @@ final class UnifiedModelManager: ObservableObject {
     }
 
     func setContextSize(_ size: UInt32) {
-        let clamped: UInt32 = size >= 4096 ? 4096 : 2048
+        let clamped = LLMContextWindow.clamp(size)
         guard clamped != contextSize else { return }
         contextSize = clamped
         persistSelection()
