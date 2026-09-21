@@ -18,6 +18,9 @@ struct LLMPickerView: View {
     @State private var localError: String?
     @State private var searchGeneration = 0
     @State private var instructionsDraft = ""
+    @State private var contextLog = LLMContextWindow.logValue(LLMContextWindow.default)
+    @State private var contextAtDragStart = LLMContextWindow.default
+    @State private var isDraggingContext = false
 
     var body: some View {
         NavigationStack {
@@ -55,6 +58,7 @@ struct LLMPickerView: View {
             }
             .onAppear {
                 instructionsDraft = modelManager.customInstructions
+                contextLog = LLMContextWindow.logValue(modelManager.contextSize)
                 modelManager.checkExistingModels(preservingLLMDownload: true)
             }
             .onDisappear {
@@ -115,30 +119,55 @@ struct LLMPickerView: View {
 
     private var contextSection: some View {
         Section {
-            Picker("Tokens", selection: contextSizeBinding) {
-                ForEach(LLMContextWindow.choices, id: \.self) { size in
-                    Text(LLMContextWindow.label(size)).tag(size)
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text(LLMContextWindow.label(modelManager.contextSize))
+                        .font(.body.monospacedDigit())
+                    Spacer()
+                    Button("Reset") {
+                        let previous = modelManager.contextSize
+                        modelManager.setContextSize(LLMContextWindow.default, persist: true)
+                        contextLog = LLMContextWindow.logValue(LLMContextWindow.default)
+                        if modelManager.contextSize != previous {
+                            onNeedsReload?()
+                        }
+                    }
+                    .font(.caption)
+                    .disabled(modelManager.contextSize == LLMContextWindow.default)
                 }
+                Slider(value: $contextLog, in: LLMContextWindow.logRange) { editing in
+                    let size = LLMContextWindow.fromLog(contextLog)
+                    if editing {
+                        if !isDraggingContext {
+                            isDraggingContext = true
+                            contextAtDragStart = modelManager.contextSize
+                        }
+                        modelManager.setContextSize(size, persist: false)
+                    } else {
+                        let started = isDraggingContext ? contextAtDragStart : modelManager.contextSize
+                        isDraggingContext = false
+                        modelManager.setContextSize(size, persist: true)
+                        contextLog = LLMContextWindow.logValue(modelManager.contextSize)
+                        if modelManager.contextSize != started {
+                            onNeedsReload?()
+                        }
+                    }
+                }
+                .accessibilityLabel("Context window")
+                HStack {
+                    Text("2K")
+                    Spacer()
+                    Text("128K")
+                }
+                .font(.caption2)
+                .foregroundStyle(.secondary)
             }
-            .pickerStyle(.inline)
+            .padding(.vertical, 4)
         } header: {
             Text("Context window")
         } footer: {
-            Text("llama.cpp n_ctx: how many tokens of instructions + recent chat fit in one pass. Default 2,048 is light. 32K–128K are usable on an iPhone 17 Pro with a 2B GGUF; 8B + STT + TTS at 64K+ can jetsam in LiveContainer. History length scales with this. The GGUF’s trained window is a second ceiling (quality drops past that even if it loads). Changing this reloads the model.")
+            Text("Log slider of llama.cpp n_ctx (snaps to 512, the decode batch). How many tokens of instructions + recent chat fit in one pass. Default 2,048 is light. 32K–128K are usable on an iPhone 17 Pro with a 2B GGUF; 8B + STT + TTS at 64K+ can jetsam in LiveContainer. History length scales with this. The GGUF’s trained window is a second ceiling (quality drops past that even if it loads). Reloads the model when you lift your finger.")
         }
-    }
-
-    private var contextSizeBinding: Binding<UInt32> {
-        Binding(
-            get: { modelManager.contextSize },
-            set: { newValue in
-                let previous = modelManager.contextSize
-                modelManager.setContextSize(newValue)
-                if modelManager.contextSize != previous {
-                    onNeedsReload?()
-                }
-            }
-        )
     }
 
     private var installedSection: some View {

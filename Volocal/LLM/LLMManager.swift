@@ -151,35 +151,47 @@ final class LLMManager: ObservableObject {
 
 /// llama.cpp `n_ctx`. KV cache grows with this; the GGUF's trained window is the other ceiling.
 enum LLMContextWindow {
-    static let choices: [UInt32] = [2048, 4096, 8192, 16384, 32768, 65536, 131072]
+    static let min: UInt32 = 2048
+    static let max: UInt32 = 131_072
+    static let step: UInt32 = 512
     static let `default`: UInt32 = 2048
 
+    static var logRange: ClosedRange<Double> {
+        log2(Double(min))...log2(Double(max))
+    }
+
     static func clamp(_ size: UInt32) -> UInt32 {
-        choices.min { abs(Int($0) - Int(size)) < abs(Int($1) - Int(size)) } ?? `default`
+        let bounded = Swift.min(max, Swift.max(min, size))
+        let stepped = ((bounded + step / 2) / step) * step
+        return Swift.min(max, Swift.max(min, stepped))
+    }
+
+    static func fromLog(_ logValue: Double) -> UInt32 {
+        let raw = pow(2.0, logValue)
+        guard raw.isFinite, raw > 0 else { return `default` }
+        return clamp(UInt32(raw.rounded()))
+    }
+
+    static func logValue(_ size: UInt32) -> Double {
+        log2(Double(clamp(size)))
     }
 
     /// User+assistant messages kept in the voice transcript (system prompt is separate).
     static func historyEntries(for size: UInt32) -> Int {
-        switch clamp(size) {
-        case 131072: return 80
-        case 65536: return 64
-        case 32768: return 48
-        case 16384: return 32
-        case 8192: return 24
-        case 4096: return 16
-        default: return 8
-        }
+        min(80, max(8, Int(clamp(size) / 256)))
     }
 
     static func label(_ size: UInt32) -> String {
-        switch clamp(size) {
-        case 2048: return "2,048 · light"
-        case 4096: return "4,096"
-        case 8192: return "8,192"
-        case 16384: return "16,384"
-        case 32768: return "32,768"
-        case 65536: return "65,536 · more RAM"
-        default: return "131,072 · max RAM"
-        }
+        let n = clamp(size)
+        let tokens = formatted(n)
+        if n <= min { return "\(tokens) · light" }
+        if n >= 65_536 { return "\(tokens) · more RAM" }
+        return "\(tokens) tokens"
+    }
+
+    static func formatted(_ size: UInt32) -> String {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        return formatter.string(from: NSNumber(value: clamp(size))) ?? "\(clamp(size))"
     }
 }

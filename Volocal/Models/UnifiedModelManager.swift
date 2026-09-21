@@ -154,11 +154,14 @@ final class UnifiedModelManager: ObservableObject {
         persistSelection()
     }
 
-    func setContextSize(_ size: UInt32) {
+    func setContextSize(_ size: UInt32, persist: Bool = true) {
         let clamped = LLMContextWindow.clamp(size)
-        guard clamped != contextSize else { return }
-        contextSize = clamped
-        persistSelection()
+        if clamped != contextSize {
+            contextSize = clamped
+        }
+        if persist {
+            persistSelection()
+        }
     }
 
     func deleteLLM(_ spec: LLMModelSpec) {
