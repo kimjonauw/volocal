@@ -181,7 +181,7 @@ enum LLMContextWindow {
 
     /// User+assistant messages kept in the voice transcript (system prompt is separate).
     static func historyEntries(for size: UInt32) -> Int {
-        min(80, max(8, Int(clamp(size) / 256)))
+        Swift.min(80, Swift.max(8, Int(clamp(size) / 256)))
     }
 
     static func label(_ size: UInt32) -> String {

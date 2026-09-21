@@ -97,7 +97,7 @@ actor LlamaContext {
         else if fileBytes > 2_200_000_000 { cap = 4096 }
         else if fileBytes > 1_400_000_000 { cap = 8192 }
         else { cap = LLMContextWindow.max }
-        return LLMContextWindow.clamp(min(requested, cap))
+        return LLMContextWindow.clamp(Swift.min(requested, cap))
     }
 
     nonisolated private static func loadBlocking(
