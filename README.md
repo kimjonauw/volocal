@@ -1,10 +1,16 @@
 # Volocal
 
-Fully local voice AI for iOS. No cloud, no API keys, no internet after setup.
+Fully local voice AI for iOS. No cloud, no API keys, no internet after model download.
 
-STT → LLM → TTS, streaming in real-time on your iPhone.
+STT → LLM → TTS, streaming on-device, with barge-in (interrupt mid-sentence).
+
+This directory is a **fork** of [fikrikarim/volocal](https://github.com/fikrikarim/volocal) (MIT). Changes: any Hugging Face GGUF for the LLM, selectable STT/TTS, FluidAudio 0.15.8, unsigned IPA via GitHub Actions (no Mac required).
+
+**Agents / future contributors:** read [AGENTS.md](AGENTS.md). Trust/network review: [docs/SECURITY.md](docs/SECURITY.md).
 
 [<img src="https://developer.apple.com/assets/elements/badges/download-on-the-app-store.svg" alt="Download on the App Store" height="50">](https://apps.apple.com/app/volocal/id6761493288)
+
+App Store listing is the **upstream** binary, not this fork. Sideload this tree with SideStore.
 
 > **Note:** This is a work in progress. Expect bugs.
 
@@ -21,10 +27,11 @@ So I decided to replicate the voice AI experience to fully run locally on my iPh
 ## Features
 
 - Runs entirely on-device across Neural Engine, GPU, and CPU
-- Real-time voice conversations
-- Interrupt mid-sentence (barge-in)
+- Real-time voice conversations with interrupt (barge-in)
 - Hardware echo cancellation so the mic doesn't pick up its own output
-- Downloads all models (~2.3 GB) on first launch with per-model progress
+- Pick any llama.cpp **GGUF** from Hugging Face (not hardcoded to one Qwen file)
+- Pick STT (Parakeet EOU 160/320 or Nemotron 560) and TTS (PocketTTS v2.1 or Kokoro ANE)
+- First-launch downloads from Hugging Face with per-model progress
 
 ## Why this stack
 
@@ -32,9 +39,9 @@ The hard part of running three models at once on a phone is that they all fight 
 
 | Component              | Chip          | Why                                                      |
 | ---------------------- | ------------- | -------------------------------------------------------- |
-| **STT** (Parakeet EOU) | Neural Engine | CoreML — leaves GPU and CPU free                         |
-| **LLM** (Qwen3.5-2B)   | GPU           | llama.cpp via Metal, gets the GPU to itself              |
-| **TTS** (PocketTTS)    | CPU + GPU     | CoreML — ANE causes float16 artifacts in Mimi decoder    |
+| **STT** (Parakeet EOU default) | Neural Engine | CoreML — leaves GPU free for the LLM |
+| **LLM** (your GGUF) | GPU | llama.cpp via Metal |
+| **TTS** (PocketTTS default) | CPU + GPU | CoreML — ANE can artifact Mimi; Kokoro optional on ANE |
 
 We started with [mlx-audio-swift](https://github.com/Blaizzy/mlx-audio-swift) for TTS, which uses the GPU via MLX. That meant TTS and the LLM were both competing for Metal, causing dropouts and hangs during streaming. Similarly, we tried [Moonshine](https://github.com/usefulsensors/moonshine) for STT — a promising streaming model, but it also runs on GPU/CPU via ONNX Runtime, adding to the contention and using more memory.
 
@@ -44,34 +51,45 @@ Moving STT to [FluidAudio](https://github.com/FluidInference/FluidAudio) (CoreML
 
 | Component | Model                                                                                       | Download | Runtime           |
 | --------- | ------------------------------------------------------------------------------------------- | -------- | ----------------- |
-| STT       | [Parakeet EOU 320](https://huggingface.co/FluidInference/parakeet-realtime-eou-120m-coreml) | ~450 MB  | CoreML (ANE)      |
-| LLM       | [Qwen3.5-2B Q4_K_S](https://huggingface.co/bartowski/Qwen_Qwen3.5-2B-GGUF)                  | ~1.26 GB | llama.cpp (Metal) |
-| TTS       | [PocketTTS](https://huggingface.co/FluidInference/pocket-tts-coreml)                        | ~600 MB  | CoreML (CPU+GPU)  |
+| STT       | Parakeet EOU 320 (default) or Nemotron 0.6B 560 ms                           | ~230–600 MB | CoreML (ANE)      |
+| LLM       | Any llama.cpp GGUF from Hugging Face (Qwen 2B suggested)                     | you pick    | llama.cpp (Metal) |
+| TTS       | PocketTTS v2.1 (default, streaming) or Kokoro ANE (prettier, batched)        | ~350–550 MB | CoreML            |
 
 Why these specifically:
 
-- **Parakeet EOU** over Moonshine/Whisper — lower WER (4.87% vs 6.65% Moonshine Medium), half the parameters, and end-of-utterance detection is built into the model so you don't need a separate VAD.
-- **Qwen3.5-2B** over 0.8B — MMLU-Pro nearly doubles (29.7 → 55.3). Slower (~32 vs ~70 tok/s) but the quality difference is obvious in conversation. Q4_K_S keeps it at 1.26 GB.
-- **PocketTTS** — best quality we found at this size (100M params). ~80ms to first audio, supports voice cloning from a 5-second clip.
+- **Parakeet EOU** — live barge-in with built-in end-of-utterance (~5% WER, 160/320 ms chunks). Nemotron 0.6B is optional (clearer, heavier, pause-based turns).
+- **Any GGUF** — llama.cpp loads what you download. Qwen-class 2B Q4 is the suggested size for a 12 GB iPhone with STT+TTS resident.
+- **PocketTTS v2.1** — streaming (~26 ms to first audio). Kokoro ANE sounds nicer but is batched and contends with Parakeet for ANE.
 
 ### Audio
 
 One shared `AVAudioEngine` for both STT input and TTS output, with Voice Processing AEC enabled on both nodes. This is what lets barge-in work — the mic stays open during playback and the hardware cancels the echo, so there's no need to mute the mic while speaking.
 
-Runtime memory: ~1.2 GB total (iPhone 15 budget is ~3 GB).
+Runtime memory: ~1.2 GB with the small default stack. Larger GGUFs need `increased-memory-limit` (entitlement + GetMoreRAM). That raises the process cap; it does not add physical RAM.
+
+## Privacy / network
+
+Voice and chat stay on the phone. The only runtime network is **Hugging Face** for public model files (and listing GGUF repos). No analytics SDKs. Details: [docs/SECURITY.md](docs/SECURITY.md).
 
 ## Getting started
 
-You need iOS 17+, Xcode 16+, and [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`). Physical device only — the Neural Engine isn't available in the simulator.
+No Mac required. GitHub’s macOS runners build an unsigned IPA that you sideload with SideStore (it re-signs with your Apple ID). Put this fork on GitHub, then:
+
+1. **Actions → Build IPA → Run workflow** (or push to `main`).
+2. Download the **Volocal** artifact (`Volocal.ipa`).
+3. Install with SideStore into a real app slot (not a LiveContainer guest — mic / AEC is flaky there).
+4. If you use GetMoreRAM, apply `increased-memory-limit` to the SideStore host and reinstall.
+
+Physical iPhone, iOS 17+. First launch still downloads STT / TTS / GGUF from Hugging Face on-device.
+
+If you do have a Mac: Xcode 16+, [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`).
 
 ```bash
-git clone https://github.com/fikrikarim/volocal.git
-cd volocal
 xcodegen generate
 open Volocal.xcodeproj
 ```
 
-Build and run, then tap **Download All Models** on first launch (~2.3 GB, Wi-Fi recommended).
+Or `./scripts/package-unsigned-ipa.sh` for a SideStore IPA.
 
 ## Architecture
 
@@ -91,20 +109,20 @@ Mic → [SharedAudioEngine] → STTManager → VoicePipeline → LLMManager → 
 Volocal/
 ├── App/        # Entry point, content view, model loading
 ├── Audio/      # SharedAudioEngine (AVAudioEngine + VP AEC)
-├── STT/        # Parakeet EOU via FluidAudio
-├── LLM/        # llama.cpp via llama.swift
-├── TTS/        # PocketTTS via FluidAudio
+├── STT/        # Parakeet EOU or Nemotron via FluidAudio
+├── LLM/        # llama.cpp via llama.swift; Hugging Face GGUF picker
+├── TTS/        # PocketTTS v2.1 or Kokoro ANE via FluidAudio
 ├── Pipeline/   # Voice pipeline, sentence buffer, conversation UI
-├── Models/     # Model registry, download manager, onboarding
+├── Models/     # Downloads, onboarding, LLM + voice-engine pickers
 └── Debug/      # Metrics overlay (RAM, CPU, thermal)
 ```
 
 ## Dependencies
 
-- [llama.swift](https://github.com/mattt/llama.swift) — Swift wrapper for llama.cpp
-- [FluidAudio](https://github.com/FluidInference/FluidAudio) — Parakeet EOU (STT) and PocketTTS (TTS)
+- [llama.swift](https://github.com/mattt/llama.swift) 2.x — Swift wrapper for llama.cpp
+- [FluidAudio](https://github.com/FluidInference/FluidAudio) 0.15.8+ — Parakeet EOU / Nemotron (STT), PocketTTS / Kokoro (TTS)
 
-Both pulled in via SPM.
+Both pulled in via SPM (`project.yml`).
 
 ## TODO
 
@@ -119,6 +137,7 @@ Both pulled in via SPM.
 - [Qwen3.5](https://huggingface.co/Qwen/Qwen3.5-2B) by Qwen — the language model
 - [Parakeet EOU](https://huggingface.co/nvidia/parakeet-tdt_ctc-110m) by NVIDIA NeMo — the speech recognition model
 - [PocketTTS](https://github.com/kyutai-labs/pocket-tts) by Kyutai — the text-to-speech model
+- [Kokoro](https://huggingface.co/hexgrad/Kokoro-82M) — optional ANE TTS via FluidAudio
 
 ## License
 

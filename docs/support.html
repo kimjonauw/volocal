@@ -24,27 +24,30 @@
 </head>
 <body>
     <h1>Support</h1>
-    <p class="updated">Last updated: April 2, 2026</p>
+    <p class="updated">Last updated: September 20, 2026</p>
 
     <h2>About Volocal</h2>
-    <p>Volocal is a fully local voice AI assistant for iOS. All processing -- speech-to-text, language model inference, and text-to-speech -- happens entirely on your device. No cloud services, no API keys, and no internet connection required after the initial model download.</p>
+    <p>Volocal is a fully local voice AI assistant for iOS. Speech-to-text, the language model, and text-to-speech run on the iPhone. After you download model files from Hugging Face, voice chat does not need the internet.</p>
 
     <h2>Frequently Asked Questions</h2>
 
     <p class="faq-question">What devices are supported?</p>
-    <p class="faq-answer">Volocal requires iOS 17 or later running on a physical iPhone with a Neural Engine. It is not supported on the iOS Simulator or older devices that lack a Neural Engine.</p>
+    <p class="faq-answer">iOS 17+ on a physical iPhone with a Neural Engine. Not the Simulator. This fork is meant to be sideloaded with SideStore into a real app slot (not LiveContainer as a guest — microphone echo cancellation is unreliable there).</p>
 
     <p class="faq-question">How much storage space does Volocal need?</p>
-    <p class="faq-answer">The app itself is small, but the AI models require approximately 2.3 GB of storage. These are downloaded once during initial setup. Make sure you have enough free space before starting the download.</p>
+    <p class="faq-answer">The app is small. Speech + voice packs are roughly 0.5–1 GB depending on engines. The language model is whatever GGUF you pick (often 1–4 GB). Downloads happen on first launch over Wi-Fi.</p>
 
     <p class="faq-question">Does Volocal work offline?</p>
-    <p class="faq-answer">Yes. After the initial model download, Volocal works entirely offline. No internet connection is needed to use any of its features.</p>
+    <p class="faq-answer">Yes, after model files are downloaded. Hugging Face is used only to fetch or list those files, not to send your voice.</p>
 
-    <p class="faq-question">How do I reset or re-download the models?</p>
-    <p class="faq-answer">To reset the models, delete and reinstall the app. This will clear all downloaded models and allow you to download them fresh on next launch. Alternatively, you can go to Settings > General > iPhone Storage > Volocal and use "Offload App" to remove the app while keeping the option to reinstall, or "Delete App" for a full reset.</p>
+    <p class="faq-question">Can I change the language model or voice engines?</p>
+    <p class="faq-answer">Yes. Onboarding and the in-app CPU / waveform buttons let you pick a GGUF from Hugging Face and switch STT (Parakeet EOU or Nemotron) and TTS (PocketTTS or Kokoro).</p>
+
+    <p class="faq-question">How do I install a build without a Mac?</p>
+    <p class="faq-answer">Push this repo to GitHub, run the “Build IPA” workflow, download the IPA artifact, and install it with SideStore. SideStore re-signs with your Apple ID.</p>
 
     <p class="faq-question">The app is not responding or is very slow. What should I do?</p>
-    <p class="faq-answer">On-device AI inference is resource-intensive. Try closing other apps to free up memory, then restart Volocal. If the problem persists, try restarting your iPhone.</p>
+    <p class="faq-answer">On-device inference is heavy. Close other apps, use a smaller GGUF, and keep PocketTTS + Parakeet EOU 320 unless you have RAM headroom. GetMoreRAM / increased-memory-limit raises the memory cap; it does not add physical RAM.</p>
 
     <h2>Report a Bug</h2>
     <p>If you encounter a bug or unexpected behavior, please open an issue on GitHub: <a href="https://github.com/fikrikarim/volocal/issues">github.com/fikrikarim/volocal/issues</a>. Include a description of the problem, your iPhone model, and your iOS version to help us investigate.</p>

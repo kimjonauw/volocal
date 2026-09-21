@@ -1,0 +1,17 @@
+---
+description: Volocal fork invariants for on-device voice LLM
+alwaysApply: true
+---
+
+# Volocal fork
+
+Full context: `AGENTS.md`. Trust review: `docs/SECURITY.md`.
+
+- Keep audio, transcripts, and LLM tokens on-device. Hugging Face is weights-only (list/download GGUF and CoreML).
+- LLM is llama.cpp GGUF only. No MLX / safetensors / ONNX.
+- Do not add analytics, crash reporters, ads, or extra network SDKs.
+- Bundle ID stays `com.localiosllm.volocal`. Do not restore the upstream Apple team.
+- Barge-in: one `AVAudioEngine`, Voice Processing AEC, mic stays open during TTS.
+- `project.yml` is the XcodeGen source of truth. FluidAudio is FluidInference `from: 0.15.8` (`ModelHub`, not `DownloadUtils`).
+- No local Mac: ship IPAs via `.github/workflows/ios-ipa.yml`. Do not compile iOS on Linux.
+- Do not commit model weights, IPAs, or secrets.

@@ -21,17 +21,17 @@
 </head>
 <body>
     <h1>Privacy Policy</h1>
-    <p class="updated">Last updated: April 2, 2026</p>
+    <p class="updated">Last updated: September 20, 2026</p>
 
     <h2>Overview</h2>
     <p>Volocal is a fully on-device voice AI assistant. Your privacy is fundamental to how this app is built — all speech recognition, language model inference, and text-to-speech processing happen entirely on your device.</p>
 
     <h2>Data Collection</h2>
-    <p><strong>Volocal does not collect, store, transmit, or share any personal data.</strong></p>
+    <p><strong>Volocal does not collect, store, transmit, or share conversation data.</strong></p>
     <ul>
         <li>Your voice input is processed entirely on your device and is never sent to any server.</li>
         <li>Conversations are not recorded, logged, or stored beyond the current session.</li>
-        <li>No analytics, tracking, or telemetry data is collected.</li>
+        <li>No analytics, tracking, or telemetry SDKs are included.</li>
         <li>No account or sign-in is required.</li>
     </ul>
 
@@ -39,10 +39,11 @@
     <p>Volocal requests microphone access solely to capture your voice for on-device speech-to-text processing. Audio data is processed in real-time and is not stored or transmitted.</p>
 
     <h2>Network Usage</h2>
-    <p>Volocal requires an internet connection only during the initial setup to download the AI models (~2.3 GB). After the models are downloaded, the app functions entirely offline. No data is sent from the app to any server at any time.</p>
+    <p>Internet is used only to download (and optionally search/list) public AI model files from Hugging Face — CoreML speech/voice packs and GGUF language models you choose. After those files are on the device, voice chat works offline. Speech audio, transcripts, and model tokens are not uploaded.</p>
+    <p>Hugging Face may see your IP address and which public model files you fetch. That is ordinary HTTPS file download, not a voice API.</p>
 
     <h2>Third-Party Services</h2>
-    <p>Volocal does not integrate with any third-party analytics, advertising, or tracking services.</p>
+    <p>Volocal does not integrate with any third-party analytics, advertising, or tracking services. Model weights are fetched from Hugging Face and (at compile time) source packages from GitHub.</p>
 
     <h2>Children's Privacy</h2>
     <p>Volocal does not collect any data from any users, including children under 13.</p>
