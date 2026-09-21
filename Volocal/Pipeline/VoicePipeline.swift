@@ -54,10 +54,18 @@ final class VoicePipeline: ObservableObject {
 
     init() {
         setupCallbacks()
-        // Forward partial transcript from STT manager
         sttManager.$partialResult
             .receive(on: DispatchQueue.main)
             .assign(to: &$partialTranscript)
+
+        llmManager.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
+        ttsManager.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
     }
 
     var metrics: SystemMetrics?

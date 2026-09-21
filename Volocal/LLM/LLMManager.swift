@@ -12,15 +12,24 @@ final class LLMManager: ObservableObject {
     @Published var error: String?
     @Published var tokensPerSecond: Double = 0
     @Published var loadedModelName: String?
+    @Published var generatePhase: GeneratePhase = .idle
+    @Published var hiddenTokenCount: Int = 0
+    @Published var spokenCharCount: Int = 0
+
+    enum GeneratePhase: Equatable {
+        case idle
+        case readingPrompt
+        case hiddenReasoning
+        case writingSpeech
+    }
 
     private var llamaContext: LlamaContext?
     private var generationTask: Task<Void, Never>?
 
     private let systemPrompt = """
     You are Volocal, a helpful voice assistant running entirely on-device. \
-    Keep responses concise and conversational — typically 1-3 sentences. \
-    You're speaking out loud, so avoid markdown, code blocks, or lists. \
-    Be friendly, direct, and natural.
+    Keep replies to 1-2 short spoken sentences. No markdown, lists, or inner monologue. \
+    Answer immediately.
     """
 
     init() {}
@@ -28,7 +37,7 @@ final class LLMManager: ObservableObject {
     func loadModel(path: String, displayName: String? = nil) async throws {
         unload()
         await Task.yield()
-        llamaContext = try LlamaContext.create(path: path, contextSize: 4096)
+        llamaContext = try LlamaContext.create(path: path, contextSize: 2048)
         loadedModelName = displayName ?? URL(fileURLWithPath: path).lastPathComponent
     }
 
@@ -58,6 +67,9 @@ final class LLMManager: ObservableObject {
                     self.isGenerating = true
                     self.response = ""
                     self.tokensPerSecond = 0
+                    self.hiddenTokenCount = 0
+                    self.spokenCharCount = 0
+                    self.generatePhase = .readingPrompt
                 }
 
                 let turns: [(role: String, content: String)] = history.map {
@@ -66,6 +78,7 @@ final class LLMManager: ObservableObject {
 
                 let startTime = CFAbsoluteTimeGetCurrent()
                 var tokenCount = 0
+                var hiddenTokens = 0
                 var thinkFilter = ThinkTagFilter()
 
                 do {
@@ -81,8 +94,13 @@ final class LLMManager: ObservableObject {
                         let tps = elapsed > 0 ? Double(tokenCount) / elapsed : 0
 
                         let spoken = thinkFilter.push(token)
-                        guard !spoken.isEmpty else {
-                            await MainActor.run { self.tokensPerSecond = tps }
+                        if spoken.isEmpty {
+                            hiddenTokens += 1
+                            await MainActor.run {
+                                self.tokensPerSecond = tps
+                                self.hiddenTokenCount = hiddenTokens
+                                self.generatePhase = thinkFilter.isInsideThink ? .hiddenReasoning : .writingSpeech
+                            }
                             continue
                         }
 
@@ -91,6 +109,8 @@ final class LLMManager: ObservableObject {
                         await MainActor.run {
                             self.response += spoken
                             self.tokensPerSecond = tps
+                            self.spokenCharCount = self.response.count
+                            self.generatePhase = .writingSpeech
                         }
                     }
 
@@ -107,6 +127,7 @@ final class LLMManager: ObservableObject {
 
                 await MainActor.run {
                     self.isGenerating = false
+                    self.generatePhase = .idle
                 }
                 continuation.finish()
             }
@@ -117,6 +138,7 @@ final class LLMManager: ObservableObject {
         generationTask?.cancel()
         generationTask = nil
         isGenerating = false
+        generatePhase = .idle
     }
 
     var isModelLoaded: Bool {

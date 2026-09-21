@@ -47,9 +47,16 @@ struct PipelineView: View {
                 // Status + mic button
                 VStack(spacing: 16) {
                     // Status indicator
-                    Text(pipeline.state.label)
+                    Text(statusTitle)
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
+
+                    if let statusDetail {
+                        Text(statusDetail)
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.tertiary)
+                            .multilineTextAlignment(.center)
+                    }
 
                     Text(modelManager.selectedLLM.displayName)
                         .font(.caption2)
@@ -134,6 +141,57 @@ struct PipelineView: View {
                 }
                 .environmentObject(modelManager)
             }
+        }
+    }
+
+    private var statusTitle: String {
+        switch pipeline.state {
+        case .idle:
+            return "Tap to start"
+        case .listening:
+            return "Listening..."
+        case .processing:
+            switch pipeline.llmManager.generatePhase {
+            case .readingPrompt:
+                return "LLM: reading prompt"
+            case .hiddenReasoning:
+                return "LLM: reasoning (hidden, not spoken)"
+            case .writingSpeech:
+                return "LLM: writing reply"
+            case .idle:
+                return "LLM: generating"
+            }
+        case .speaking:
+            switch pipeline.ttsManager.playbackPhase {
+            case .synthesizing:
+                return "TTS: generating audio"
+            case .playing:
+                return "TTS: playing"
+            case .idle:
+                return "TTS: starting"
+            }
+        }
+    }
+
+    private var statusDetail: String? {
+        switch pipeline.state {
+        case .processing, .speaking:
+            let tps = pipeline.llmManager.tokensPerSecond
+            let hidden = pipeline.llmManager.hiddenTokenCount
+            let spoken = pipeline.llmManager.spokenCharCount
+            var parts: [String] = []
+            if tps > 0 {
+                parts.append(String(format: "%.0f tok/s", tps))
+            }
+            if hidden > 0 {
+                parts.append("\(hidden) hidden tokens")
+            }
+            if spoken > 0 {
+                parts.append("\(spoken) spoken chars")
+            }
+            return parts.isEmpty ? "If this stays on LLM, the model is the delay. TTS only starts at TTS: generating audio." : parts.joined(separator: " · ")
+        default:
+            return nil
         }
     }
 

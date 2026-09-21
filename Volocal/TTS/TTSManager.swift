@@ -13,6 +13,13 @@ final class TTSManager: ObservableObject {
     @Published var selectedVoice: String = PocketTtsConstants.defaultVoice
     @Published var error: String?
     @Published private(set) var engineKind: TTSEngine = .pocketTts
+    @Published var playbackPhase: PlaybackPhase = .idle
+
+    enum PlaybackPhase: Equatable {
+        case idle
+        case synthesizing
+        case playing
+    }
 
     private var pocket: PocketTtsManager?
     private var kokoro: KokoroAneManager?
@@ -71,6 +78,7 @@ final class TTSManager: ObservableObject {
         speakTask?.cancel()
 
         isSpeaking = true
+        playbackPhase = .synthesizing
         error = nil
 
         let speakTimeout: TimeInterval = 30
@@ -103,6 +111,9 @@ final class TTSManager: ObservableObject {
                             break
                         }
                         chunkCount += 1
+                        if self.playbackPhase != .playing {
+                            self.playbackPhase = .playing
+                        }
                         sharedAudio.scheduleTTSBuffer(frame.samples)
                     }
                 } else if let kokoro {
@@ -111,6 +122,7 @@ final class TTSManager: ObservableObject {
                     self.markFirstInferenceIfNeeded()
                     if !result.samples.isEmpty {
                         chunkCount = 1
+                        self.playbackPhase = .playing
                         sharedAudio.scheduleTTSBuffer(result.samples)
                     }
                 } else {
@@ -130,6 +142,7 @@ final class TTSManager: ObservableObject {
             }
             if !Task.isCancelled {
                 self.isSpeaking = false
+                self.playbackPhase = .idle
             }
             logger.info("speak end")
         }
@@ -143,6 +156,7 @@ final class TTSManager: ObservableObject {
         speakTask = nil
         sharedAudio?.stopPlayback()
         isSpeaking = false
+        playbackPhase = .idle
     }
 
     private func markFirstInferenceIfNeeded() {

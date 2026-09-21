@@ -9,6 +9,8 @@ struct ThinkTagFilter {
     private let open = "<think>"
     private let close = "</think>"
 
+    var isInsideThink: Bool { insideThink }
+
     mutating func push(_ chunk: String) -> String {
         buffer += chunk
         var output = ""

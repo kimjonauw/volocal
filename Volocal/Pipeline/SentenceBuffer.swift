@@ -1,57 +1,50 @@
 import Foundation
 
-/// Accumulates streaming LLM tokens and emits complete sentences.
-/// Detects sentence boundaries at `.`, `!`, `?` followed by whitespace or end-of-stream.
-/// Also splits on `:` and `;` as secondary clause boundaries, and forces split at ~200 chars.
+/// Accumulates streaming LLM tokens and emits clauses for TTS as soon as possible.
+/// Prefers `.!?` / `:;` boundaries; the first chunk is forced out around 40 characters
+/// so voice can start before a full sentence exists.
 final class SentenceBuffer {
     private var buffer = ""
+    private var didEmit = false
 
-    /// Called when a complete sentence is ready for TTS
     var onSentenceReady: ((String) -> Void)?
 
-    /// Maximum characters before forcing a split at nearest word boundary
-    private let maxChars = 200
+    private let maxChars = 160
+    private let firstChunkChars = 40
 
-    /// Add a token to the buffer. May trigger onSentenceReady if a sentence boundary is found.
     func append(_ token: String) {
         buffer += token
 
-        // Look for sentence boundaries
         while let range = findSentenceBoundary() {
-            let sentence = String(buffer[buffer.startIndex...range.upperBound])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-
-            if !sentence.isEmpty {
-                onSentenceReady?(sentence)
-            }
-
+            emit(String(buffer[buffer.startIndex...range.upperBound]))
             let nextIndex = buffer.index(after: range.upperBound)
-            if nextIndex < buffer.endIndex {
-                buffer = String(buffer[nextIndex...])
-                    .trimmingCharacters(in: .whitespaces)
-            } else {
-                buffer = ""
-            }
+            buffer = nextIndex < buffer.endIndex
+                ? String(buffer[nextIndex...]).trimmingCharacters(in: .whitespaces)
+                : ""
         }
 
-        // Force split if buffer exceeds max length
-        if buffer.count > maxChars {
-            forceSplitAtWordBoundary()
+        let limit = didEmit ? maxChars : firstChunkChars
+        if buffer.count >= limit {
+            forceSplitAtWordBoundary(limit: limit)
         }
     }
 
-    /// Flush any remaining text in the buffer (call at end of generation)
     func flush() {
-        let remaining = buffer.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !remaining.isEmpty {
-            onSentenceReady?(remaining)
-        }
+        emit(buffer)
         buffer = ""
+        didEmit = false
     }
 
-    /// Reset the buffer
     func reset() {
         buffer = ""
+        didEmit = false
+    }
+
+    private func emit(_ raw: String) {
+        let sentence = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !sentence.isEmpty else { return }
+        didEmit = true
+        onSentenceReady?(sentence)
     }
 
     // MARK: - Private
@@ -98,30 +91,22 @@ final class SentenceBuffer {
     }
 
     /// Force a split at the nearest word boundary when buffer is too long.
-    private func forceSplitAtWordBoundary() {
-        // Find last space before maxChars
+    private func forceSplitAtWordBoundary(limit: Int) {
         var splitIndex = buffer.startIndex
         for i in buffer.indices {
-            if buffer.distance(from: buffer.startIndex, to: i) >= maxChars { break }
-            if buffer[i] == " " {
+            if buffer.distance(from: buffer.startIndex, to: i) >= limit { break }
+            if buffer[i] == " " || buffer[i] == "," {
                 splitIndex = i
             }
         }
 
-        // If we found a space to split on
         if splitIndex > buffer.startIndex {
-            let sentence = String(buffer[buffer.startIndex..<splitIndex])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if !sentence.isEmpty {
-                onSentenceReady?(sentence)
-            }
-
+            emit(String(buffer[buffer.startIndex..<splitIndex]))
             let nextIndex = buffer.index(after: splitIndex)
-            if nextIndex < buffer.endIndex {
-                buffer = String(buffer[nextIndex...])
-            } else {
-                buffer = ""
-            }
+            buffer = nextIndex < buffer.endIndex ? String(buffer[nextIndex...]) : ""
+        } else if buffer.count >= limit {
+            emit(buffer)
+            buffer = ""
         }
     }
 }

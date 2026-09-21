@@ -134,11 +134,14 @@ actor LlamaContext {
         }
 
         let tmpl = llama_model_chat_template(model, nil)
+        let prompt: String
         if let formatted = applyChatTemplate(tmpl: tmpl, messages: messages) {
-            return formatted
+            prompt = formatted
+        } else {
+            logger.warning("GGUF chat template was not applied; using ChatML. Llama/Gemma GGUFs may need a llama.cpp template update.")
+            prompt = ChatMLFallback.format(system: system, history: history)
         }
-        logger.warning("GGUF chat template was not applied; using ChatML. Llama/Gemma GGUFs may need a llama.cpp template update.")
-        return ChatMLFallback.format(system: system, history: history)
+        return ThinkingPrefix.suppress(prompt)
     }
 
     deinit {
@@ -294,7 +297,32 @@ private enum ChatMLFallback {
         for turn in history {
             prompt += "<|im_start|>\(turn.role)\n\(turn.content)<|im_end|>\n"
         }
-        prompt += "<|im_start|>assistant\n"
+        prompt += "<|im_start|>assistant\n<think>\n</think>\n"
+        return prompt
+    }
+}
+
+/// Qwen-class GGUFs leave an open `<think>` so the model reasons silently and TTS waits.
+/// Close that prefix so the first tokens are spoken words.
+private enum ThinkingPrefix {
+    static func suppress(_ prompt: String) -> String {
+        let lower = prompt.lowercased()
+        if let open = lower.range(of: "<think>", options: .backwards) {
+            let after = lower[open.upperBound...]
+            if after.range(of: "</think>") == nil {
+                var closed = prompt
+                if !closed.hasSuffix("\n") { closed += "\n" }
+                return closed + "</think>\n"
+            }
+            return prompt
+        }
+
+        let trimmed = prompt.trimmingCharacters(in: .newlines)
+        if trimmed.hasSuffix("<|im_start|>assistant") {
+            var out = prompt
+            if !out.hasSuffix("\n") { out += "\n" }
+            return out + "<think>\n</think>\n"
+        }
         return prompt
     }
 }
