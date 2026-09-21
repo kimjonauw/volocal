@@ -16,3 +16,4 @@ Full context: `AGENTS.md`. Trust review: `docs/SECURITY.md`.
 - No local Mac: ship IPAs via `.github/workflows/ios-ipa.yml` as a rolling GitHub Release (`sidestore` / `Volocal.ipa`). Do not compile iOS on Linux. Do not accumulate Actions artifact zips.
 - Do not commit model weights, IPAs, or secrets.
 - System prompt is user-editable (`volocal.customInstructions`). llama.cpp `n_ctx` is a 2K–128K log slider (`volocal.contextSize`, snap 512), not a free-form number. GGUF delete is in-app swipe; do not leave orphan huge files with no UI.
+- A kill during `llama_model_load_from_file` must not crash-loop: persist `volocal.pendingLLMLoad` before load and skip auto-load on the next launch.

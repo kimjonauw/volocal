@@ -85,12 +85,40 @@ final class VoicePipeline: ObservableObject {
         let gen = configureGeneration
         currentError = nil
         isReady = false
-        // Start shared audio engine
         sharedAudio.start()
-
-        // Inject shared audio into managers
         sttManager.sharedAudio = sharedAudio
         ttsManager.sharedAudio = sharedAudio
+
+        guard let path = llmModelPath else {
+            currentError = "No GGUF on this iPhone. Pick a language model first."
+            loadingStatus = nil
+            return
+        }
+
+        if LLMLoadFence.shouldSkipLoad(path: path) {
+            currentError = LlamaContextError.crashedLastLaunch.localizedDescription
+            loadingStatus = nil
+            return
+        }
+
+        applyInstructions(instructions ?? LLMManager.defaultInstructions)
+        llmManager.contextSize = LLMContextWindow.clamp(contextSize)
+        LLMLoadFence.markStarting(path: path, contextSize: llmManager.contextSize)
+
+        loadingStatus = "Loading language model..."
+        metrics?.beginTracking("LLM (llama.cpp)")
+        do {
+            try await llmManager.loadModel(path: path, displayName: displayName ?? URL(fileURLWithPath: path).lastPathComponent)
+        } catch {
+            LLMLoadFence.clear()
+            guard gen == configureGeneration else { return }
+            logger.error("LLM load failed: \(error.localizedDescription)")
+            currentError = "LLM failed to load: \(error.localizedDescription)"
+            loadingStatus = nil
+            return
+        }
+        guard gen == configureGeneration else { return }
+        metrics?.endTracking("LLM (llama.cpp)")
 
         loadingStatus = "Loading speech recognition..."
         metrics?.beginTracking("STT (\(stt.displayName))")
@@ -102,27 +130,6 @@ final class VoicePipeline: ObservableObject {
             loadingStatus = nil
             return
         }
-
-        loadingStatus = "Loading language model..."
-        guard let path = llmModelPath else {
-            currentError = "No GGUF on this iPhone. Pick a language model first."
-            loadingStatus = nil
-            return
-        }
-        applyInstructions(instructions ?? LLMManager.defaultInstructions)
-        llmManager.contextSize = LLMContextWindow.clamp(contextSize)
-        metrics?.beginTracking("LLM (llama.cpp)")
-        do {
-            try await llmManager.loadModel(path: path, displayName: displayName ?? URL(fileURLWithPath: path).lastPathComponent)
-        } catch {
-            guard gen == configureGeneration else { return }
-            logger.error("LLM load failed: \(error.localizedDescription)")
-            currentError = "LLM failed to load: \(error.localizedDescription)"
-            loadingStatus = nil
-            return
-        }
-        guard gen == configureGeneration else { return }
-        metrics?.endTracking("LLM (llama.cpp)")
 
         loadingStatus = "Loading text-to-speech..."
         ttsManager.metrics = metrics

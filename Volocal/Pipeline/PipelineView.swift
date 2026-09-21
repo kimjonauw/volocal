@@ -131,9 +131,15 @@ struct PipelineView: View {
             }
             .sheet(isPresented: $showLLMPicker) {
                 LLMPickerView(
-                    onModelReady: { _ in pipeline.invalidateForReload() },
+                    onModelReady: { _ in
+                        LLMLoadFence.allowRetry()
+                        pipeline.invalidateForReload()
+                    },
                     onInstructionsChanged: { pipeline.applyInstructions($0) },
-                    onNeedsReload: { pipeline.invalidateForReload() }
+                    onNeedsReload: {
+                        LLMLoadFence.allowRetry()
+                        pipeline.invalidateForReload()
+                    }
                 )
                 .environmentObject(modelManager)
             }

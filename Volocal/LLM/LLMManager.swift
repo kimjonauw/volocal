@@ -40,7 +40,10 @@ final class LLMManager: ObservableObject {
     func loadModel(path: String, displayName: String? = nil) async throws {
         unload()
         await Task.yield()
-        llamaContext = try LlamaContext.create(path: path, contextSize: contextSize)
+        let ctxSize = contextSize
+        llamaContext = try await Task.detached(priority: .userInitiated) {
+            try LlamaContext.create(path: path, contextSize: ctxSize)
+        }.value
         loadedModelName = displayName ?? URL(fileURLWithPath: path).lastPathComponent
     }
 
@@ -193,5 +196,46 @@ enum LLMContextWindow {
         let formatter = NumberFormatter()
         formatter.numberStyle = .decimal
         return formatter.string(from: NSNumber(value: clamp(size))) ?? "\(clamp(size))"
+    }
+}
+
+/// Survives a LiveContainer/jetsam kill during `llama_model_load_from_file` so relaunch does not crash-loop.
+enum LLMLoadFence {
+    private static let key = "volocal.pendingLLMLoad"
+    private static var retryAllowed = false
+
+    private struct Record: Codable {
+        var path: String
+        var contextSize: UInt32
+    }
+
+    static func shouldSkipLoad(path: String) -> Bool {
+        guard let rec = read() else { return false }
+        if retryAllowed { return false }
+        return rec.path == path
+    }
+
+    static func allowRetry() {
+        retryAllowed = true
+    }
+
+    static func markStarting(path: String, contextSize: UInt32) {
+        retryAllowed = false
+        let rec = Record(path: path, contextSize: contextSize)
+        if let data = try? JSONEncoder().encode(rec) {
+            UserDefaults.standard.set(data, forKey: key)
+            UserDefaults.standard.synchronize()
+        }
+    }
+
+    static func clear() {
+        retryAllowed = false
+        UserDefaults.standard.removeObject(forKey: key)
+        UserDefaults.standard.synchronize()
+    }
+
+    private static func read() -> Record? {
+        guard let data = UserDefaults.standard.data(forKey: key) else { return nil }
+        return try? JSONDecoder().decode(Record.self, from: data)
     }
 }

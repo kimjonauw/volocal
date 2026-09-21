@@ -43,52 +43,88 @@ actor LlamaContext {
     private var nDecode: Int32 = 0
     private var isDone: Bool = false
 
-    // Static ref-counted backend init/free — called once, not per instance
-    private static var backendRefCount = 0
-    private static let backendLock = NSLock()
-
-    private static func retainBackend() {
-        backendLock.lock()
-        defer { backendLock.unlock() }
-        if backendRefCount == 0 {
-            llama_backend_init()
-        }
-        backendRefCount += 1
-    }
-
-    private static func releaseBackend() {
-        backendLock.lock()
-        defer { backendLock.unlock() }
-        backendRefCount -= 1
-        if backendRefCount == 0 {
-            llama_backend_free()
-        }
-    }
-
     /// Create a new LlamaContext by loading a GGUF model file.
-    static func create(path: String, contextSize: UInt32 = 2048) throws -> LlamaContext {
-        retainBackend()
+    /// Blocking mmap/Metal work must not run on the main thread.
+    nonisolated static func create(path: String, contextSize: UInt32 = 2048) throws -> LlamaContext {
+        let url = URL(fileURLWithPath: path)
+        try validateLoadable(at: url)
+        let bytes = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? UInt64) ?? 0
+        let primaryLayers = gpuLayers(forFileBytes: bytes)
+        let primaryCtx = cappedContext(fileBytes: bytes, requested: contextSize)
+
+        do {
+            return try loadBlocking(path: path, gpuLayers: primaryLayers, contextSize: primaryCtx)
+        } catch {
+            if primaryLayers != 0 || primaryCtx > 2048 {
+                logger.error("LLM load retry on CPU with 2048 context after: \(error.localizedDescription)")
+                return try loadBlocking(path: path, gpuLayers: 0, contextSize: 2048)
+            }
+            throw error
+        }
+    }
+
+    nonisolated private static func validateLoadable(at url: URL) throws {
+        let name = url.lastPathComponent.lowercased()
+        if name.contains("iq1_") || name.contains("iq2_") || name.contains("iq3_") {
+            throw LlamaContextError.unsupportedQuant
+        }
+        guard GGUFFile.looksLikeGGUF(at: url) else {
+            throw LlamaContextError.modelLoadFailed
+        }
+        let bytes = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? UInt64) ?? 0
+        if bytes > 6_500_000_000 {
+            throw LlamaContextError.tooLarge(bytes)
+        }
+        if bytes < 1_048_576 {
+            throw LlamaContextError.modelLoadFailed
+        }
+    }
+
+    nonisolated private static func gpuLayers(forFileBytes bytes: UInt64) -> Int32 {
+        #if targetEnvironment(simulator)
+        return 0
+        #else
+        if bytes > 3_500_000_000 { return 0 }
+        if bytes > 2_200_000_000 { return 16 }
+        if bytes > 1_400_000_000 { return 32 }
+        return 99
+        #endif
+    }
+
+    nonisolated private static func cappedContext(fileBytes: UInt64, requested: UInt32) -> UInt32 {
+        let cap: UInt32
+        if fileBytes > 3_500_000_000 { cap = 2048 }
+        else if fileBytes > 2_200_000_000 { cap = 4096 }
+        else if fileBytes > 1_400_000_000 { cap = 8192 }
+        else { cap = LLMContextWindow.max }
+        return LLMContextWindow.clamp(min(requested, cap))
+    }
+
+    nonisolated private static func loadBlocking(
+        path: String,
+        gpuLayers: Int32,
+        contextSize: UInt32
+    ) throws -> LlamaContext {
+        LlamaBackend.retain()
 
         var modelParams = llama_model_default_params()
-        #if targetEnvironment(simulator)
-        modelParams.n_gpu_layers = 0
-        #else
-        modelParams.n_gpu_layers = 99 // Offload all layers to Metal GPU
-        #endif
+        modelParams.n_gpu_layers = gpuLayers
 
         guard let model = llama_model_load_from_file(path, modelParams) else {
+            LlamaBackend.release()
             throw LlamaContextError.modelLoadFailed
         }
 
         var ctxParams = llama_context_default_params()
         ctxParams.n_ctx = contextSize
-        ctxParams.n_batch = 512
+        ctxParams.n_batch = min(UInt32(512), contextSize)
         let threadCount = Int32(max(1, min(8, ProcessInfo.processInfo.processorCount - 2)))
         ctxParams.n_threads = threadCount
         ctxParams.n_threads_batch = threadCount
 
         guard let context = llama_init_from_model(model, ctxParams) else {
             llama_model_free(model)
+            LlamaBackend.release()
             throw LlamaContextError.contextCreationFailed
         }
 
@@ -149,7 +185,7 @@ actor LlamaContext {
         llama_batch_free(batch)
         llama_free(context)
         llama_model_free(model)
-        LlamaContext.releaseBackend()
+        LlamaBackend.release()
     }
 
     /// Tokenize and evaluate the prompt, preparing for token generation.
@@ -276,6 +312,29 @@ actor LlamaContext {
     }
 }
 
+private enum LlamaBackend {
+    private static var refCount = 0
+    private static let lock = NSLock()
+
+    static func retain() {
+        lock.lock()
+        defer { lock.unlock() }
+        if refCount == 0 {
+            llama_backend_init()
+        }
+        refCount += 1
+    }
+
+    static func release() {
+        lock.lock()
+        defer { lock.unlock() }
+        refCount -= 1
+        if refCount == 0 {
+            llama_backend_free()
+        }
+    }
+}
+
 private final class CStringBox {
     let ptr: UnsafeMutablePointer<CChar>
 
@@ -334,17 +393,27 @@ enum LlamaContextError: LocalizedError {
     case contextCreationFailed
     case promptTooLong
     case decodeFailed
+    case tooLarge(UInt64)
+    case unsupportedQuant
+    case crashedLastLaunch
 
     var errorDescription: String? {
         switch self {
         case .modelLoadFailed:
             return "Failed to load GGUF model file"
         case .contextCreationFailed:
-            return "Failed to create llama.cpp context"
+            return "Failed to create llama.cpp context (try a smaller GGUF or lower context)"
         case .promptTooLong:
             return "Prompt exceeds context window"
         case .decodeFailed:
             return "Token decode failed"
+        case .tooLarge(let bytes):
+            let size = ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+            return "This GGUF is \(size). With speech models resident that will jetsam LiveContainer. Pick a Q4 2B–4B."
+        case .unsupportedQuant:
+            return "IQ1/IQ2/IQ3 GGUFs are not safe in this llama.cpp build. Pick a Q4_K / Q5_K file."
+        case .crashedLastLaunch:
+            return "The last language-model load crashed (the app was killed). That GGUF is probably too big, an unsupported quant, or the context slider is too high. Pick a Q4 2B–4B, or Reset context to 2,048, then Try again."
         }
     }
 }

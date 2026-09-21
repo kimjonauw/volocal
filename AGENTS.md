@@ -43,7 +43,7 @@ Linux cannot compile iOS. Push to GitHub → **Actions → Build IPA** (`macos-1
 
 ## Hardware note
 
-Target was iPhone 17 Pro (~12 GB). `increased-memory-limit` raises the **jetsam cap** (often ~6–8 GB), it does not add physical RAM. 8B Q4 + STT + TTS is a stretch; keep defaults light. llama.cpp `n_ctx` is a **2K–128K log slider** (default 2048, snap 512). Custom instructions persist in `UserDefaults` (`volocal.customInstructions`) and are the system prompt; they are not extra Hub traffic. GGUFs live under Documents/`models/llm` and can be swipe-deleted.
+Target was iPhone 17 Pro (~12 GB). `increased-memory-limit` raises the **jetsam cap** (often ~6–8 GB), it does not add physical RAM. 8B Q4 + STT + TTS is a stretch; keep defaults light. llama.cpp `n_ctx` is a **2K–128K log slider** (default 2048, snap 512). A kill during GGUF load writes `volocal.pendingLLMLoad` so the next launch **does not crash-loop** — show the error and let them pick a smaller Q4. Custom instructions persist in `UserDefaults` (`volocal.customInstructions`) and are the system prompt; they are not extra Hub traffic. GGUFs live under Documents/`models/llm` and can be swipe-deleted.
 
 ## If you change FluidAudio or llama.swift
 

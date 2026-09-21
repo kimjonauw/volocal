@@ -32,6 +32,7 @@ struct ModelLoadingView: View {
                     .multilineTextAlignment(.center)
 
                 Button("Try again") {
+                    LLMLoadFence.allowRetry()
                     Task { await load() }
                 }
                 .buttonStyle(.borderedProminent)
@@ -56,11 +57,13 @@ struct ModelLoadingView: View {
         .sheet(isPresented: $showLLMPicker) {
             LLMPickerView(
                 onModelReady: { _ in
+                    LLMLoadFence.allowRetry()
                     pipeline.invalidateForReload()
                     Task { await load() }
                 },
                 onInstructionsChanged: { pipeline.applyInstructions($0) },
                 onNeedsReload: {
+                    LLMLoadFence.allowRetry()
                     pipeline.invalidateForReload()
                     Task { await load() }
                 }

@@ -58,6 +58,7 @@ Open the language-model screen (CPU icon). Three things live there:
 - **Your context / instructions** — this is the system prompt sent every turn. Edit it with who you are, how it should talk, or facts to remember. It applies on the next reply; the GGUF does not reload. Tap **Reset to default** to restore the short spoken-assistant prompt.
 - **Context window** — log slider for llama.cpp `n_ctx` (2,048–131,072, snaps to 512). Default **2048**. KV cache RAM grows with this; 64K+ plus an 8B GGUF plus STT/TTS can jetsam in LiveContainer. A 2B Q4 at 32K is usually fine on this phone. The GGUF’s trained window is a second ceiling. Chat history scales with the pick. Reloads when you lift your finger.
 - **Delete GGUFs** — swipe left on **On this iPhone** (or Files → On My iPhone → Volocal → `models`, when the IPA is a normal install). LiveContainer guests should swipe-delete in-app. Speech models stay in the FluidAudio cache until you delete the whole app.
+- If a GGUF **kills the app while loading**, the next launch stops and shows an error instead of crash-looping. Pick a Q4 **2B–4B**; 8B+ with STT+TTS often jetsams inside LiveContainer.
 
 ## Privacy / network
 

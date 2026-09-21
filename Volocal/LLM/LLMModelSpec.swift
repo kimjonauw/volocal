@@ -136,6 +136,7 @@ enum LLMFileFilter {
         guard name.hasSuffix(".gguf") else { return false }
         if name.contains("mmproj") { return false }
         if name.contains("imatrix") { return false }
+        if name.contains("iq1_") || name.contains("iq2_") || name.contains("iq3_") { return false }
         if name.contains("gguf-split") { return false }
         // Hub shards look like `*-00001-of-00003.gguf`, not `gguf-split`.
         if name.range(of: #"-\d{5}-of-\d{5}\.gguf$"#, options: .regularExpression) != nil {
