@@ -63,7 +63,7 @@ struct PipelineView: View {
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)
 
-                    Text("\(modelManager.selectedSTT.displayName) · \(modelManager.selectedTTS.displayName)")
+                    Text("\(modelManager.selectedSTT.displayName) · \(modelManager.selectedTTS.displayName) · \(modelManager.selectedTTS.voiceChoices.first { $0.id == modelManager.selectedTTSVoice }?.displayName ?? modelManager.selectedTTSVoice)")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)
@@ -136,9 +136,10 @@ struct PipelineView: View {
                 .environmentObject(modelManager)
             }
             .sheet(isPresented: $showVoicePicker) {
-                VoiceEnginePickerView {
-                    pipeline.invalidateForReload()
-                }
+                VoiceEnginePickerView(
+                    onEnginesChanged: { pipeline.invalidateForReload() },
+                    onVoiceChanged: { pipeline.setTTSVoice($0) }
+                )
                 .environmentObject(modelManager)
             }
         }

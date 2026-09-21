@@ -61,10 +61,13 @@ struct ModelLoadingView: View {
             .environmentObject(modelManager)
         }
         .sheet(isPresented: $showVoicePicker) {
-            VoiceEnginePickerView {
-                pipeline.invalidateForReload()
-                Task { await load() }
-            }
+            VoiceEnginePickerView(
+                onEnginesChanged: {
+                    pipeline.invalidateForReload()
+                    Task { await load() }
+                },
+                onVoiceChanged: { pipeline.setTTSVoice($0) }
+            )
             .environmentObject(modelManager)
         }
         .task {
@@ -79,7 +82,8 @@ struct ModelLoadingView: View {
             llmModelPath: modelManager.llmModelPath,
             displayName: modelManager.selectedLLM.displayName,
             stt: modelManager.selectedSTT,
-            tts: modelManager.selectedTTS
+            tts: modelManager.selectedTTS,
+            ttsVoice: modelManager.selectedTTSVoice
         )
     }
 }

@@ -36,12 +36,15 @@ final class TTSManager: ObservableObject {
 
     /// Initialize the selected TTS engine. Downloads CoreML models on first use,
     /// then runs a dummy generation to warm up.
-    func initialize(engine: TTSEngine) async {
+    func initialize(engine: TTSEngine, voice: String? = nil) async {
         stop()
         pocket = nil
         kokoro = nil
         engineKind = engine
-        selectedVoice = engine.defaultVoice
+        selectedVoice = {
+            if let voice, engine.voiceNames.contains(voice) { return voice }
+            return engine.defaultVoice
+        }()
         error = nil
 
         do {

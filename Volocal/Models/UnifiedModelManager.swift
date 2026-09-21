@@ -8,6 +8,7 @@ private let logger = Logger(subsystem: "com.volocal.app", category: "models")
 private let selectedLLMKey = "volocal.selectedLLM.spec"
 private let selectedSTTKey = "volocal.selectedSTT.engine"
 private let selectedTTSKey = "volocal.selectedTTS.engine"
+private let selectedTTSVoiceKey = "volocal.selectedTTS.voice"
 private let onboardedKey = "volocal.hasCompletedOnboarding"
 
 /// Unified model manager tracking download state for STT, TTS, and the selected GGUF.
@@ -18,6 +19,7 @@ final class UnifiedModelManager: ObservableObject {
     @Published var selectedLLM: LLMModelSpec
     @Published var selectedSTT: STTEngine
     @Published var selectedTTS: TTSEngine
+    @Published var selectedTTSVoice: String
     @Published var hasCompletedOnboarding: Bool
 
     enum ModelState: Equatable {
@@ -66,6 +68,12 @@ final class UnifiedModelManager: ObservableObject {
         } else {
             selectedTTS = .pocketTts
         }
+        if let raw = UserDefaults.standard.string(forKey: selectedTTSVoiceKey),
+           selectedTTS.voiceNames.contains(raw) {
+            selectedTTSVoice = raw
+        } else {
+            selectedTTSVoice = selectedTTS.defaultVoice
+        }
         hasCompletedOnboarding = UserDefaults.standard.bool(forKey: onboardedKey)
         checkExistingModels()
     }
@@ -76,6 +84,7 @@ final class UnifiedModelManager: ObservableObject {
         }
         UserDefaults.standard.set(selectedSTT.rawValue, forKey: selectedSTTKey)
         UserDefaults.standard.set(selectedTTS.rawValue, forKey: selectedTTSKey)
+        UserDefaults.standard.set(selectedTTSVoice, forKey: selectedTTSVoiceKey)
         checkExistingModels()
     }
 
@@ -99,6 +108,15 @@ final class UnifiedModelManager: ObservableObject {
     func selectTTS(_ engine: TTSEngine) {
         guard engine != selectedTTS else { return }
         selectedTTS = engine
+        if !engine.voiceNames.contains(selectedTTSVoice) {
+            selectedTTSVoice = engine.defaultVoice
+        }
+        persistSelection()
+    }
+
+    func selectTTSVoice(_ name: String) {
+        guard selectedTTS.voiceNames.contains(name), name != selectedTTSVoice else { return }
+        selectedTTSVoice = name
         persistSelection()
     }
 

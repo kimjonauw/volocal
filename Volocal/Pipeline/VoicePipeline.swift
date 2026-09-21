@@ -74,7 +74,8 @@ final class VoicePipeline: ObservableObject {
         llmModelPath: String?,
         displayName: String? = nil,
         stt: STTEngine = .parakeetEou320,
-        tts: TTSEngine = .pocketTts
+        tts: TTSEngine = .pocketTts,
+        ttsVoice: String? = nil
     ) async {
         configureGeneration += 1
         let gen = configureGeneration
@@ -119,7 +120,7 @@ final class VoicePipeline: ObservableObject {
 
         loadingStatus = "Loading text-to-speech..."
         ttsManager.metrics = metrics
-        await ttsManager.initialize(engine: tts)
+        await ttsManager.initialize(engine: tts, voice: ttsVoice)
         guard gen == configureGeneration else { return }
         if let ttsError = ttsManager.error {
             currentError = ttsError
@@ -131,7 +132,10 @@ final class VoicePipeline: ObservableObject {
         isReady = true
     }
 
-    /// Drop back to the loading screen so `configure` picks up the current STT/TTS/LLM selection.
+    func setTTSVoice(_ name: String) {
+        ttsManager.selectedVoice = name
+    }
+
     func invalidateForReload() {
         if state == .processing || state == .speaking {
             interrupt()

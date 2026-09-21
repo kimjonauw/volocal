@@ -103,19 +103,37 @@ enum TTSEngine: String, CaseIterable, Codable, Identifiable {
 
     var defaultVoice: String {
         switch self {
-        case .pocketTts: return PocketTtsConstants.defaultVoice
-        case .kokoroAne: return KokoroAneConstants.defaultVoice
+        case .pocketTts: return "fantine"
+        case .kokoroAne: return "af_heart"
         }
     }
 
-    var voiceNames: [String] {
+    var voiceChoices: [TTSVoiceChoice] {
         switch self {
         case .pocketTts:
-            return ["alba", "marius", "javert", "jean", "fantine", "cosette", "eponine", "azelma"]
+            return [
+                TTSVoiceChoice(id: "fantine", displayName: "Fantine", detail: "Woman"),
+                TTSVoiceChoice(id: "cosette", displayName: "Cosette", detail: "Woman"),
+                TTSVoiceChoice(id: "eponine", displayName: "Éponine", detail: "Woman"),
+                TTSVoiceChoice(id: "azelma", displayName: "Azelma", detail: "Woman"),
+                TTSVoiceChoice(id: "alba", displayName: "Alba", detail: "Woman"),
+                TTSVoiceChoice(id: "marius", displayName: "Marius", detail: "Man"),
+                TTSVoiceChoice(id: "jean", displayName: "Jean", detail: "Man"),
+                TTSVoiceChoice(id: "javert", displayName: "Javert", detail: "Man"),
+            ]
         case .kokoroAne:
-            return ["af_heart", "af_bella", "af_nicole", "am_michael", "am_fenrir", "bf_emma"]
+            return [
+                TTSVoiceChoice(id: "af_heart", displayName: "Heart", detail: "Woman (US)"),
+                TTSVoiceChoice(id: "af_bella", displayName: "Bella", detail: "Woman (US)"),
+                TTSVoiceChoice(id: "af_nicole", displayName: "Nicole", detail: "Woman (US)"),
+                TTSVoiceChoice(id: "bf_emma", displayName: "Emma", detail: "Woman (UK)"),
+                TTSVoiceChoice(id: "am_michael", displayName: "Michael", detail: "Man (US)"),
+                TTSVoiceChoice(id: "am_fenrir", displayName: "Fenrir", detail: "Man (US)"),
+            ]
         }
     }
+
+    var voiceNames: [String] { voiceChoices.map(\.id) }
 
     func isDownloaded() -> Bool {
         guard let cache = try? TtsCacheDirectory.ensure() else { return false }
@@ -135,6 +153,12 @@ enum TTSEngine: String, CaseIterable, Codable, Identifiable {
             )
         }
     }
+}
+
+struct TTSVoiceChoice: Identifiable, Equatable {
+    let id: String
+    let displayName: String
+    let detail: String
 }
 
 enum FluidAudioCache {

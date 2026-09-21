@@ -5,6 +5,7 @@ struct VoiceEnginePickerView: View {
     @Environment(\.dismiss) private var dismiss
 
     var onEnginesChanged: (() -> Void)?
+    var onVoiceChanged: ((String) -> Void)?
 
     @State private var busyLabel: String?
     @State private var localError: String?
@@ -51,7 +52,7 @@ struct VoiceEnginePickerView: View {
                     }
                 }
 
-                Section("Text-to-speech") {
+                Section("Text-to-speech engine") {
                     ForEach(TTSEngine.allCases) { engine in
                         engineRow(
                             title: engine.displayName,
@@ -61,6 +62,30 @@ struct VoiceEnginePickerView: View {
                             ready: engine.isDownloaded()
                         ) {
                             Task { await pickTTS(engine) }
+                        }
+                    }
+                }
+
+                Section("Speaker") {
+                    ForEach(modelManager.selectedTTS.voiceChoices) { voice in
+                        Button {
+                            modelManager.selectTTSVoice(voice.id)
+                            onVoiceChanged?(voice.id)
+                        } label: {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(voice.displayName)
+                                        .foregroundStyle(.primary)
+                                    Text(voice.detail)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                if modelManager.selectedTTSVoice == voice.id {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .foregroundStyle(Color.accentColor)
+                                }
+                            }
                         }
                     }
                 }
