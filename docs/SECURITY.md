@@ -1,6 +1,6 @@
 # Trust review (2026-09-20)
 
-Static review of upstream `fikrikarim/volocal` (MIT) plus this fork. **Not a pentest** and not a binary/IPA scan of App Store builds.
+Static review of this MIT-licensed tree. **Not a pentest** and not a binary/IPA scan of store builds.
 
 ## Verdict
 
@@ -33,7 +33,7 @@ Hugging Face still sees IP, User-Agent, and which public repo/file you fetch. Th
 
 ## Upstream FluidAudio pin (historical)
 
-Original Volocal used `fikrikarim/FluidAudio` `branch: main`. Diff vs FluidInference was a streaming chunk-size fix, not extra network. This fork **dropped that pin** for official `FluidInference/FluidAudio` `from: 0.15.8`.
+This tree previously pinned an outdated FluidAudio git branch. That pin is gone; the app uses official `FluidInference/FluidAudio` `from: 0.15.8`.
 
 ## Known non-malware issues (fixed or still true)
 

@@ -35,4 +35,4 @@ REQUIREMENTS
 - Physical device only (Neural Engine is not available in the Simulator)
 - ~2.3 GB of storage for model downloads on first launch
 
-Volocal is MIT licensed and open source. Built by Fikri Karim.
+Volocal is MIT licensed and open source.

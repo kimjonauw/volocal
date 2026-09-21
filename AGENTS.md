@@ -2,7 +2,7 @@
 
 Read this before changing Volocal. Human-facing overview is in `README.md`. Trust/network review is in `docs/SECURITY.md`.
 
-Upstream: [fikrikarim/volocal](https://github.com/fikrikarim/volocal) (MIT). This tree is a SideStore-oriented fork: modular GGUF LLM, selectable STT/TTS, unsigned IPA via GitHub Actions. The developer does **not** have a Mac.
+MIT-licensed on-device iOS voice app: modular GGUF LLM, selectable STT/TTS, unsigned IPA via GitHub Actions. The developer does **not** have a Mac.
 
 ## Product constraints (do not violate)
 
@@ -11,7 +11,7 @@ Upstream: [fikrikarim/volocal](https://github.com/fikrikarim/volocal) (MIT). Thi
 - **Barge-in** is the point of this app vs Locally AI. Keep one `AVAudioEngine`, Voice Processing AEC, mic open during TTS.
 - **Install:** SideStore real app slot, not a LiveContainer guest (mic/AEC is flaky). `increased-memory-limit` is in entitlements; GetMoreRAM can re-apply it. Extra RAM does not add barge-in to other apps.
 - **Do not** add analytics, crash reporters, ads, accounts, or third-party SDKs that open a network path.
-- **Do not** restore `com.fikrikarim.volocal` / team `FBS8R927D4`. Bundle ID is `com.localiosllm.volocal`.
+- **Do not** restore a foreign App Store bundle ID or DEVELOPMENT_TEAM. Bundle ID is `com.localiosllm.volocal`.
 - **Do not** commit `.gguf`, CoreML packs, IPAs, or secrets.
 
 ## Stack (as of 2026-09-20)
@@ -22,7 +22,7 @@ Upstream: [fikrikarim/volocal](https://github.com/fikrikarim/volocal) (MIT). Thi
 | LLM | any HF GGUF (Qwen 2B Q4 suggested) | user-picked GGUF | Metal |
 | TTS | PocketTTS v2.1 English, streaming | Kokoro ANE (batched, prettier) | GPU+CPU (Pocket) / ANE (Kokoro) |
 
-- FluidAudio: SPM `https://github.com/FluidInference/FluidAudio.git` **from 0.15.8** (not the old `fikrikarim/FluidAudio` `branch: main`). APIs: `ModelHub.download`, `StreamingEouAsrManager.loadModels(to:)`, `PocketTtsResourceDownloader.ensureModels(language:)`.
+- FluidAudio: SPM `https://github.com/FluidInference/FluidAudio.git` **from 0.15.8** (not an old third-party `branch: main` pin). APIs: `ModelHub.download`, `StreamingEouAsrManager.loadModels(to:)`, `PocketTtsResourceDownloader.ensureModels(language:)`.
 - llama.swift: `from: "2.0.0"`. `llama_sampler_init_penalties` is **4-arg** on this pin. Newer llama.cpp puts `n_vocab` first — update the call if you bump the package.
 - PocketTTS and Kokoro both emit **24 kHz** mono; `SharedAudioEngine.ttsFormat` is 24 kHz. Do not add 44.1 kHz TTS (e.g. Supertonic-3) without resampling.
 - Nemotron has **no EOU head**. `STTManager` treats ~900 ms of unchanged partial as a turn.
