@@ -16,7 +16,7 @@ Pick any Hugging Face GGUF for the language model, and swap STT/TTS engines. Git
 - Real-time voice conversations with interrupt (barge-in)
 - Hardware echo cancellation so the mic doesn't pick up its own output
 - Pick any llama.cpp **GGUF** from Hugging Face
-- Custom conversation instructions (system prompt) and a 2K–16K token context window
+- Custom conversation instructions (system prompt) and a 2K–128K token context window
 - Swipe-delete unused GGUFs on the phone
 - Pick STT (Parakeet EOU 160/320 or Nemotron 560) and TTS (PocketTTS v2.1 or Kokoro ANE)
 - First-launch downloads from Hugging Face with per-model progress
@@ -56,7 +56,7 @@ Runtime memory: ~1.2 GB with the small default stack. Larger GGUFs need `increas
 Open the language-model screen (CPU icon). Three things live there:
 
 - **Your context / instructions** — this is the system prompt sent every turn. Edit it with who you are, how it should talk, or facts to remember. It applies on the next reply; the GGUF does not reload. Tap **Reset to default** to restore the short spoken-assistant prompt.
-- **Context window** — llama.cpp `n_ctx`, default **2048**. Pick 4096 / 8192 / 16384 if you want a longer pass (hidden Qwen reasoning and more of the chat). KV cache RAM grows with this; 16K plus an 8B GGUF plus STT/TTS can jetsam in LiveContainer. The GGUF’s trained window is a second ceiling. Chat history scales with the pick (about 4–16 exchanges). Changing it reloads the model.
+- **Context window** — llama.cpp `n_ctx`, default **2048**. Pick up to **128K**. KV cache RAM grows with this; 64K+ plus an 8B GGUF plus STT/TTS can jetsam in LiveContainer. A 2B Q4 at 32K is usually fine on this phone. The GGUF’s trained window is a second ceiling. Chat history scales with the pick. Changing it reloads the model.
 - **Delete GGUFs** — swipe left on **On this iPhone** (or Files → On My iPhone → Volocal → `models`, when the IPA is a normal install). LiveContainer guests should swipe-delete in-app. Speech models stay in the FluidAudio cache until you delete the whole app.
 
 ## Privacy / network

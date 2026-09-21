@@ -151,7 +151,7 @@ final class LLMManager: ObservableObject {
 
 /// llama.cpp `n_ctx`. KV cache grows with this; the GGUF's trained window is the other ceiling.
 enum LLMContextWindow {
-    static let choices: [UInt32] = [2048, 4096, 8192, 16384]
+    static let choices: [UInt32] = [2048, 4096, 8192, 16384, 32768, 65536, 131072]
     static let `default`: UInt32 = 2048
 
     static func clamp(_ size: UInt32) -> UInt32 {
@@ -161,6 +161,9 @@ enum LLMContextWindow {
     /// User+assistant messages kept in the voice transcript (system prompt is separate).
     static func historyEntries(for size: UInt32) -> Int {
         switch clamp(size) {
+        case 131072: return 80
+        case 65536: return 64
+        case 32768: return 48
         case 16384: return 32
         case 8192: return 24
         case 4096: return 16
@@ -173,7 +176,10 @@ enum LLMContextWindow {
         case 2048: return "2,048 · light"
         case 4096: return "4,096"
         case 8192: return "8,192"
-        default: return "16,384 · more RAM"
+        case 16384: return "16,384"
+        case 32768: return "32,768"
+        case 65536: return "65,536 · more RAM"
+        default: return "131,072 · max RAM"
         }
     }
 }

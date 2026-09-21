@@ -124,7 +124,7 @@ struct LLMPickerView: View {
         } header: {
             Text("Context window")
         } footer: {
-            Text("llama.cpp n_ctx: how many tokens of instructions + recent chat fit in one pass. Default 2,048 is light. 8K/16K are fine on an iPhone 17 Pro with a 2B GGUF; 8B + STT + TTS at 16K can jetsam in LiveContainer. History length scales with this. The GGUF’s trained window is a second ceiling. Changing this reloads the model.")
+            Text("llama.cpp n_ctx: how many tokens of instructions + recent chat fit in one pass. Default 2,048 is light. 32K–128K are usable on an iPhone 17 Pro with a 2B GGUF; 8B + STT + TTS at 64K+ can jetsam in LiveContainer. History length scales with this. The GGUF’s trained window is a second ceiling (quality drops past that even if it loads). Changing this reloads the model.")
         }
     }
 
