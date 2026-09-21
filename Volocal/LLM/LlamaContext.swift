@@ -5,15 +5,21 @@ import os
 
 private let logger = Logger(subsystem: "com.volocal.app", category: "llama")
 
+private func volocalLlamaLog(
+    _ level: ggml_log_level,
+    _ text: UnsafePointer<CChar>?,
+    _ userData: UnsafeMutableRawPointer?
+) {
+    guard let text else { return }
+    LlamaLogSink.append(String(cString: text))
+}
+
 private enum LlamaLogSink {
     private static let lock = NSLock()
     private static var lines: [String] = []
 
     static func install() {
-        llama_log_set({ _, text, _ in
-            guard let text else { return }
-            append(String(cString: text))
-        }, nil)
+        llama_log_set(volocalLlamaLog, nil)
     }
 
     static func clear() {
