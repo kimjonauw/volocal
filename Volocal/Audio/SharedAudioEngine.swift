@@ -118,10 +118,6 @@ final class SharedAudioEngine: ObservableObject {
             // Engine is stopped so the graph can be modified safely.
             let audioBridge = self.bridge
             inputNode.installTap(onBus: 0, bufferSize: 4096, format: nil) { buffer, _ in
-                // No speaking gate — VP handles echo cancellation.
-                // Mic stays active during TTS for barge-in (voice interruption).
-
-                // Copy buffer — the original may be reused by the audio engine
                 guard let copy = AVAudioPCMBuffer(
                     pcmFormat: buffer.format,
                     frameCapacity: buffer.frameLength
@@ -131,6 +127,12 @@ final class SharedAudioEngine: ObservableObject {
                     for ch in 0..<Int(buffer.format.channelCount) {
                         dst[ch].update(from: src[ch], count: Int(buffer.frameLength))
                     }
+                }
+
+                // LiveContainer VP AEC leaks speaker audio. Drop quiet buffers while TTS plays
+                // so barge-in still works for a real nearby voice.
+                if audioBridge.isSpeaking {
+                    if SharedAudioEngine.rmsEnergy(copy) < 0.05 { return }
                 }
 
                 audioBridge.inputContinuation?.yield(copy)
@@ -202,5 +204,17 @@ final class SharedAudioEngine: ObservableObject {
             try? await Task.sleep(for: .milliseconds(50))
             if Task.isCancelled { break }
         }
+    }
+
+    nonisolated static func rmsEnergy(_ buffer: AVAudioPCMBuffer) -> Float {
+        guard let data = buffer.floatChannelData?[0] else { return 0 }
+        let n = Int(buffer.frameLength)
+        guard n > 0 else { return 0 }
+        var sum: Float = 0
+        for i in 0..<n {
+            let x = data[i]
+            sum += x * x
+        }
+        return sqrtf(sum / Float(n))
     }
 }

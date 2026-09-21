@@ -42,7 +42,7 @@ STT on [FluidAudio](https://github.com/FluidInference/FluidAudio) (CoreML / Neur
 | TTS | PocketTTS v2.1 (default, streaming) or Kokoro ANE (prettier, batched) | ~350–550 MB | CoreML |
 
 - **Parakeet EOU** — live barge-in with built-in end-of-utterance (~5% WER, 160/320 ms chunks). Nemotron 0.6B is optional (clearer, heavier, pause-based turns).
-- **Any GGUF** — llama.cpp loads what you download. Qwen-class 2B Q4 is the suggested size for a 12 GB iPhone with STT+TTS resident.
+- **Any GGUF chat model** — llama.cpp (b10549) loads decoder GGUFs. Prefer **Q4_K / Q5_K / Q6_K**. A 250 MB file can still fail if it is an embedding/rerank GGUF, a different architecture, or flash-attn/KV that iOS Metal rejects. Qwen 3.5 2B Q4_K at 2048 is the known-good stack.
 - **PocketTTS v2.1** — streaming (~26 ms to first audio). Kokoro ANE sounds nicer but is batched and contends with Parakeet for ANE.
 
 ### Audio

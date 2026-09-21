@@ -31,6 +31,8 @@ final class VoicePipeline: ObservableObject {
     private var turnRevision: Int = 0
     private var configureGeneration: Int = 0
     private var cancellables = Set<AnyCancellable>()
+    private var lastSpokenTTS = ""
+    private var speakingEndedAt: Date?
 
     /// Maximum conversation history entries (system prompt excluded).
     /// Each exchange is 2 entries (user + assistant). Scales with `n_ctx`.
@@ -143,6 +145,7 @@ final class VoicePipeline: ObservableObject {
 
         loadingStatus = nil
         isReady = true
+        LLMLoadFence.clear()
     }
 
     func setTTSVoice(_ name: String) {
@@ -214,6 +217,7 @@ final class VoicePipeline: ObservableObject {
         speakingTask = nil
         sentenceQueue.removeAll()
         sentenceBuffer.reset()
+        lastSpokenTTS = ""
         currentResponse = ""
         // Don't stop STT — mic stays open for barge-in
         state = .listening
@@ -233,6 +237,7 @@ final class VoicePipeline: ObservableObject {
                 guard let self else { return }
                 // Barge-in: user started speaking while AI is active
                 if self.state == .processing || self.state == .speaking {
+                    if self.isLikelySpeakerEcho(self.sttManager.partialResult) { return }
                     self.interrupt()
                 }
             }
@@ -246,6 +251,11 @@ final class VoicePipeline: ObservableObject {
     }
 
     private func handleUtterance(_ text: String) {
+        if isLikelySpeakerEcho(text) {
+            logger.info("Ignoring STT echo of TTS: \(text, privacy: .public)")
+            sttManager.resetForNextUtterance()
+            return
+        }
         // If AI is still active, interrupt first
         if state == .processing || state == .speaking {
             interrupt()
@@ -319,14 +329,34 @@ final class VoicePipeline: ObservableObject {
         guard !Task.isCancelled else { return }
 
         let sentence = sentenceQueue.removeFirst()
+        lastSpokenTTS += " " + sentence
+        if lastSpokenTTS.count > 400 {
+            lastSpokenTTS = String(lastSpokenTTS.suffix(400))
+        }
+        speakingEndedAt = nil
         let myRevision = turnRevision
         state = .speaking
         speakingTask = Task {
             await ttsManager.speak(sentence)
+            speakingEndedAt = Date()
             guard !Task.isCancelled, myRevision == turnRevision else { return }
             speakingTask = nil
             processNextSentence()
         }
+    }
+
+    private func isLikelySpeakerEcho(_ text: String) -> Bool {
+        let playing = ttsManager.isSpeaking || sharedAudio.isSpeaking
+        let justFinished = speakingEndedAt.map { Date().timeIntervalSince($0) < 0.7 } ?? false
+        guard playing || justFinished || state == .speaking else { return false }
+        let heard = text.lowercased().filter { $0.isLetter || $0.isWhitespace }
+            .split(separator: " ").joined(separator: " ")
+        guard !heard.isEmpty else { return true }
+        let spoken = lastSpokenTTS.lowercased().filter { $0.isLetter || $0.isWhitespace }
+            .split(separator: " ").joined(separator: " ")
+        if heard.count < 18 { return true }
+        if !spoken.isEmpty, spoken.contains(heard) || heard.contains(spoken) { return true }
+        return false
     }
 
     /// Trim conversation history to prevent context overflow.

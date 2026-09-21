@@ -5,6 +5,47 @@ import os
 
 private let logger = Logger(subsystem: "com.volocal.app", category: "llama")
 
+private enum LlamaLogSink {
+    private static let lock = NSLock()
+    private static var lines: [String] = []
+
+    static func install() {
+        llama_log_set({ _, text, _ in
+            guard let text else { return }
+            append(String(cString: text))
+        }, nil)
+    }
+
+    static func clear() {
+        lock.lock()
+        lines.removeAll()
+        lock.unlock()
+    }
+
+    static func append(_ raw: String) {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        let lower = text.lowercased()
+        let keep = lower.contains("error") || lower.contains("fail") || lower.contains("unable")
+            || lower.contains("invalid") || lower.contains("unknown") || lower.contains("not support")
+            || lower.contains("oom") || lower.contains("failed")
+        guard keep else { return }
+        lock.lock()
+        lines.append(text)
+        if lines.count > 10 {
+            lines.removeFirst(lines.count - 10)
+        }
+        lock.unlock()
+    }
+
+    static func hint() -> String {
+        lock.lock()
+        let joined = lines.suffix(4).joined(separator: " · ")
+        lock.unlock()
+        return joined
+    }
+}
+
 // MARK: - Batch Helpers (from official llama.cpp SwiftUI example)
 
 private func llama_batch_clear(_ batch: inout llama_batch) {
@@ -50,14 +91,13 @@ actor LlamaContext {
         try validateLoadable(at: url)
         let bytes = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? UInt64) ?? 0
         let primaryLayers = gpuLayers(forFileBytes: bytes)
-        let primaryCtx = cappedContext(fileBytes: bytes, requested: contextSize)
 
         do {
-            return try loadBlocking(path: path, gpuLayers: primaryLayers, contextSize: primaryCtx)
+            return try loadBlocking(path: path, gpuLayers: primaryLayers, contextSize: contextSize)
         } catch {
-            if primaryLayers != 0 || primaryCtx > 2048 {
-                logger.error("LLM load retry on CPU with 2048 context after: \(error.localizedDescription)")
-                return try loadBlocking(path: path, gpuLayers: 0, contextSize: 2048)
+            if primaryLayers != 0 {
+                logger.error("LLM load retry CPU-only after: \(error.localizedDescription)")
+                return try loadBlocking(path: path, gpuLayers: 0, contextSize: contextSize)
             }
             throw error
         }
@@ -68,15 +108,19 @@ actor LlamaContext {
         if name.contains("iq1_") || name.contains("iq2_") || name.contains("iq3_") {
             throw LlamaContextError.unsupportedQuant
         }
+        if name.contains("embed") || name.contains("rerank") || name.contains("bge-")
+            || name.contains("-e5-") || name.contains("minilm") || name.contains("mmproj") {
+            throw LlamaContextError.modelLoadFailed("This looks like an embedding, rerank, or vision GGUF — not a chat model. Qwen 3.5 2B Q4_K is the known-good pick.")
+        }
         guard GGUFFile.looksLikeGGUF(at: url) else {
-            throw LlamaContextError.modelLoadFailed
+            throw LlamaContextError.modelLoadFailed("File is not a GGUF (wrong magic).")
         }
         let bytes = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? UInt64) ?? 0
         if bytes > 6_500_000_000 {
             throw LlamaContextError.tooLarge(bytes)
         }
         if bytes < 1_048_576 {
-            throw LlamaContextError.modelLoadFailed
+            throw LlamaContextError.modelLoadFailed("File is smaller than 1 MB — truncated download.")
         }
     }
 
@@ -92,12 +136,12 @@ actor LlamaContext {
     }
 
     nonisolated private static func cappedContext(fileBytes: UInt64, requested: UInt32) -> UInt32 {
-        let cap: UInt32
-        if fileBytes > 3_500_000_000 { cap = 2048 }
-        else if fileBytes > 2_200_000_000 { cap = 4096 }
-        else if fileBytes > 1_400_000_000 { cap = 8192 }
-        else { cap = LLMContextWindow.max }
-        return LLMContextWindow.clamp(Swift.min(requested, cap))
+        let ramCap: UInt32
+        if fileBytes > 3_500_000_000 { ramCap = 2048 }
+        else if fileBytes > 2_200_000_000 { ramCap = 4096 }
+        else if fileBytes > 1_400_000_000 { ramCap = 8192 }
+        else { ramCap = requested }
+        return Swift.min(requested, ramCap)
     }
 
     nonisolated private static func loadBlocking(
@@ -106,36 +150,71 @@ actor LlamaContext {
         contextSize: UInt32
     ) throws -> LlamaContext {
         LlamaBackend.retain()
+        LlamaLogSink.clear()
 
         var modelParams = llama_model_default_params()
         modelParams.n_gpu_layers = gpuLayers
 
         guard let model = llama_model_load_from_file(path, modelParams) else {
             LlamaBackend.release()
-            throw LlamaContextError.modelLoadFailed
+            throw LlamaContextError.modelLoadFailed(LlamaLogSink.hint())
         }
 
-        var ctxParams = llama_context_default_params()
-        ctxParams.n_ctx = contextSize
-        ctxParams.n_batch = min(UInt32(512), contextSize)
+        let trained = UInt32(max(0, llama_model_n_ctx_train(model)))
+        var nctx = contextSize
+        if trained > 0 {
+            nctx = Swift.min(nctx, trained)
+        }
+        nctx = cappedContext(
+            fileBytes: (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? UInt64) ?? 0,
+            requested: nctx
+        )
+        nctx = max(UInt32(256), nctx)
+        nctx = (nctx / 32) * 32
+
+        var descBuf = [CChar](repeating: 0, count: 256)
+        _ = llama_model_desc(model, &descBuf, descBuf.count)
+        let modelDesc = String(cString: descBuf)
+
         let threadCount = Int32(max(1, min(8, ProcessInfo.processInfo.processorCount - 2)))
-        ctxParams.n_threads = threadCount
-        ctxParams.n_threads_batch = threadCount
+        let nBatchBase = Swift.min(UInt32(256), nctx)
 
-        guard let context = llama_init_from_model(model, ctxParams) else {
-            llama_model_free(model)
-            LlamaBackend.release()
-            throw LlamaContextError.contextCreationFailed
+        let attempts: [(flash: llama_flash_attn_type, offloadKQV: Bool, ctx: UInt32)] = [
+            (LLAMA_FLASH_ATTN_TYPE_AUTO, true, nctx),
+            (LLAMA_FLASH_ATTN_TYPE_DISABLED, true, nctx),
+            (LLAMA_FLASH_ATTN_TYPE_DISABLED, false, nctx),
+            (LLAMA_FLASH_ATTN_TYPE_DISABLED, false, Swift.min(nctx, 2048)),
+            (LLAMA_FLASH_ATTN_TYPE_DISABLED, false, Swift.min(nctx, 512)),
+        ]
+
+        for attempt in attempts {
+            var ctxParams = llama_context_default_params()
+            ctxParams.n_ctx = max(UInt32(256), (attempt.ctx / 32) * 32)
+            ctxParams.n_batch = Swift.min(nBatchBase, ctxParams.n_ctx)
+            ctxParams.n_ubatch = ctxParams.n_batch
+            ctxParams.n_seq_max = 1
+            ctxParams.n_threads = threadCount
+            ctxParams.n_threads_batch = threadCount
+            ctxParams.flash_attn_type = attempt.flash
+            ctxParams.offload_kqv = attempt.offloadKQV
+            ctxParams.embeddings = false
+
+            if let context = llama_init_from_model(model, ctxParams) {
+                logger.info("llama context ready desc=\(modelDesc, privacy: .public) n_ctx=\(ctxParams.n_ctx) kqv=\(attempt.offloadKQV)")
+                return LlamaContext(model: model, context: context, batchSize: ctxParams.n_batch)
+            }
         }
 
-        return LlamaContext(model: model, context: context)
+        llama_model_free(model)
+        LlamaBackend.release()
+        throw LlamaContextError.contextCreationFailed(model: modelDesc, log: LlamaLogSink.hint())
     }
 
-    private init(model: OpaquePointer, context: OpaquePointer) {
+    private init(model: OpaquePointer, context: OpaquePointer, batchSize: UInt32) {
         self.model = model
         self.context = context
         self.tokensList = []
-        self.batch = llama_batch_init(512, 0, 1)
+        self.batch = llama_batch_init(Int32(max(UInt32(32), batchSize)), 0, 1)
         self.vocab = llama_model_get_vocab(model)
 
         // Generic voice-assistant sampling. Not tied to a single model family.
@@ -321,6 +400,7 @@ private enum LlamaBackend {
         defer { lock.unlock() }
         if refCount == 0 {
             llama_backend_init()
+            LlamaLogSink.install()
         }
         refCount += 1
     }
@@ -389,8 +469,8 @@ private enum ThinkingPrefix {
 // MARK: - Errors
 
 enum LlamaContextError: LocalizedError {
-    case modelLoadFailed
-    case contextCreationFailed
+    case modelLoadFailed(String)
+    case contextCreationFailed(model: String, log: String)
     case promptTooLong
     case decodeFailed
     case tooLarge(UInt64)
@@ -399,10 +479,17 @@ enum LlamaContextError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .modelLoadFailed:
-            return "Failed to load GGUF model file"
-        case .contextCreationFailed:
-            return "Failed to create llama.cpp context (try a smaller GGUF or lower context)"
+        case .modelLoadFailed(let log):
+            if log.isEmpty {
+                return "llama.cpp could not load this GGUF (unknown architecture, bad quant, or truncated file). Qwen 3.5 2B Q4_K is the known-good pick."
+            }
+            return "llama.cpp could not load this GGUF. \(log)"
+        case .contextCreationFailed(let model, let log):
+            var parts = ["This GGUF loaded but llama.cpp could not create a context."]
+            if !model.isEmpty { parts.append(model) }
+            parts.append("Qwen 3.5 2B at 2048 working means RAM is fine — this file is a different architecture, an embedding/rerank GGUF, or needs flash-attn/KV settings iOS Metal rejected.")
+            if !log.isEmpty { parts.append(log) }
+            return parts.joined(separator: " ")
         case .promptTooLong:
             return "Prompt exceeds context window"
         case .decodeFailed:

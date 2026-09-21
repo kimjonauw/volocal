@@ -34,7 +34,7 @@ struct LLMPickerView: View {
                 }
 
                 Section {
-                    Text("Only GGUF files work here — that is what llama.cpp loads on-device. Safetensors / MLX / ONNX repos will not run.")
+                    Text("Only GGUF chat models work here. Prefer Q4_K / Q5_K / Q6_K (bartowski). Embedding, rerank, mmproj, IQ1–3, and Unsloth UD files often fail even when they are small. Qwen 3.5 2B Q4_K is the known-good pick.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
