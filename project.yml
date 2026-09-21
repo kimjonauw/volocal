@@ -11,14 +11,16 @@ settings:
     SWIFT_VERSION: "5.9"
     ENABLE_USER_SCRIPT_SANDBOXING: false
     EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
+    ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: YES
+    LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"
 
 packages:
   llama-swift:
     url: https://github.com/mattt/llama.swift.git
-    from: "2.0.0"
+    exactVersion: "2.10549.0"
   FluidAudio:
     url: https://github.com/FluidInference/FluidAudio.git
-    from: "0.15.8"
+    exactVersion: "0.15.8"
 
 targets:
   Volocal:
@@ -54,6 +56,9 @@ targets:
         CFBundlePackageType: APPL
         CFBundleExecutable: $(EXECUTABLE_NAME)
         UILaunchScreen: {}
+        LSRequiresIPhoneOS: true
+        UIRequiredDeviceCapabilities:
+          - arm64
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
         NSMicrophoneUsageDescription: "Volocal needs microphone access for voice conversations."

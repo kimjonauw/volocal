@@ -15,16 +15,8 @@ struct VolocalApp: App {
             } else if !pipeline.isReady {
                 ModelLoadingView()
                     .environmentObject(pipeline)
-                    .task {
-                        pipeline.metrics = metrics
-                        metrics.startMonitoring()
-                        await pipeline.configure(
-                            llmModelPath: modelManager.llmModelPath,
-                            displayName: modelManager.selectedLLM.displayName,
-                            stt: modelManager.selectedSTT,
-                            tts: modelManager.selectedTTS
-                        )
-                    }
+                    .environmentObject(modelManager)
+                    .environmentObject(metrics)
             } else {
                 ContentView()
                     .environmentObject(modelManager)

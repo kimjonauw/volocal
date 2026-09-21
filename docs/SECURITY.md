@@ -33,7 +33,7 @@ Hugging Face still sees IP, User-Agent, and which public repo/file you fetch. Th
 
 ## Upstream FluidAudio pin (historical)
 
-This tree previously pinned an outdated FluidAudio git branch. That pin is gone; the app uses official `FluidInference/FluidAudio` `from: 0.15.8`.
+This tree previously pinned an outdated FluidAudio git branch. That pin is gone; the app uses official `FluidInference/FluidAudio` **0.15.8** (exact).
 
 ## Known non-malware issues (fixed or still true)
 

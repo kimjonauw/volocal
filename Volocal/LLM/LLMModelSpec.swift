@@ -2,7 +2,9 @@ import Foundation
 
 /// A GGUF language model that can be downloaded from Hugging Face and loaded by llama.cpp.
 struct LLMModelSpec: Codable, Identifiable, Equatable, Hashable {
+    /// Hugging Face `org/repo`.
     var repoId: String
+    /// Path inside the repo (`model.gguf` or `subdir/model.gguf`). Disk storage uses the last component only.
     var filename: String
     var displayName: String
     var sizeBytes: Int64?
@@ -10,13 +12,26 @@ struct LLMModelSpec: Codable, Identifiable, Equatable, Hashable {
 
     var id: String { "\(repoId)/\(filename)" }
 
+    var diskFileName: String {
+        URL(fileURLWithPath: filename).lastPathComponent
+    }
+
     var downloadURL: URL? {
-        let encodedFile = filename.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? filename
-        return URL(string: "https://huggingface.co/\(repoId)/resolve/main/\(encodedFile)")
+        guard HuggingFaceHub.isValidRepoId(repoId), GGUFFile.isSafeHubPath(filename) else { return nil }
+        let encodedRepo = repoId
+            .split(separator: "/")
+            .map { $0.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? String($0) }
+            .joined(separator: "/")
+        let encodedFile = filename
+            .split(separator: "/")
+            .map { $0.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? String($0) }
+            .joined(separator: "/")
+        return URL(string: "https://huggingface.co/\(encodedRepo)/resolve/main/\(encodedFile)")
     }
 
     var huggingFacePageURL: URL? {
-        URL(string: "https://huggingface.co/\(repoId)")
+        guard HuggingFaceHub.isValidRepoId(repoId) else { return nil }
+        return URL(string: "https://huggingface.co/\(repoId)")
     }
 
     var sizeDescription: String {
@@ -33,12 +48,12 @@ struct LLMModelSpec: Codable, Identifiable, Equatable, Hashable {
         let folder = repoId.replacingOccurrences(of: "/", with: "__")
         return ModelRegistry.llmDirectory
             .appendingPathComponent(folder, isDirectory: true)
-            .appendingPathComponent(filename)
+            .appendingPathComponent(diskFileName)
     }
 
     /// Original Volocal layout dumped the default GGUF in Documents/models/.
     var legacyLocalURL: URL {
-        ModelRegistry.modelsDirectory.appendingPathComponent(filename)
+        ModelRegistry.modelsDirectory.appendingPathComponent(diskFileName)
     }
 
     var localURL: URL {
@@ -48,16 +63,20 @@ struct LLMModelSpec: Codable, Identifiable, Equatable, Hashable {
         return nested
     }
 
+    /// True only when the file sits under the models folder, looks like GGUF, and is not truncated.
     var isDownloaded: Bool {
-        guard FileManager.default.fileExists(atPath: localURL.path),
-              let attrs = try? FileManager.default.attributesOfItem(atPath: localURL.path),
+        let url = localURL.standardizedFileURL
+        guard GGUFFile.isInsideModelsDirectory(url) else { return false }
+        guard FileManager.default.fileExists(atPath: url.path),
+              let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
               let size = attrs[.size] as? UInt64,
               size > 1_048_576
         else { return false }
+        guard GGUFFile.looksLikeGGUF(at: url) else { return false }
         if let sizeBytes, sizeBytes > 0 {
-            // Allow a small mismatch so a re-quantized file still counts as present.
             let expected = UInt64(sizeBytes)
-            if size + 1_048_576 < expected { return false }
+            let slack: UInt64 = 65_536
+            if size + slack < expected { return false }
         }
         return true
     }
@@ -118,6 +137,34 @@ enum LLMFileFilter {
         if name.contains("mmproj") { return false }
         if name.contains("imatrix") { return false }
         if name.contains("gguf-split") { return false }
+        // Hub shards look like `*-00001-of-00003.gguf`, not `gguf-split`.
+        if name.range(of: #"-\d{5}-of-\d{5}\.gguf$"#, options: .regularExpression) != nil {
+            return false
+        }
         return true
+    }
+}
+
+enum GGUFFile {
+    static let magic = Data("GGUF".utf8)
+
+    static func looksLikeGGUF(at url: URL) -> Bool {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        let header = handle.readData(ofLength: 4)
+        return header == magic
+    }
+
+    static func isSafeHubPath(_ path: String) -> Bool {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.hasPrefix("/") else { return false }
+        let parts = trimmed.split(separator: "/")
+        return !parts.isEmpty && parts.allSatisfy { $0 != ".." && $0 != "." }
+    }
+
+    static func isInsideModelsDirectory(_ url: URL) -> Bool {
+        let path = url.standardizedFileURL.path
+        let root = ModelRegistry.modelsDirectory.standardizedFileURL.path
+        return path == root || path.hasPrefix(root + "/")
     }
 }

@@ -6,35 +6,41 @@ struct ThinkTagFilter {
     private var buffer = ""
     private var insideThink = false
 
+    private let open = "<think>"
+    private let close = "</think>"
+
     mutating func push(_ chunk: String) -> String {
         buffer += chunk
         var output = ""
 
         while !buffer.isEmpty {
             if insideThink {
-                if let end = buffer.range(of: "</think>", options: .caseInsensitive) {
+                if let end = buffer.range(of: close, options: .caseInsensitive) {
                     buffer.removeSubrange(buffer.startIndex..<end.upperBound)
                     if buffer.first == "\n" { buffer.removeFirst() }
                     insideThink = false
                     continue
                 }
-                if buffer.count > 16 {
-                    buffer = String(buffer.suffix(16))
+                if buffer.count > close.count {
+                    buffer = String(buffer.suffix(close.count))
                 }
                 break
             }
 
-            if let start = buffer.range(of: "<think>", options: .caseInsensitive) {
+            if let start = buffer.range(of: open, options: .caseInsensitive) {
                 output += buffer[buffer.startIndex..<start.lowerBound]
                 buffer.removeSubrange(buffer.startIndex..<start.upperBound)
                 insideThink = true
                 continue
             }
 
-            if let partial = partialTagPrefix() {
-                if partial == buffer {
-                    break
+            if let hold = incompleteTagSuffixCount() {
+                if hold < buffer.count {
+                    let keepFrom = buffer.index(buffer.endIndex, offsetBy: -hold)
+                    output += buffer[buffer.startIndex..<keepFrom]
+                    buffer = String(buffer[keepFrom...])
                 }
+                break
             }
 
             output += buffer
@@ -55,13 +61,15 @@ struct ThinkTagFilter {
         return leftover
     }
 
-    private func partialTagPrefix() -> String? {
-        let open = "<think>"
-        let close = "</think>"
+    /// Number of trailing characters that might still complete `<think>` / `</think>`.
+    private func incompleteTagSuffixCount() -> Int? {
+        let lower = buffer.lowercased()
         for tag in [open, close] {
-            for n in 1..<tag.count {
-                if buffer.lowercased().hasSuffix(String(tag.prefix(n)).lowercased()) {
-                    return String(buffer.suffix(n))
+            let maxN = min(tag.count - 1, lower.count)
+            guard maxN >= 1 else { continue }
+            for n in stride(from: maxN, through: 1, by: -1) {
+                if lower.hasSuffix(String(tag.prefix(n))) {
+                    return n
                 }
             }
         }

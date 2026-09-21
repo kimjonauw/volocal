@@ -29,6 +29,7 @@ final class VoicePipeline: ObservableObject {
     private var sentenceQueue: [String] = []
     private var speakingTask: Task<Void, Never>?
     private var turnRevision: Int = 0
+    private var configureGeneration: Int = 0
     private var cancellables = Set<AnyCancellable>()
 
     /// Maximum conversation history entries (system prompt excluded).
@@ -67,6 +68,10 @@ final class VoicePipeline: ObservableObject {
         stt: STTEngine = .parakeetEou320,
         tts: TTSEngine = .pocketTts
     ) async {
+        configureGeneration += 1
+        let gen = configureGeneration
+        currentError = nil
+        isReady = false
         // Start shared audio engine
         sharedAudio.start()
 
@@ -77,6 +82,7 @@ final class VoicePipeline: ObservableObject {
         loadingStatus = "Loading speech recognition..."
         metrics?.beginTracking("STT (\(stt.displayName))")
         await sttManager.initialize(engine: stt)
+        guard gen == configureGeneration else { return }
         metrics?.endTracking("STT (\(stt.displayName))")
         if let sttError = sttManager.error {
             currentError = sttError
@@ -85,23 +91,28 @@ final class VoicePipeline: ObservableObject {
         }
 
         loadingStatus = "Loading language model..."
-        if let path = llmModelPath {
-            metrics?.beginTracking("LLM (llama.cpp)")
-            do {
-                try await llmManager.loadModel(path: path, displayName: displayName ?? URL(fileURLWithPath: path).lastPathComponent)
-            } catch {
-                logger.error("LLM load failed: \(error.localizedDescription)")
-                currentError = "LLM failed to load: \(error.localizedDescription)"
-                loadingStatus = nil
-                // Don't set isReady — stay on loading screen with error
-                return
-            }
-            metrics?.endTracking("LLM (llama.cpp)")
+        guard let path = llmModelPath else {
+            currentError = "No GGUF on this iPhone. Pick a language model first."
+            loadingStatus = nil
+            return
         }
+        metrics?.beginTracking("LLM (llama.cpp)")
+        do {
+            try await llmManager.loadModel(path: path, displayName: displayName ?? URL(fileURLWithPath: path).lastPathComponent)
+        } catch {
+            guard gen == configureGeneration else { return }
+            logger.error("LLM load failed: \(error.localizedDescription)")
+            currentError = "LLM failed to load: \(error.localizedDescription)"
+            loadingStatus = nil
+            return
+        }
+        guard gen == configureGeneration else { return }
+        metrics?.endTracking("LLM (llama.cpp)")
 
         loadingStatus = "Loading text-to-speech..."
         ttsManager.metrics = metrics
         await ttsManager.initialize(engine: tts)
+        guard gen == configureGeneration else { return }
         if let ttsError = ttsManager.error {
             currentError = ttsError
             loadingStatus = nil
@@ -112,28 +123,7 @@ final class VoicePipeline: ObservableObject {
         isReady = true
     }
 
-    func reloadLanguageModel(path: String, displayName: String?) async {
-        if state == .processing || state == .speaking {
-            interrupt()
-        }
-        resetChat()
-        currentError = nil
-        loadingStatus = "Loading language model..."
-        isReady = false
-        metrics?.beginTracking("LLM (llama.cpp)")
-        do {
-            try await llmManager.loadModel(path: path, displayName: displayName)
-            metrics?.endTracking("LLM (llama.cpp)")
-            loadingStatus = nil
-            isReady = true
-        } catch {
-            logger.error("LLM reload failed: \(error.localizedDescription)")
-            currentError = "LLM failed to load: \(error.localizedDescription)"
-            loadingStatus = nil
-        }
-    }
-
-    /// Drop back to the loading screen so `configure` picks up the current STT/TTS selection.
+    /// Drop back to the loading screen so `configure` picks up the current STT/TTS/LLM selection.
     func invalidateForReload() {
         if state == .processing || state == .speaking {
             interrupt()

@@ -6,6 +6,9 @@ struct VoiceEnginePickerView: View {
 
     var onEnginesChanged: (() -> Void)?
 
+    @State private var busyLabel: String?
+    @State private var localError: String?
+
     var body: some View {
         NavigationStack {
             List {
@@ -13,6 +16,25 @@ struct VoiceEnginePickerView: View {
                     Text("Speech recognition and voice stay on-device. Changing an engine downloads its weights from Hugging Face if they are not already here.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                }
+
+                if let localError {
+                    Section {
+                        Text(localError)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
+                }
+
+                if let busyLabel {
+                    Section {
+                        HStack {
+                            ProgressView()
+                            Text(busyLabel)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                 }
 
                 Section("Speech recognition") {
@@ -24,9 +46,7 @@ struct VoiceEnginePickerView: View {
                             selected: modelManager.selectedSTT == engine,
                             ready: engine.isDownloaded(in: FluidAudioCache.asrModelsRoot)
                         ) {
-                            let changed = modelManager.selectedSTT != engine
-                            modelManager.selectSTT(engine)
-                            if changed { onEnginesChanged?() }
+                            Task { await pickSTT(engine) }
                         }
                     }
                 }
@@ -40,21 +60,54 @@ struct VoiceEnginePickerView: View {
                             selected: modelManager.selectedTTS == engine,
                             ready: engine.isDownloaded()
                         ) {
-                            let changed = modelManager.selectedTTS != engine
-                            modelManager.selectTTS(engine)
-                            if changed { onEnginesChanged?() }
+                            Task { await pickTTS(engine) }
                         }
                     }
                 }
             }
             .navigationTitle("Voice engines")
             .navigationBarTitleDisplayMode(.inline)
+            .disabled(busyLabel != nil)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Done") { dismiss() }
                 }
             }
         }
+    }
+
+    private func pickSTT(_ engine: STTEngine) async {
+        localError = nil
+        let changed = modelManager.selectedSTT != engine
+        let wasReady = engine.isDownloaded(in: FluidAudioCache.asrModelsRoot)
+        modelManager.selectSTT(engine)
+        if !engine.isDownloaded(in: FluidAudioCache.asrModelsRoot) {
+            busyLabel = "Downloading \(engine.displayName)…"
+            await modelManager.retryModel(.stt)
+            busyLabel = nil
+            guard engine.isDownloaded(in: FluidAudioCache.asrModelsRoot) else {
+                localError = modelManager.error ?? "STT download failed."
+                return
+            }
+        }
+        if changed || !wasReady { onEnginesChanged?() }
+    }
+
+    private func pickTTS(_ engine: TTSEngine) async {
+        localError = nil
+        let changed = modelManager.selectedTTS != engine
+        let wasReady = engine.isDownloaded()
+        modelManager.selectTTS(engine)
+        if !engine.isDownloaded() {
+            busyLabel = "Downloading \(engine.displayName)…"
+            await modelManager.retryModel(.tts)
+            busyLabel = nil
+            guard engine.isDownloaded() else {
+                localError = modelManager.error ?? "TTS download failed."
+                return
+            }
+        }
+        if changed || !wasReady { onEnginesChanged?() }
     }
 
     private func engineRow(

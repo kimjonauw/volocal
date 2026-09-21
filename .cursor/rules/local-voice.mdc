@@ -12,6 +12,6 @@ Full context: `AGENTS.md`. Trust review: `docs/SECURITY.md`.
 - Do not add analytics, crash reporters, ads, or extra network SDKs.
 - Bundle ID stays `com.localiosllm.volocal`. Do not restore the upstream Apple team.
 - Barge-in: one `AVAudioEngine`, Voice Processing AEC, mic stays open during TTS.
-- `project.yml` is the XcodeGen source of truth. FluidAudio is FluidInference `from: 0.15.8` (`ModelHub`, not `DownloadUtils`).
-- No local Mac: ship IPAs via `.github/workflows/ios-ipa.yml`. Do not compile iOS on Linux.
+- `project.yml` is the XcodeGen source of truth. FluidAudio is FluidInference **exact 0.15.8** (`ModelHub`, not `DownloadUtils`). llama.swift is **exact 2.10549.0**.
+- No local Mac: ship IPAs via `.github/workflows/ios-ipa.yml` as a rolling GitHub Release (`sidestore` / `Volocal.ipa`). Do not compile iOS on Linux. Do not accumulate Actions artifact zips.
 - Do not commit model weights, IPAs, or secrets.

@@ -57,12 +57,14 @@ Voice and chat stay on the phone. The only runtime network is **Hugging Face** f
 
 This repo is **public** so GitHub Actions macOS minutes stay free (private macOS runners need paid credits).
 
-1. **Actions → Build IPA → Run workflow** (or push to `main`).
-2. Download the **Volocal** artifact (`Volocal.ipa`).
-3. Install with SideStore into a real app slot (not a LiveContainer guest — mic / AEC is flaky there).
-4. If you use GetMoreRAM, apply `increased-memory-limit` to the SideStore host and reinstall.
+**Install path:** SideStore **real app slot**. LiveContainer guests crash on launch or have broken mic/AEC on iOS 26 (iPhone 17 Pro included). LiveContainer 3.6.65+ is required even to try, and still is not this app’s supported install.
 
-Physical iPhone, iOS 17+. First launch still downloads STT / TTS / GGUF from Hugging Face on-device.
+1. Wait for **Actions → Build IPA** to go green (push to `main` or Run workflow).
+2. Open **Releases → Volocal (SideStore IPA)** and download `Volocal.ipa` (not Actions artifacts — GitHub always wraps those in a zip).
+3. That pre-release tag `sidestore` is **overwritten** on every successful build, so you never collect a pile of broken IPAs.
+4. In SideStore, install into a real app slot. Apply `increased-memory-limit` with GetMoreRAM on the SideStore host, then reinstall.
+
+Physical iPhone, iOS 17+ (developed against iOS 26 / iPhone 17 Pro). First launch still downloads STT / TTS / GGUF from Hugging Face on-device.
 
 If you do have a Mac: Xcode 16+, [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`).
 
@@ -101,10 +103,10 @@ Volocal/
 
 ## Dependencies
 
-- [llama.swift](https://github.com/mattt/llama.swift) 2.x — Swift wrapper for llama.cpp
-- [FluidAudio](https://github.com/FluidInference/FluidAudio) 0.15.8+ — Parakeet EOU / Nemotron (STT), PocketTTS / Kokoro (TTS)
+- [llama.swift](https://github.com/mattt/llama.swift) **2.10549.0** — Swift wrapper for llama.cpp
+- [FluidAudio](https://github.com/FluidInference/FluidAudio) **0.15.8** — Parakeet EOU / Nemotron (STT), PocketTTS / Kokoro (TTS)
 
-Both pulled in via SPM (`project.yml`).
+Both pinned exact via SPM (`project.yml`) so CI cannot silently pick a breaking llama.cpp.
 
 ## TODO
 

@@ -2,15 +2,22 @@ import SwiftUI
 
 struct ModelLoadingView: View {
     @EnvironmentObject var pipeline: VoicePipeline
+    @EnvironmentObject var modelManager: UnifiedModelManager
+    @EnvironmentObject var metrics: SystemMetrics
+
+    @State private var showLLMPicker = false
+    @State private var showVoicePicker = false
 
     var body: some View {
         VStack(spacing: 24) {
             Spacer()
 
-            ProgressView()
-                .scaleEffect(1.5)
+            if pipeline.currentError == nil {
+                ProgressView()
+                    .scaleEffect(1.5)
+            }
 
-            Text(pipeline.loadingStatus ?? "Preparing...")
+            Text(pipeline.loadingStatus ?? (pipeline.currentError == nil ? "Preparing..." : "Could not load"))
                 .font(.headline)
 
             Text("Loading models into memory")
@@ -23,10 +30,56 @@ struct ModelLoadingView: View {
                     .foregroundStyle(.red)
                     .padding(.horizontal)
                     .multilineTextAlignment(.center)
+
+                Button("Try again") {
+                    Task { await load() }
+                }
+                .buttonStyle(.borderedProminent)
+
+                Button("Change language model") {
+                    showLLMPicker = true
+                }
+
+                Button("Change speech or voice") {
+                    showVoicePicker = true
+                }
+
+                Button("Back to downloads") {
+                    modelManager.reopenSetup()
+                }
+                .font(.subheadline)
             }
 
             Spacer()
         }
         .frame(maxWidth: .infinity)
+        .sheet(isPresented: $showLLMPicker) {
+            LLMPickerView { _ in
+                pipeline.invalidateForReload()
+                Task { await load() }
+            }
+            .environmentObject(modelManager)
+        }
+        .sheet(isPresented: $showVoicePicker) {
+            VoiceEnginePickerView {
+                pipeline.invalidateForReload()
+                Task { await load() }
+            }
+            .environmentObject(modelManager)
+        }
+        .task {
+            await load()
+        }
+    }
+
+    private func load() async {
+        pipeline.metrics = metrics
+        metrics.startMonitoring()
+        await pipeline.configure(
+            llmModelPath: modelManager.llmModelPath,
+            displayName: modelManager.selectedLLM.displayName,
+            stt: modelManager.selectedSTT,
+            tts: modelManager.selectedTTS
+        )
     }
 }

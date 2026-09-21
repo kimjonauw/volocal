@@ -107,8 +107,9 @@ final class TTSManager: ObservableObject {
                     }
                 } else if let kokoro {
                     let result = try await kokoro.synthesizeDetailed(text: text, voice: selectedVoice)
+                    try Task.checkCancellation()
                     self.markFirstInferenceIfNeeded()
-                    if !Task.isCancelled, !result.samples.isEmpty {
+                    if !result.samples.isEmpty {
                         chunkCount = 1
                         sharedAudio.scheduleTTSBuffer(result.samples)
                     }

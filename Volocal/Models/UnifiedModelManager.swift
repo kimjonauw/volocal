@@ -84,6 +84,12 @@ final class UnifiedModelManager: ObservableObject {
         persistSelection()
     }
 
+    /// Show onboarding again so the user can pick another engine or GGUF after a load failure.
+    func reopenSetup() {
+        hasCompletedOnboarding = false
+        UserDefaults.standard.set(false, forKey: onboardedKey)
+    }
+
     func selectSTT(_ engine: STTEngine) {
         guard engine != selectedSTT else { return }
         selectedSTT = engine
@@ -206,12 +212,22 @@ final class UnifiedModelManager: ObservableObject {
             return
         }
 
+        guard HuggingFaceHub.isValidRepoId(spec.repoId), GGUFFile.isSafeHubPath(spec.filename) else {
+            modelStates[.llm] = .error("Invalid Hugging Face repo or file path")
+            return
+        }
+
         guard let url = spec.downloadURL else {
             modelStates[.llm] = .error("Invalid Hugging Face URL")
             return
         }
 
-        let destination = spec.nestedLocalURL
+        let destination = spec.nestedLocalURL.standardizedFileURL
+        guard GGUFFile.isInsideModelsDirectory(destination) else {
+            modelStates[.llm] = .error("Refusing to write GGUF outside the models folder")
+            return
+        }
+
         try? FileManager.default.createDirectory(
             at: destination.deletingLastPathComponent(),
             withIntermediateDirectories: true
@@ -255,6 +271,7 @@ final class UnifiedModelManager: ObservableObject {
         switch result {
         case .success(let tempURL):
             do {
+                try Self.validateDownloadedGGUF(at: tempURL, expectedBytes: spec.sizeBytes)
                 if FileManager.default.fileExists(atPath: destination.path) {
                     try FileManager.default.removeItem(at: destination)
                 }
@@ -268,10 +285,17 @@ final class UnifiedModelManager: ObservableObject {
                     }
                 }
 
+                guard spec.isDownloaded else {
+                    try? FileManager.default.removeItem(at: destination)
+                    throw LLMDownloadError.notGGUF
+                }
+
                 modelStates[.llm] = .downloaded
                 logger.info("LLM downloaded: \(spec.id)")
                 markOnboardedIfReady()
             } catch {
+                try? FileManager.default.removeItem(at: tempURL)
+                try? FileManager.default.removeItem(at: destination)
                 modelStates[.llm] = .error(error.localizedDescription)
                 self.error = "LLM download failed: \(error.localizedDescription)"
             }
@@ -279,6 +303,23 @@ final class UnifiedModelManager: ObservableObject {
             modelStates[.llm] = .error(error.localizedDescription)
             self.error = "LLM download failed: \(error.localizedDescription)"
             logger.error("LLM download failed: \(error.localizedDescription)")
+        }
+    }
+
+    private static func validateDownloadedGGUF(at url: URL, expectedBytes: Int64?) throws {
+        guard GGUFFile.looksLikeGGUF(at: url) else {
+            throw LLMDownloadError.notGGUF
+        }
+        let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+        let size = attrs[.size] as? UInt64 ?? 0
+        guard size > 1_048_576 else {
+            throw LLMDownloadError.truncated
+        }
+        if let expectedBytes, expectedBytes > 0 {
+            let expected = UInt64(expectedBytes)
+            if size + 65_536 < expected {
+                throw LLMDownloadError.truncated
+            }
         }
     }
 
@@ -351,11 +392,20 @@ final class UnifiedModelManager: ObservableObject {
 
 enum LLMDownloadError: LocalizedError {
     case checksumMismatch
+    case httpStatus(Int)
+    case notGGUF
+    case truncated
 
     var errorDescription: String? {
         switch self {
         case .checksumMismatch:
             return "Downloaded GGUF failed SHA-256 check. Deleted the file — retry the download."
+        case .httpStatus(let code):
+            return "Hugging Face returned HTTP \(code) instead of a GGUF."
+        case .notGGUF:
+            return "Download was not a GGUF file (HTML error page or wrong asset)."
+        case .truncated:
+            return "Download was truncated. Delete and retry on Wi-Fi."
         }
     }
 }
@@ -389,9 +439,23 @@ private final class LLMDownloadDelegate: NSObject, URLSessionDownloadDelegate {
         downloadTask: URLSessionDownloadTask,
         didFinishDownloadingTo location: URL
     ) {
+        if let http = downloadTask.response as? HTTPURLResponse,
+           !(200..<300).contains(http.statusCode) {
+            finish(tempURL: nil, error: LLMDownloadError.httpStatus(http.statusCode))
+            return
+        }
+        if let mime = downloadTask.response?.mimeType?.lowercased(),
+           mime.contains("text/html") || mime.contains("application/json") {
+            finish(tempURL: nil, error: LLMDownloadError.notGGUF)
+            return
+        }
         let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".gguf")
-        try? FileManager.default.moveItem(at: location, to: tempURL)
-        finish(tempURL: tempURL, error: nil)
+        do {
+            try FileManager.default.moveItem(at: location, to: tempURL)
+            finish(tempURL: tempURL, error: nil)
+        } catch {
+            finish(tempURL: nil, error: error)
+        }
     }
 
     func urlSession(

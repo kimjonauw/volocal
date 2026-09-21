@@ -123,14 +123,8 @@ struct PipelineView: View {
                 }
             }
             .sheet(isPresented: $showLLMPicker) {
-                LLMPickerView { spec in
-                    guard let path = spec.isDownloaded ? spec.localURL.path : modelManager.llmModelPath else { return }
-                    Task {
-                        await pipeline.reloadLanguageModel(
-                            path: path,
-                            displayName: spec.displayName
-                        )
-                    }
+                LLMPickerView { _ in
+                    pipeline.invalidateForReload()
                 }
                 .environmentObject(modelManager)
             }

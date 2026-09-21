@@ -27,6 +27,7 @@ final class LLMManager: ObservableObject {
 
     func loadModel(path: String, displayName: String? = nil) async throws {
         unload()
+        await Task.yield()
         llamaContext = try LlamaContext.create(path: path, contextSize: 4096)
         loadedModelName = displayName ?? URL(fileURLWithPath: path).lastPathComponent
     }
@@ -46,6 +47,9 @@ final class LLMManager: ObservableObject {
         return AsyncStream { continuation in
             generationTask = Task {
                 guard let ctx = llamaContext else {
+                    await MainActor.run {
+                        self.error = "No GGUF loaded."
+                    }
                     continuation.finish()
                     return
                 }

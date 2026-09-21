@@ -14,6 +14,7 @@ struct LLMPickerView: View {
     @State private var isListing = false
     @State private var pasteText = ""
     @State private var localError: String?
+    @State private var searchGeneration = 0
 
     var body: some View {
         NavigationStack {
@@ -110,7 +111,7 @@ struct LLMPickerView: View {
                         ForEach(files) { file in
                             let spec = LLMModelSpec(
                                 repoId: hit.id,
-                                filename: file.filename,
+                                filename: file.path,
                                 displayName: "\(hit.id.split(separator: "/").last ?? "") · \(file.filename)",
                                 sizeBytes: file.sizeBytes,
                                 sha256: file.sha256
@@ -169,10 +170,10 @@ struct LLMPickerView: View {
     private func choose(_ spec: LLMModelSpec) async {
         localError = nil
         modelManager.select(spec)
-        if !spec.isDownloaded {
+        if !modelManager.selectedLLM.isDownloaded {
             await modelManager.downloadSelectedLLM()
         }
-        if spec.isDownloaded || modelManager.selectedLLM.isDownloaded {
+        if modelManager.selectedLLM.isDownloaded {
             onModelReady?(modelManager.selectedLLM)
             dismiss()
         } else {
@@ -205,14 +206,16 @@ struct LLMPickerView: View {
     }
 
     private func scheduleSearch(_ query: String) {
+        searchGeneration += 1
+        let generation = searchGeneration
         Task {
             try? await Task.sleep(for: .milliseconds(400))
-            guard query == searchText else { return }
-            await runSearch(query)
+            guard generation == searchGeneration else { return }
+            await runSearch(query, generation: generation)
         }
     }
 
-    private func runSearch(_ query: String) async {
+    private func runSearch(_ query: String, generation: Int) async {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count >= 2 else {
             repoHits = []
@@ -221,9 +224,12 @@ struct LLMPickerView: View {
         isSearching = true
         defer { isSearching = false }
         do {
-            repoHits = try await HuggingFaceHub.searchRepos(query: trimmed)
+            let hits = try await HuggingFaceHub.searchRepos(query: trimmed)
+            guard generation == searchGeneration else { return }
+            repoHits = hits
             localError = nil
         } catch {
+            guard generation == searchGeneration else { return }
             localError = error.localizedDescription
         }
     }

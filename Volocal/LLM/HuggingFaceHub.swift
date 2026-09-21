@@ -19,16 +19,15 @@ enum HuggingFaceHub {
         let sha256: String?
 
         var id: String { path }
+        /// Last path component, for display only. Downloads must use `path`.
         var filename: String { (path as NSString).lastPathComponent }
+    }
 
-        var spec: LLMModelSpec {
-            LLMModelSpec(
-                repoId: "",
-                filename: filename,
-                displayName: filename,
-                sizeBytes: sizeBytes,
-                sha256: sha256
-            )
+    static func isValidRepoId(_ repoId: String) -> Bool {
+        let parts = repoId.split(separator: "/").map(String.init)
+        guard parts.count == 2 else { return false }
+        return parts.allSatisfy { part in
+            !part.isEmpty && part != "." && part != ".." && !part.contains("\\")
         }
     }
 
@@ -70,7 +69,11 @@ enum HuggingFaceHub {
     }
 
     static func listGGUFFiles(repoId: String) async throws -> [RemoteFile] {
-        let encoded = repoId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? repoId
+        guard isValidRepoId(repoId) else { throw URLError(.badURL) }
+        let encoded = repoId
+            .split(separator: "/")
+            .map { $0.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? String($0) }
+            .joined(separator: "/")
         guard let url = URL(string: "https://huggingface.co/api/models/\(encoded)/tree/main?recursive=true") else {
             throw URLError(.badURL)
         }
@@ -107,13 +110,16 @@ enum HuggingFaceHub {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
 
-        if let url = URL(string: trimmed), let host = url.host, host.contains("huggingface.co") {
+        if let url = URL(string: trimmed), let host = url.host?.lowercased(),
+           host == "huggingface.co" || host.hasSuffix(".huggingface.co") {
             let parts = url.path.split(separator: "/").map(String.init)
             guard parts.count >= 2 else { return nil }
             let repoId = "\(parts[0])/\(parts[1])"
+            guard isValidRepoId(repoId) else { return nil }
             if let fileIndex = parts.firstIndex(of: "resolve") ?? parts.firstIndex(of: "blob"),
                fileIndex + 2 < parts.count {
                 let filename = parts[(fileIndex + 2)...].joined(separator: "/")
+                guard GGUFFile.isSafeHubPath(filename) else { return nil }
                 return (repoId, filename.isEmpty ? nil : filename)
             }
             return (repoId, nil)
@@ -121,10 +127,14 @@ enum HuggingFaceHub {
 
         let pieces = trimmed.split(separator: "/").map(String.init)
         guard pieces.count >= 2 else { return nil }
+        let repoId = "\(pieces[0])/\(pieces[1])"
+        guard isValidRepoId(repoId) else { return nil }
         if pieces.last?.lowercased().hasSuffix(".gguf") == true, pieces.count >= 3 {
-            return ("\(pieces[0])/\(pieces[1])", pieces.dropFirst(2).joined(separator: "/"))
+            let filename = pieces.dropFirst(2).joined(separator: "/")
+            guard GGUFFile.isSafeHubPath(filename) else { return nil }
+            return (repoId, filename)
         }
-        return ("\(pieces[0])/\(pieces[1])", nil)
+        return (repoId, nil)
     }
 
     private static func throwIfBad(_ response: URLResponse) throws {

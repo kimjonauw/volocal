@@ -1,6 +1,9 @@
 import Foundation
 import Darwin
 import LlamaSwift
+import os
+
+private let logger = Logger(subsystem: "com.volocal.app", category: "llama")
 
 // MARK: - Batch Helpers (from official llama.cpp SwiftUI example)
 
@@ -134,6 +137,7 @@ actor LlamaContext {
         if let formatted = applyChatTemplate(tmpl: tmpl, messages: messages) {
             return formatted
         }
+        logger.warning("GGUF chat template was not applied; using ChatML. Llama/Gemma GGUFs may need a llama.cpp template update.")
         return ChatMLFallback.format(system: system, history: history)
     }
 
