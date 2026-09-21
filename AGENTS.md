@@ -23,7 +23,7 @@ MIT-licensed on-device iOS voice app: modular GGUF LLM, selectable STT/TTS, unsi
 | TTS | PocketTTS v2.1 English, streaming | Kokoro ANE (batched, prettier) | GPU+CPU (Pocket) / ANE (Kokoro) |
 
 - FluidAudio: SPM `https://github.com/FluidInference/FluidAudio.git` **from 0.15.8** (not an old third-party `branch: main` pin). APIs: `ModelHub.download`, `StreamingEouAsrManager.loadModels(to:)`, `PocketTtsResourceDownloader.ensureModels(language:)`.
-- llama.swift: `from: "2.0.0"`. `llama_sampler_init_penalties` is **4-arg** on this pin. Newer llama.cpp puts `n_vocab` first — update the call if you bump the package.
+- llama.swift: `from: "2.0.0"` (SPM takes current 2.x). `llama_sampler_init_penalties` is **5-arg**: `n_vocab, last_n, repeat, freq, present`. Use `llama_vocab_n_tokens(vocab)`.
 - PocketTTS and Kokoro both emit **24 kHz** mono; `SharedAudioEngine.ttsFormat` is 24 kHz. Do not add 44.1 kHz TTS (e.g. Supertonic-3) without resampling.
 - Nemotron has **no EOU head**. `STTManager` treats ~900 ms of unchanged partial as a turn.
 - Kokoro is sentence-batched and shares ANE with Parakeet; default stays PocketTTS for barge-in.

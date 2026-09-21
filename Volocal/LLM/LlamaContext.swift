@@ -102,7 +102,10 @@ actor LlamaContext {
         // Generic voice-assistant sampling. Not tied to a single model family.
         let sparams = llama_sampler_chain_default_params()
         self.sampling = llama_sampler_chain_init(sparams)!
-        llama_sampler_chain_add(self.sampling, llama_sampler_init_penalties(64, 1.05, 0.0, 0.0)) // last_n, repeat, freq, present
+        llama_sampler_chain_add(
+            self.sampling,
+            llama_sampler_init_penalties(llama_vocab_n_tokens(vocab), 64, 1.05, 0.0, 0.0)
+        )
         llama_sampler_chain_add(self.sampling, llama_sampler_init_top_k(40))
         llama_sampler_chain_add(self.sampling, llama_sampler_init_top_p(0.9, 1))
         llama_sampler_chain_add(self.sampling, llama_sampler_init_min_p(0.05, 1))
