@@ -1,0 +1,64 @@
+name: Build IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "fastlane/metadata/**"
+      - "**.md"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ipa:
+    name: SideStore IPA
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode
+        run: |
+          xcodebuild -version
+          xcode-select -p
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Build IPA
+        run: |
+          chmod +x scripts/package-unsigned-ipa.sh
+          ./scripts/package-unsigned-ipa.sh
+
+      - name: Publish rolling SideStore IPA
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NOTES="$(cat <<EOF
+          Rolling SideStore build \`${GITHUB_SHA:0:7}\`.
+
+          Download **Volocal.ipa** from Assets (not Actions artifacts — those are always a zip).
+
+          Install with **SideStore in a real app slot**. LiveContainer guests crash on launch or have broken mic/AEC on iOS 26. If you still try LiveContainer, use **3.6.65+** (required on iOS 26.4+).
+
+          This tag is overwritten on every successful build so broken IPAs do not pile up.
+          EOF
+          )"
+          if gh release view sidestore >/dev/null 2>&1; then
+            gh release upload sidestore build/Volocal.ipa --clobber
+            gh release edit sidestore --notes "$NOTES" --prerelease --latest=false --title "Volocal (SideStore IPA)"
+          else
+            gh release create sidestore build/Volocal.ipa \
+              --prerelease \
+              --latest=false \
+              --title "Volocal (SideStore IPA)" \
+              --notes "$NOTES"
+          fi

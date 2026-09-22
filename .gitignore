@@ -1,0 +1,26 @@
+# ML models (too large for git)
+/models/
+*.gguf
+*.ort
+*.safetensors
+
+# Xcode
+xcuserdata/
+DerivedData/
+Volocal.xcodeproj/xcuserdata/
+Volocal.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/
+
+# Fastlane
+.env
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/**/*.png.tmp
+fastlane/test_output
+build/
+
+# Bundler
+vendor/bundle
+.bundle
+
+# macOS
+.DS_Store

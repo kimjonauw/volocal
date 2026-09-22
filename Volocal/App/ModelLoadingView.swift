@@ -1,0 +1,106 @@
+import SwiftUI
+
+struct ModelLoadingView: View {
+    @EnvironmentObject var pipeline: VoicePipeline
+    @EnvironmentObject var modelManager: UnifiedModelManager
+    @EnvironmentObject var metrics: SystemMetrics
+
+    @State private var showLLMPicker = false
+    @State private var showVoicePicker = false
+
+    var body: some View {
+        VStack(spacing: 24) {
+            Spacer()
+
+            if pipeline.currentError == nil {
+                ProgressView()
+                    .scaleEffect(1.5)
+            }
+
+            Text(pipeline.loadingStatus ?? (pipeline.currentError == nil ? "Preparing..." : "Could not load"))
+                .font(.headline)
+
+            Text("Loading models into memory")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+
+            if let error = pipeline.currentError {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .padding(.horizontal)
+                    .multilineTextAlignment(.center)
+
+                Button("Try again") {
+                    LLMLoadFence.allowRetry()
+                    Task { await load() }
+                }
+                .buttonStyle(.borderedProminent)
+
+                Button("Change language model") {
+                    showLLMPicker = true
+                }
+
+                Button("Change speech or voice") {
+                    showVoicePicker = true
+                }
+
+                Button("Back to downloads") {
+                    modelManager.reopenSetup()
+                }
+                .font(.subheadline)
+            }
+
+            Spacer()
+        }
+        .frame(maxWidth: .infinity)
+        .sheet(isPresented: $showLLMPicker) {
+            LLMPickerView(
+                onModelReady: { _ in
+                    LLMLoadFence.allowRetry()
+                    pipeline.invalidateForReload()
+                    Task { await load() }
+                },
+                onInstructionsChanged: { pipeline.applyInstructions($0) },
+                onNeedsReload: {
+                    LLMLoadFence.allowRetry()
+                    pipeline.invalidateForReload()
+                    Task { await load() }
+                },
+                countTokens: { text in await pipeline.llmManager.tokenCount(for: text) },
+                onThinkingChanged: { pipeline.setSuppressThinking($0) }
+            )
+            .environmentObject(modelManager)
+        }
+        .sheet(isPresented: $showVoicePicker) {
+            VoiceEnginePickerView(
+                onEnginesChanged: {
+                    pipeline.invalidateForReload()
+                    Task { await load() }
+                },
+                onVoiceChanged: { pipeline.setTTSVoice($0) },
+                onExpressionsChanged: { pipeline.setExpressions($0) }
+            )
+            .environmentObject(modelManager)
+        }
+        .task {
+            await load()
+        }
+    }
+
+    private func load() async {
+        pipeline.metrics = metrics
+        metrics.startMonitoring()
+        await pipeline.configure(
+            llmModelPath: modelManager.llmModelPath,
+            displayName: modelManager.selectedLLM.displayName,
+            stt: modelManager.selectedSTT,
+            tts: modelManager.selectedTTS,
+            ttsVoice: modelManager.selectedTTSVoice,
+            instructions: modelManager.customInstructions,
+            contextSize: modelManager.contextSize,
+            expressions: modelManager.ttsExpressionsEnabled,
+            suppressThinking: modelManager.suppressThinking
+        )
+    }
+}

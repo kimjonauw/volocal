@@ -1,0 +1,626 @@
+import Foundation
+import CryptoKit
+import FluidAudio
+import os
+
+private let logger = Logger(subsystem: "com.volocal.app", category: "models")
+
+private let selectedLLMKey = "volocal.selectedLLM.spec"
+private let selectedSTTKey = "volocal.selectedSTT.engine"
+private let selectedTTSKey = "volocal.selectedTTS.engine"
+private let selectedTTSVoiceKey = "volocal.selectedTTS.voice"
+private let ttsExpressionsKey = "volocal.tts.expressions"
+private let instructionsKey = "volocal.customInstructions"
+private let contextSizeKey = "volocal.contextSize"
+private let suppressThinkingKey = "volocal.suppressThinking"
+private let onboardedKey = "volocal.hasCompletedOnboarding"
+
+/// Unified model manager tracking download state for STT, TTS, and the selected GGUF.
+@MainActor
+final class UnifiedModelManager: ObservableObject {
+    @Published var modelStates: [ModelRegistry.ModelType: ModelState] = [:]
+    @Published var error: String?
+    @Published var selectedLLM: LLMModelSpec = .default
+    @Published var selectedSTT: STTEngine = .parakeetEou320
+    @Published var selectedTTS: TTSEngine = .pocketTts
+    @Published var selectedTTSVoice: String = TTSEngine.pocketTts.defaultVoice
+    @Published var ttsExpressionsEnabled: Bool = true
+    @Published var customInstructions: String = LLMManager.defaultInstructions
+    @Published var contextSize: UInt32 = LLMContextWindow.default
+    /// Default on: Qwen 3.5 and Gemma 4 skip hidden reasoning so TTS starts immediately.
+    @Published var suppressThinking: Bool = true
+    @Published var hasCompletedOnboarding: Bool = false
+    private var llmDownloadGeneration = 0
+    private var llmDownloadDelegate: LLMDownloadDelegate?
+
+    enum ModelState: Equatable {
+        case notDownloaded
+        case downloading(progress: Double)
+        case downloaded
+        case error(String)
+
+        var isReady: Bool {
+            if case .downloaded = self { return true }
+            return false
+        }
+
+        var progress: Double {
+            if case .downloading(let p) = self { return p }
+            if case .downloaded = self { return 1.0 }
+            return 0
+        }
+    }
+
+    var allModelsReady: Bool {
+        ModelRegistry.ModelType.allCases.allSatisfy { modelStates[$0]?.isReady == true }
+    }
+
+    var llmModelPath: String? {
+        guard selectedLLM.isDownloaded else { return nil }
+        return selectedLLM.localURL.path
+    }
+
+    init() {
+        if let data = UserDefaults.standard.data(forKey: selectedLLMKey),
+           let spec = try? JSONDecoder().decode(LLMModelSpec.self, from: data) {
+            selectedLLM = spec
+        } else {
+            selectedLLM = .default
+        }
+        if let raw = UserDefaults.standard.string(forKey: selectedSTTKey),
+           let engine = STTEngine(rawValue: raw) {
+            selectedSTT = engine
+        } else {
+            selectedSTT = .parakeetEou320
+        }
+        if let raw = UserDefaults.standard.string(forKey: selectedTTSKey),
+           raw != "chatterboxNano",
+           raw != "kokoroAne",
+           let engine = TTSEngine(rawValue: raw) {
+            selectedTTS = engine
+        } else {
+            selectedTTS = .pocketTts
+        }
+        RetiredTTSCache.wipeChatterboxNano()
+        RetiredTTSCache.wipeKokoro()
+        if let raw = UserDefaults.standard.string(forKey: selectedTTSVoiceKey),
+           selectedTTS.voiceNames.contains(raw) {
+            selectedTTSVoice = raw
+        } else {
+            selectedTTSVoice = selectedTTS.defaultVoice
+        }
+        if UserDefaults.standard.object(forKey: ttsExpressionsKey) != nil {
+            ttsExpressionsEnabled = UserDefaults.standard.bool(forKey: ttsExpressionsKey)
+        } else {
+            ttsExpressionsEnabled = true
+        }
+        if let saved = UserDefaults.standard.string(forKey: instructionsKey),
+           !saved.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            customInstructions = saved
+        } else {
+            customInstructions = LLMManager.defaultInstructions
+        }
+        let storedCtx = UInt32(UserDefaults.standard.integer(forKey: contextSizeKey))
+        contextSize = storedCtx == 0 ? LLMContextWindow.default : LLMContextWindow.clamp(storedCtx)
+        if UserDefaults.standard.object(forKey: suppressThinkingKey) != nil {
+            suppressThinking = UserDefaults.standard.bool(forKey: suppressThinkingKey)
+        } else {
+            suppressThinking = true
+        }
+        hasCompletedOnboarding = UserDefaults.standard.bool(forKey: onboardedKey)
+        checkExistingModels()
+    }
+
+    func persistSelection() {
+        if let data = try? JSONEncoder().encode(selectedLLM) {
+            UserDefaults.standard.set(data, forKey: selectedLLMKey)
+        }
+        UserDefaults.standard.set(selectedSTT.rawValue, forKey: selectedSTTKey)
+        UserDefaults.standard.set(selectedTTS.rawValue, forKey: selectedTTSKey)
+        UserDefaults.standard.set(selectedTTSVoice, forKey: selectedTTSVoiceKey)
+        UserDefaults.standard.set(ttsExpressionsEnabled, forKey: ttsExpressionsKey)
+        UserDefaults.standard.set(customInstructions, forKey: instructionsKey)
+        UserDefaults.standard.set(Int(contextSize), forKey: contextSizeKey)
+        UserDefaults.standard.set(suppressThinking, forKey: suppressThinkingKey)
+        checkExistingModels(preservingLLMDownload: true)
+    }
+
+    func select(_ spec: LLMModelSpec) {
+        if selectedLLM.id != spec.id {
+            cancelLLMDownload()
+        }
+        selectedLLM = spec
+        persistSelection()
+    }
+
+    func cancelLLMDownload() {
+        llmDownloadGeneration += 1
+        llmDownloadDelegate?.cancel()
+        llmDownloadDelegate = nil
+        if case .downloading = modelStates[.llm], !selectedLLM.isDownloaded {
+            modelStates[.llm] = .notDownloaded
+        }
+    }
+
+    /// Show onboarding again so the user can pick another engine or GGUF after a load failure.
+    func reopenSetup() {
+        hasCompletedOnboarding = false
+        UserDefaults.standard.set(false, forKey: onboardedKey)
+    }
+
+    func selectSTT(_ engine: STTEngine) {
+        guard engine != selectedSTT else { return }
+        selectedSTT = engine
+        persistSelection()
+    }
+
+    func selectTTS(_ engine: TTSEngine) {
+        guard engine != selectedTTS else { return }
+        selectedTTS = engine
+        if !engine.voiceNames.contains(selectedTTSVoice) {
+            selectedTTSVoice = engine.defaultVoice
+        }
+        persistSelection()
+    }
+
+    func selectTTSVoice(_ name: String) {
+        guard selectedTTS.voiceNames.contains(name), name != selectedTTSVoice else { return }
+        selectedTTSVoice = name
+        persistSelection()
+    }
+
+    func setTTSExpressions(_ enabled: Bool) {
+        guard ttsExpressionsEnabled != enabled else { return }
+        ttsExpressionsEnabled = enabled
+        persistSelection()
+    }
+
+    func setInstructions(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        customInstructions = trimmed.isEmpty ? LLMManager.defaultInstructions : text
+        persistSelection()
+    }
+
+    func setSuppressThinking(_ enabled: Bool) {
+        guard suppressThinking != enabled else { return }
+        suppressThinking = enabled
+        persistSelection()
+    }
+
+    func setContextSize(_ size: UInt32, persist: Bool = true) {
+        let clamped = LLMContextWindow.clamp(size)
+        if clamped != contextSize {
+            contextSize = clamped
+        }
+        if persist {
+            persistSelection()
+        }
+    }
+
+    func deleteLLM(_ spec: LLMModelSpec) {
+        let url = spec.localURL
+        try? FileManager.default.removeItem(at: url)
+        let parent = url.deletingLastPathComponent()
+        if parent.lastPathComponent != "models",
+           let leftover = try? FileManager.default.contentsOfDirectory(atPath: parent.path),
+           leftover.isEmpty {
+            try? FileManager.default.removeItem(at: parent)
+        }
+        if selectedLLM.id == spec.id || selectedLLM.filename == spec.filename {
+            let remaining = installedLLMSpecs().filter { $0.id != spec.id }
+            selectedLLM = remaining.first ?? .default
+        }
+        persistSelection()
+        objectWillChange.send()
+    }
+
+    func deleteSelectedLLM() {
+        deleteLLM(selectedLLM)
+    }
+
+    func checkExistingModels(preservingLLMDownload: Bool = false) {
+        if selectedLLM.isDownloaded {
+            modelStates[.llm] = .downloaded
+        } else if preservingLLMDownload, case .downloading = modelStates[.llm] {
+            // Leave the in-flight GGUF transfer alone.
+        } else {
+            modelStates[.llm] = .notDownloaded
+        }
+
+        if selectedSTT.isDownloaded(in: FluidAudioCache.asrModelsRoot) {
+            modelStates[.stt] = .downloaded
+        } else {
+            modelStates[.stt] = .notDownloaded
+        }
+
+        if selectedTTS.isDownloaded() {
+            modelStates[.tts] = .downloaded
+        } else {
+            modelStates[.tts] = .notDownloaded
+        }
+
+        markOnboardedIfReady()
+    }
+
+    private func markOnboardedIfReady() {
+        if allModelsReady {
+            hasCompletedOnboarding = true
+            UserDefaults.standard.set(true, forKey: onboardedKey)
+        }
+    }
+
+    func downloadAllModels() async {
+        await withTaskGroup(of: Void.self) { group in
+            if modelStates[.llm]?.isReady != true {
+                group.addTask { await self.downloadLLM() }
+            }
+            if modelStates[.stt]?.isReady != true {
+                group.addTask { await self.downloadSTT() }
+            }
+            if modelStates[.tts]?.isReady != true {
+                group.addTask { await self.downloadTTS() }
+            }
+        }
+        if allModelsReady {
+            hasCompletedOnboarding = true
+            UserDefaults.standard.set(true, forKey: onboardedKey)
+        }
+    }
+
+    func retryModel(_ type: ModelRegistry.ModelType) async {
+        modelStates[type] = .notDownloaded
+        error = nil
+
+        switch type {
+        case .llm: await downloadLLM()
+        case .stt: await downloadSTT()
+        case .tts: await downloadTTS()
+        }
+    }
+
+    func downloadSelectedLLM() async {
+        await downloadLLM()
+    }
+
+    func installedLLMSpecs() -> [LLMModelSpec] {
+        var found: [LLMModelSpec] = []
+        let fm = FileManager.default
+
+        if selectedLLM.isDownloaded {
+            found.append(selectedLLM)
+        }
+
+        let llmRoot = ModelRegistry.llmDirectory
+        if let folders = try? fm.contentsOfDirectory(at: llmRoot, includingPropertiesForKeys: nil) {
+            for folder in folders where folder.hasDirectoryPath {
+                if let files = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.fileSizeKey]) {
+                    for file in files where LLMFileFilter.isLoadableGGUF(file.lastPathComponent) {
+                        let repoId = folder.lastPathComponent.replacingOccurrences(of: "__", with: "/")
+                        let size = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize).map { Int64($0) }
+                        let spec = LLMModelSpec(
+                            repoId: repoId,
+                            filename: file.lastPathComponent,
+                            displayName: file.lastPathComponent,
+                            sizeBytes: size,
+                            sha256: nil
+                        )
+                        if !found.contains(where: { $0.id == spec.id }) {
+                            found.append(spec)
+                        }
+                    }
+                }
+            }
+        }
+
+        let legacy = ModelRegistry.modelsDirectory.appendingPathComponent(LLMModelSpec.default.filename)
+        if fm.fileExists(atPath: legacy.path),
+           !found.contains(where: { $0.filename == LLMModelSpec.default.filename }) {
+            found.insert(.default, at: 0)
+        }
+
+        return found
+    }
+
+    private func downloadLLM() async {
+        let spec = selectedLLM
+        if case .downloading = modelStates[.llm], llmDownloadDelegate != nil, !spec.isDownloaded {
+            return
+        }
+        llmDownloadGeneration += 1
+        let generation = llmDownloadGeneration
+        error = nil
+        modelStates[.llm] = .downloading(progress: 0)
+
+        if spec.isDownloaded {
+            modelStates[.llm] = .downloaded
+            return
+        }
+
+        guard HuggingFaceHub.isValidRepoId(spec.repoId), GGUFFile.isSafeHubPath(spec.filename) else {
+            failLLM("Invalid Hugging Face repo or file path")
+            return
+        }
+
+        guard let url = spec.downloadURL else {
+            failLLM("Invalid Hugging Face URL")
+            return
+        }
+
+        let destination = spec.nestedLocalURL.standardizedFileURL
+        guard GGUFFile.isInsideModelsDirectory(destination) else {
+            failLLM("Refusing to write GGUF outside the models folder")
+            return
+        }
+
+        try? FileManager.default.createDirectory(
+            at: destination.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+
+        let expectedBytes = spec.sizeBytes ?? 0
+
+        let result: Result<URL, Error> = await withCheckedContinuation { continuation in
+            llmDownloadDelegate?.cancel()
+            let delegate = LLMDownloadDelegate(
+                onProgress: { [weak self] bytesWritten, totalExpected in
+                    let total = totalExpected > 0 ? totalExpected : max(expectedBytes, 1)
+                    let fraction = Double(bytesWritten) / Double(total)
+                    Task { @MainActor in
+                        guard let self, self.llmDownloadGeneration == generation else { return }
+                        self.modelStates[.llm] = .downloading(progress: min(fraction, 1.0))
+                    }
+                },
+                onComplete: { tempURL, error in
+                    if let error {
+                        continuation.resume(returning: .failure(error))
+                    } else if let tempURL {
+                        continuation.resume(returning: .success(tempURL))
+                    } else {
+                        continuation.resume(returning: .failure(URLError(.badServerResponse)))
+                    }
+                }
+            )
+
+            let config = URLSessionConfiguration.default
+            config.timeoutIntervalForResource = 3600
+            config.waitsForConnectivity = true
+            config.httpAdditionalHeaders = [
+                "User-Agent": "volocal-ios/1.0 (on-device; no-telemetry)"
+            ]
+            let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
+            delegate.session = session
+            self.llmDownloadDelegate = delegate
+
+            var request = URLRequest(url: url, timeoutInterval: 3600)
+            request.setValue("volocal-ios/1.0 (on-device; no-telemetry)", forHTTPHeaderField: "User-Agent")
+            session.downloadTask(with: request).resume()
+        }
+
+        guard generation == llmDownloadGeneration else {
+            if case .success(let tempURL) = result {
+                try? FileManager.default.removeItem(at: tempURL)
+            }
+            return
+        }
+        llmDownloadDelegate = nil
+
+        switch result {
+        case .success(let tempURL):
+            do {
+                try Self.validateDownloadedGGUF(at: tempURL, expectedBytes: spec.sizeBytes)
+                if FileManager.default.fileExists(atPath: destination.path) {
+                    try FileManager.default.removeItem(at: destination)
+                }
+                try FileManager.default.moveItem(at: tempURL, to: destination)
+
+                if let expected = GGUFFile.normalizedSHA256(spec.sha256) {
+                    let actual = try Self.sha256Hex(of: destination)
+                    if actual.lowercased() != expected {
+                        logger.error("SHA-256 mismatch for \(spec.id); keeping the GGUF if the header is valid")
+                        // Hub LFS oids are not always the file digest (Xet). Do not delete a valid GGUF.
+                    }
+                }
+
+                guard spec.isDownloaded else {
+                    try? FileManager.default.removeItem(at: destination)
+                    throw LLMDownloadError.notGGUF
+                }
+
+                modelStates[.llm] = .downloaded
+                logger.info("LLM downloaded: \(spec.id)")
+                markOnboardedIfReady()
+            } catch {
+                try? FileManager.default.removeItem(at: tempURL)
+                try? FileManager.default.removeItem(at: destination)
+                failLLM("LLM download failed: \(error.localizedDescription)")
+            }
+        case .failure(let error):
+            if (error as? URLError)?.code == .cancelled { return }
+            failLLM("LLM download failed: \(error.localizedDescription)")
+            logger.error("LLM download failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func failLLM(_ message: String) {
+        modelStates[.llm] = .error(message)
+        error = message
+    }
+
+    private static func validateDownloadedGGUF(at url: URL, expectedBytes: Int64?) throws {
+        guard GGUFFile.looksLikeGGUF(at: url) else {
+            throw LLMDownloadError.notGGUF
+        }
+        let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+        let size = attrs[.size] as? UInt64 ?? 0
+        guard size > 1_048_576 else {
+            throw LLMDownloadError.truncated
+        }
+        if let expectedBytes, expectedBytes > 0 {
+            let expected = UInt64(expectedBytes)
+            if size + 65_536 < expected {
+                throw LLMDownloadError.truncated
+            }
+        }
+    }
+
+    private static func sha256Hex(of url: URL) throws -> String {
+        var hasher = SHA256()
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        while true {
+            let data = handle.readData(ofLength: 1024 * 1024)
+            if data.isEmpty { break }
+            hasher.update(data: data)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func downloadSTT() async {
+        modelStates[.stt] = .downloading(progress: 0)
+        let engine = selectedSTT
+
+        do {
+            try await ModelHub.download(engine.repo, to: FluidAudioCache.asrModelsRoot) { [weak self] progress in
+                Task { @MainActor in
+                    self?.modelStates[.stt] = .downloading(progress: progress.fractionCompleted)
+                }
+            }
+            modelStates[.stt] = .downloaded
+            logger.info("STT models downloaded: \(engine.displayName)")
+            markOnboardedIfReady()
+        } catch {
+            modelStates[.stt] = .error(error.localizedDescription)
+            self.error = "STT download failed: \(error.localizedDescription)"
+            logger.error("STT download failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func downloadTTS() async {
+        modelStates[.tts] = .downloading(progress: 0)
+        let engine = selectedTTS
+
+        do {
+            switch engine {
+            case .pocketTts:
+                _ = try await PocketTtsResourceDownloader.ensureModels(language: .english) { [weak self] progress in
+                    Task { @MainActor in
+                        self?.modelStates[.tts] = .downloading(progress: progress.fractionCompleted)
+                    }
+                }
+            case .supertonic3:
+                _ = try await Supertonic3ResourceDownloader.ensureModels(
+                    veVariant: TTSEngine.superonicVariantToken
+                ) { [weak self] progress in
+                    Task { @MainActor in
+                        self?.modelStates[.tts] = .downloading(progress: progress.fractionCompleted)
+                    }
+                }
+                _ = try await Supertonic3ResourceDownloader.downloadVoiceStyle(.f1)
+            }
+            modelStates[.tts] = .downloaded
+            logger.info("TTS models downloaded: \(engine.displayName)")
+            markOnboardedIfReady()
+        } catch {
+            modelStates[.tts] = .error(error.localizedDescription)
+            self.error = "TTS download failed: \(error.localizedDescription)"
+            logger.error("TTS download failed: \(error.localizedDescription)")
+        }
+    }
+}
+
+enum LLMDownloadError: LocalizedError {
+    case checksumMismatch
+    case httpStatus(Int)
+    case notGGUF
+    case truncated
+
+    var errorDescription: String? {
+        switch self {
+        case .checksumMismatch:
+            return "Downloaded GGUF failed SHA-256 check. Deleted the file — retry the download."
+        case .httpStatus(let code):
+            return "Hugging Face returned HTTP \(code) instead of a GGUF."
+        case .notGGUF:
+            return "Download was not a GGUF file (HTML error page or wrong asset)."
+        case .truncated:
+            return "Download was truncated. Delete and retry on Wi-Fi."
+        }
+    }
+}
+
+private final class LLMDownloadDelegate: NSObject, URLSessionDownloadDelegate {
+    let onProgress: (Int64, Int64) -> Void
+    let onComplete: (URL?, Error?) -> Void
+    var session: URLSession?
+    private let lock = NSLock()
+    private var hasCompleted = false
+
+    init(
+        onProgress: @escaping (Int64, Int64) -> Void,
+        onComplete: @escaping (URL?, Error?) -> Void
+    ) {
+        self.onProgress = onProgress
+        self.onComplete = onComplete
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didWriteData bytesWritten: Int64,
+        totalBytesWritten: Int64,
+        totalBytesExpectedToWrite: Int64
+    ) {
+        onProgress(totalBytesWritten, totalBytesExpectedToWrite)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didFinishDownloadingTo location: URL
+    ) {
+        if let http = downloadTask.response as? HTTPURLResponse,
+           !(200..<300).contains(http.statusCode) {
+            finish(tempURL: nil, error: LLMDownloadError.httpStatus(http.statusCode))
+            return
+        }
+        if let mime = downloadTask.response?.mimeType?.lowercased(),
+           mime.contains("text/html") || mime.contains("application/json") {
+            finish(tempURL: nil, error: LLMDownloadError.notGGUF)
+            return
+        }
+        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".gguf")
+        do {
+            try FileManager.default.moveItem(at: location, to: tempURL)
+            finish(tempURL: tempURL, error: nil)
+        } catch {
+            finish(tempURL: nil, error: error)
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didCompleteWithError error: Error?
+    ) {
+        if let error {
+            finish(tempURL: nil, error: error)
+        }
+    }
+
+    func cancel() {
+        session?.invalidateAndCancel()
+        session = nil
+        finish(tempURL: nil, error: URLError(.cancelled))
+    }
+
+    private func finish(tempURL: URL?, error: Error?) {
+        lock.lock()
+        let shouldFinish = !hasCompleted
+        if shouldFinish { hasCompleted = true }
+        lock.unlock()
+        guard shouldFinish else { return }
+        session?.finishTasksAndInvalidate()
+        session = nil
+        onComplete(tempURL, error)
+    }
+}
