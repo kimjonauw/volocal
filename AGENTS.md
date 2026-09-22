@@ -1,6 +1,6 @@
 # Agent notes (this fork)
 
-Read this before changing Volocal. Human-facing overview is in `README.md`. Trust/network review is in `docs/SECURITY.md`.
+Read this before changing Volocal. There is no public README yet. Trust/network review is in `docs/SECURITY.md`.
 
 MIT-licensed on-device iOS voice app: modular GGUF LLM, selectable STT/TTS, unsigned IPA via GitHub Actions. The developer does **not** have a Mac.
 
