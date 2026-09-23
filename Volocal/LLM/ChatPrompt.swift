@@ -66,7 +66,7 @@ enum ChatPrompt {
                 thoughtPrimer: gemmaThoughtPrimer
             )
         case .gemma3:
-            return gemma3(system: system, history: history)
+            return gemma3(system: system, history: history, thinking: thinking)
         case .qwen3:
             return chatml(system: system, history: history, qwenThinkSwitch: true, thinking: thinking)
         case .chatml, .unknown:
@@ -115,7 +115,22 @@ enum ChatPrompt {
         return prompt
     }
 
-    private static func gemma3(system: String, history: [(role: String, content: String)]) -> String {
+    /// Gemma 3 thinking finetunes (R1, “deep reasoning”) open `<think>` right after
+    /// `<start_of_turn>model`. A closed empty block ends that channel before the
+    /// spoken answer, same idea as Qwen’s `</think>`. Plain Gemma 3 ignores it.
+    private static func gemma3(
+        system: String,
+        history: [(role: String, content: String)],
+        thinking: Bool
+    ) -> String {
+        var systemText = system.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !thinking {
+            let lock = " Speak only the words the user should hear. Do not recap them, describe tone, or plan the reply."
+            if !systemText.lowercased().contains("speak only the words") {
+                systemText += lock
+            }
+        }
+        let closeThink = thinking ? "" : "<think>\n</think>\n"
         var prompt = "<bos>"
         var firstUser = true
         for turn in history {
@@ -126,9 +141,8 @@ enum ChatPrompt {
             } else {
                 prompt += "<start_of_turn>user\n"
                 if firstUser {
-                    let sys = system.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !sys.isEmpty {
-                        prompt += sys + "\n\n"
+                    if !systemText.isEmpty {
+                        prompt += systemText + "\n\n"
                     }
                     firstUser = false
                 }
@@ -137,6 +151,7 @@ enum ChatPrompt {
             }
         }
         prompt += "<start_of_turn>model\n"
+        prompt += closeThink
         return prompt
     }
 
@@ -271,10 +286,21 @@ struct StopSequenceTracker {
     }
 }
 
-/// Skip Gemma 4 `<|channel>thought` … `<channel|>` so TTS only gets the answer channel.
+/// Drop a hidden reasoning span so TTS only gets the answer.
+/// Gemma 4 uses `<|channel>thought` … `<channel|>`. Gemma 3 thinking finetunes
+/// and Qwen use `<think>` … `</think>`. The prompt already closes these; this
+/// only catches a model that opens one anyway.
 struct ThoughtChannelFilter {
+    private static let spans: [(open: String, closes: [String])] = [
+        ("<|channel>thought", ["<channel|>", "<|channel|>"]),
+        ("<|channel|>thought", ["<channel|>", "<|channel|>"]),
+        ("<think>", ["</think>"]),
+        ("<|think|>", ["</think>", "</|think|>"]),
+    ]
+
     private var buffer = ""
     private var inside = false
+    private var closes: [String] = []
     var isInside: Bool { inside }
 
     mutating func push(_ chunk: String) -> String {
@@ -282,21 +308,24 @@ struct ThoughtChannelFilter {
         var output = ""
         while !buffer.isEmpty {
             if inside {
-                if let end = range(of: "<channel|>") ?? range(of: "<|channel|>") {
+                if let end = earliestRange(among: closes) {
                     buffer.removeSubrange(buffer.startIndex..<end.upperBound)
                     if buffer.first == "\n" { buffer.removeFirst() }
                     inside = false
+                    closes = []
                     continue
                 }
-                if buffer.count > 12 {
-                    buffer = String(buffer.suffix(12))
+                let keep = closes.map(\.count).max() ?? 12
+                if buffer.count > keep {
+                    buffer = String(buffer.suffix(keep))
                 }
                 break
             }
-            if let start = range(of: "<|channel>thought") ?? range(of: "<|channel|>thought") {
-                output += buffer[buffer.startIndex..<start.lowerBound]
-                buffer.removeSubrange(buffer.startIndex..<start.upperBound)
+            if let start = earliestOpen() {
+                output += buffer[buffer.startIndex..<start.range.lowerBound]
+                buffer.removeSubrange(buffer.startIndex..<start.range.upperBound)
                 inside = true
+                closes = start.closes
                 continue
             }
             if let hold = incompletePrefixCount() {
@@ -317,6 +346,7 @@ struct ThoughtChannelFilter {
         if inside {
             buffer = ""
             inside = false
+            closes = []
             return ""
         }
         let leftover = buffer
@@ -324,12 +354,36 @@ struct ThoughtChannelFilter {
         return leftover
     }
 
+    private func earliestOpen() -> (range: Range<String.Index>, closes: [String])? {
+        var best: (range: Range<String.Index>, closes: [String])?
+        for span in Self.spans {
+            guard let range = range(of: span.open) else { continue }
+            if best == nil || range.lowerBound < best!.range.lowerBound {
+                best = (range, span.closes)
+            }
+        }
+        return best
+    }
+
+    private func earliestRange(among needles: [String]) -> Range<String.Index>? {
+        var best: Range<String.Index>?
+        for needle in needles {
+            guard let range = range(of: needle) else { continue }
+            if best == nil || range.lowerBound < best!.lowerBound {
+                best = range
+            }
+        }
+        return best
+    }
+
     private func range(of needle: String) -> Range<String.Index>? {
         buffer.range(of: needle, options: .caseInsensitive)
     }
 
     private func incompletePrefixCount() -> Int? {
-        let tags = ["<|channel>thought", "<|channel|>thought", "<channel|>", "<|channel|>"]
+        var tags = Self.spans.flatMap { [$0.open] + $0.closes }
+        tags.append("<channel|>")
+        tags.append("<|channel|>")
         let lower = buffer.lowercased()
         var hold: Int?
         for tag in tags {
