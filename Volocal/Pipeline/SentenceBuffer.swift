@@ -1,10 +1,9 @@
 import Foundation
 
 /// Accumulates streaming LLM tokens and emits clauses for TTS.
-/// Splits only on real sentence punctuation so PocketTTS is not fed 40-character
-/// crumbs that pause in the middle of a phrase. PocketTTS already streams frames
-/// inside one `synthesizeStreaming` call — chopping the text is what made the
-/// odd silences.
+/// The first chunk may be a comma clause or about 10 words. After that, split
+/// only on real sentence punctuation so PocketTTS is not fed 40-character
+/// crumbs that pause in the middle of a phrase.
 final class SentenceBuffer {
     enum ClauseMode {
         /// PocketTTS / Supertonic — whole sentences; one synth job per sentence.
