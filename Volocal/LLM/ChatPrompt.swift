@@ -137,23 +137,22 @@ enum ChatPrompt {
         thinking: Bool,
         reasoningTune: Bool
     ) -> String {
-        var systemText = system.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !thinking {
-            let lock = " Speak only the words the user should hear. Do not recap them, describe tone, or plan the reply."
-            if !systemText.lowercased().contains("speak only the words") {
-                systemText += lock
-            }
-            if reasoningTune, !systemText.lowercased().contains("do not write a think") {
-                systemText += " Do not write a think tag or a reasoning draft."
-            }
-        }
-        let closeThink = (!thinking && reasoningTune) ? "</think>\n" : ""
+        // Gemma 3 has no system role: instructions are prefixed to the first user
+        // turn. Do not append more rules here, and do not prefill `</think>`.
+        // That close tag makes everything above it (the instructions, and any
+        // saved context) look like a finished thought, so the model answers
+        // those lines as if they were the user's turns and often says the tag.
+        _ = thinking
+        _ = reasoningTune
+        let systemText = system.trimmingCharacters(in: .whitespacesAndNewlines)
         var prompt = "<bos>"
         var firstUser = true
         for turn in history {
             if turn.role == "assistant" {
+                let spoken = Self.stripThinkMarkers(turn.content)
+                if Self.isPromptEcho(spoken, system: systemText) { continue }
                 prompt += "<start_of_turn>model\n"
-                prompt += turn.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                prompt += spoken
                 prompt += "<end_of_turn>\n"
             } else {
                 prompt += "<start_of_turn>user\n"
@@ -168,8 +167,28 @@ enum ChatPrompt {
             }
         }
         prompt += "<start_of_turn>model\n"
-        prompt += closeThink
         return prompt
+    }
+
+    /// Think tags are ordinary text on Gemma 3 R1. Drop them from saved turns
+    /// so a leaked tag is not replayed as part of the conversation.
+    static func stripThinkMarkers(_ text: String) -> String {
+        var cleaned = text
+        let tags = ["</think>", "<think>", "</|think|>", "<|think|>", "<|channel>thought", "<|channel|>thought", "<channel|>", "<|channel|>"]
+        for tag in tags {
+            cleaned = cleaned.replacingOccurrences(of: tag, with: "", options: .caseInsensitive)
+        }
+        return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// True when a saved reply is the instructions being read back, not something
+    /// the user should hear again on the next turn.
+    private static func isPromptEcho(_ text: String, system: String) -> Bool {
+        let lower = text.lowercased()
+        if lower.contains("you are volocal") || lower.contains("speak only the words") { return true }
+        if lower.contains("helpful voice assistant") || lower.contains("do not write a think") { return true }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return trimmed.count >= 24 && system.lowercased().contains(trimmed)
     }
 
     /// Qwen 3.x: `/no_think` on the last user turn plus a closed think block so the
@@ -360,6 +379,15 @@ struct ThoughtChannelFilter {
                 closes = start.closes
                 continue
             }
+            if let end = earliestRange(among: ["</think>", "</|think|>"]) {
+                let before = String(buffer[buffer.startIndex..<end.lowerBound])
+                if !Self.looksLikeUnspokenThought(before) {
+                    output += before
+                }
+                buffer.removeSubrange(buffer.startIndex..<end.upperBound)
+                if buffer.first == "\n" { buffer.removeFirst() }
+                continue
+            }
             if let hold = incompletePrefixCount() {
                 if hold < buffer.count {
                     let keepFrom = buffer.index(buffer.endIndex, offsetBy: -hold)
@@ -417,6 +445,15 @@ struct ThoughtChannelFilter {
         return nil
     }
 
+    private static func looksLikeUnspokenThought(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return true }
+        let lower = trimmed.lowercased()
+        if lower.contains("you are volocal") || lower.contains("speak only the words") { return true }
+        if lower.hasPrefix("the user") || lower.hasPrefix("i need to") || lower.hasPrefix("i should") { return true }
+        return false
+    }
+
     private func earliestOpen() -> (range: Range<String.Index>, closes: [String])? {
         var best: (range: Range<String.Index>, closes: [String])?
         for span in Self.spans {
@@ -467,6 +504,9 @@ struct ThoughtChannelFilter {
 /// Gemma 4 often emits several of these ("Okay." then "I need to respond naturally…")
 /// before the greeting — skip all of them, not just a first-line prefix.
 struct ReasoningPreambleFilter {
+    /// Instructions and saved notes live in the Gemma 3 user turn. If the model
+    /// reads them back, drop those sentences instead of speaking them.
+    var systemEcho: String = ""
     private var buffer = ""
     private var passed = false
 
@@ -561,6 +601,7 @@ struct ReasoningPreambleFilter {
         var lower = trimmed.lowercased()
             .trimmingCharacters(in: .punctuationCharacters.union(.whitespacesAndNewlines))
         guard !lower.isEmpty else { return true }
+        if isSystemEcho(lower) { return true }
         if Self.fillerSentences.contains(lower) { return true }
         for filler in ["okay, ", "ok, ", "alright, ", "so, ", "well, ", "right, ", "hmm, "] {
             if lower.hasPrefix(filler) {
@@ -573,5 +614,20 @@ struct ReasoningPreambleFilter {
             return true
         }
         return false
+    }
+
+    private func isSystemEcho(_ lower: String) -> Bool {
+        let sys = systemEcho.lowercased()
+        if lower.count >= 16, sys.contains(lower) { return true }
+        let needles = [
+            "you are volocal",
+            "speak only the words",
+            "do not write a think",
+            "do not read this block",
+            "earlier conversation",
+            "helpful voice assistant",
+            "running entirely on-device",
+        ]
+        return needles.contains { lower.contains($0) }
     }
 }

@@ -128,10 +128,10 @@ final class LLMManager: ObservableObject {
 
                 let startTime = CFAbsoluteTimeGetCurrent()
                 var tokenCount = 0
-                var channelFilter = ThoughtChannelFilter(
-                    hideUntilThinkClose: skipThink && ctx.hidesThinkUntilClose
+                var channelFilter = ThoughtChannelFilter()
+                var preambleFilter = ReasoningPreambleFilter(
+                    systemEcho: Self.promptWithMemory(promptSystem, memory: memorySnapshot)
                 )
-                var preambleFilter = ReasoningPreambleFilter()
 
                 do {
                     let fullPrompt = try await ctx.formatChat(
