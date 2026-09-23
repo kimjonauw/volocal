@@ -217,27 +217,31 @@ final class TTSManager: ObservableObject {
             let voice = selectedVoice
             let temperature: Float = whisper ? 0.2 : 0.4
             let applyWhisper = whisper
-            let frames: [[Float]] = try await withGPU {
-                var out: [[Float]] = []
+            let generation = speakGeneration
+            chunks = try await withGPU {
                 let stream = try await pocket.synthesizeStreaming(
                     text: text,
                     voice: voice,
                     temperature: temperature
                 )
+                var count = 0
                 for try await frame in stream {
                     try Task.checkCancellation()
-                    out.append(applyWhisper ? Self.applyWhisper(frame.samples) : frame.samples)
+                    let samples = applyWhisper ? Self.applyWhisper(frame.samples) : frame.samples
+                    count += 1
+                    let isFirst = count == 1
+                    // Schedule without awaiting MainActor. Awaiting here would
+                    // drop the GPU lock and let llama Metal overlap CoreML.
+                    Task { @MainActor in
+                        guard generation == self.speakGeneration else { return }
+                        if isFirst {
+                            self.markFirstInferenceIfNeeded()
+                            self.playbackPhase = .playing
+                        }
+                        audio.scheduleTTSBuffer(samples)
+                    }
                 }
-                return out
-            }
-            for samples in frames {
-                if Task.isCancelled { break }
-                chunks += 1
-                audio.scheduleTTSBuffer(samples)
-            }
-            if chunks > 0 {
-                markFirstInferenceIfNeeded()
-                playbackPhase = .playing
+                return count
             }
         } else if let superonic {
             let style = try await superonicStyle(named: selectedVoice)
