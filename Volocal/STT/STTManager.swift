@@ -44,6 +44,9 @@ final class STTManager: ObservableObject {
     private var asrResetEpoch = 0
     /// Partial already reads as a finished thought, so the energy detector may end sooner.
     private var eagerEndpoint = false
+    /// Last non-empty partial. Streaming ASR often clears the hypothesis at the
+    /// end of a phrase; the energy end-of-turn must still commit those words.
+    private var lastHypothesis = ""
     /// PocketTTS plays the first frame while CoreML is still running, so Parakeet
     /// stays paused. Loud sustained mic energy must still be able to interrupt.
     var bargeInWhilePaused = false
@@ -191,6 +194,7 @@ final class STTManager: ObservableObject {
     func resetForNextUtterance() {
         hasFiredSpeechDetected = false
         partialResult = ""
+        lastHypothesis = ""
         eagerEndpoint = false
         nemotronDebounceTask?.cancel()
         nemotronDebounceTask = nil
@@ -252,9 +256,7 @@ final class STTManager: ObservableObject {
         await manager.setPartialCallback { [weak self] text in
             Task { @MainActor in
                 guard let self, !self.isStopping else { return }
-                self.partialResult = text
-                self.eagerEndpoint = UtteranceReadiness.looksComplete(text)
-                self.considerSpeechDetected(text)
+                self.notePartial(text)
             }
         }
 
@@ -275,9 +277,7 @@ final class STTManager: ObservableObject {
         await manager.setPartialCallback { [weak self] text in
             Task { @MainActor in
                 guard let self, !self.isStopping else { return }
-                self.partialResult = text
-                self.eagerEndpoint = UtteranceReadiness.looksComplete(text)
-                self.considerSpeechDetected(text)
+                self.notePartial(text)
                 self.scheduleNemotronUtterance(text)
             }
         }
@@ -285,6 +285,17 @@ final class STTManager: ObservableObject {
         logger.info("Loading Nemotron 560…")
         try await manager.loadModels(to: asrRoot)
         self.nemotronManager = manager
+    }
+
+    private func notePartial(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // An empty revision must not wipe the words already on screen. The
+        // turn commit uses lastHypothesis if the live partial has been cleared.
+        guard !trimmed.isEmpty else { return }
+        lastHypothesis = trimmed
+        partialResult = trimmed
+        eagerEndpoint = UtteranceReadiness.looksComplete(trimmed)
+        considerSpeechDetected(trimmed)
     }
 
     private func considerSpeechDetected(_ text: String) {
@@ -297,7 +308,9 @@ final class STTManager: ObservableObject {
     }
 
     private func forceEndOfTurn() {
-        let text = partialResult.trimmingCharacters(in: .whitespacesAndNewlines)
+        let live = partialResult.trimmingCharacters(in: .whitespacesAndNewlines)
+        let remembered = lastHypothesis.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = live.isEmpty ? remembered : live
         guard !text.isEmpty else { return }
         emitUtterance(text)
     }
@@ -327,6 +340,7 @@ final class STTManager: ObservableObject {
         lastEmittedNormalized = normalized
         transcript = finalText
         partialResult = ""
+        lastHypothesis = ""
         eagerEndpoint = false
         hasFiredSpeechDetected = false
         nemotronDebounceTask?.cancel()

@@ -337,6 +337,16 @@ final class TTSManager: ObservableObject {
         await leftover?.value
     }
 
+    /// Playback finished and no synthesis is running. Clears a stuck
+    /// `isSpeaking` so the next utterance is not thrown out as speaker echo.
+    func notePlaybackIdle() {
+        guard playbackPhase != .synthesizing else { return }
+        isSpeaking = sharedAudio?.isSpeaking == true
+        if !isSpeaking {
+            playbackPhase = .idle
+        }
+    }
+
     private func markFirstInferenceIfNeeded() {
         if !hasTrackedFirstInference {
             hasTrackedFirstInference = true

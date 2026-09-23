@@ -487,6 +487,7 @@ final class VoicePipeline: ObservableObject {
         }
         if !Task.isCancelled && myRevision == turnRevision {
             await sharedAudio.waitForPlaybackCompletion()
+            ttsManager.notePlaybackIdle()
         }
 
         guard !Task.isCancelled, myRevision == turnRevision else { return }
@@ -526,9 +527,8 @@ final class VoicePipeline: ObservableObject {
     }
 
     private func isLikelySpeakerEcho(_ text: String) -> Bool {
-        let playing = ttsManager.isSpeaking || sharedAudio.isSpeaking
-        let justFinished = speakingEndedAt.map { Date().timeIntervalSince($0) < 0.45 } ?? false
-        guard playing || justFinished || state == .speaking else { return false }
+        let playing = sharedAudio.isSpeaking || state == .speaking
+        guard playing else { return false }
 
         let heard = Self.normalizedWords(text)
         guard !heard.isEmpty else { return true }
