@@ -139,6 +139,7 @@ final class TTSManager: ObservableObject {
 
         isSpeaking = true
         playbackPhase = .synthesizing
+        stt?.bargeInWhilePaused = true
         error = nil
 
         let speakTimeout: TimeInterval = 30
@@ -312,6 +313,7 @@ final class TTSManager: ObservableObject {
         speakGeneration += 1
         speakTask?.cancel()
         holdsInferenceGPU = false
+        stt?.bargeInWhilePaused = false
         sharedAudio?.stopPlayback()
         isSpeaking = false
         playbackPhase = .idle

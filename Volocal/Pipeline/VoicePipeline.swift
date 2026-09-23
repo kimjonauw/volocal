@@ -310,6 +310,15 @@ final class VoicePipeline: ObservableObject {
             }
         }
 
+        sttManager.onBargeIn = { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                if self.state == .processing || self.state == .speaking {
+                    self.interrupt()
+                }
+            }
+        }
+
         sentenceBuffer.onSentenceReady = { [weak self] sentence in
             self?.handleSentence(sentence)
         }

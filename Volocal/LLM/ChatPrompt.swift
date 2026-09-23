@@ -174,7 +174,7 @@ enum ChatPrompt {
     /// so a leaked tag is not replayed as part of the conversation.
     static func stripThinkMarkers(_ text: String) -> String {
         var cleaned = text
-        let tags = ["</think>", "<think>", "</|think|>", "<|think|>", "<|channel>thought", "<|channel|>thought", "<channel|>", "<|channel|>"]
+        let tags = ["</think>", "<think>", "</|think|>", "<|think|>", "<speak>", "</speak>", "<|channel>thought", "<|channel|>thought", "<channel|>", "<|channel|>"]
         for tag in tags {
             cleaned = cleaned.replacingOccurrences(of: tag, with: "", options: .caseInsensitive)
         }
@@ -388,6 +388,11 @@ struct ThoughtChannelFilter {
                 if buffer.first == "\n" { buffer.removeFirst() }
                 continue
             }
+            if let end = earliestRange(among: ["<speak>", "</speak>"]) {
+                output += buffer[buffer.startIndex..<end.lowerBound]
+                buffer.removeSubrange(buffer.startIndex..<end.upperBound)
+                continue
+            }
             if let hold = incompletePrefixCount() {
                 if hold < buffer.count {
                     let keepFrom = buffer.index(buffer.endIndex, offsetBy: -hold)
@@ -484,6 +489,8 @@ struct ThoughtChannelFilter {
         var tags = Self.spans.flatMap { [$0.open] + $0.closes }
         tags.append("<channel|>")
         tags.append("<|channel|>")
+        tags.append("<speak>")
+        tags.append("</speak>")
         let lower = buffer.lowercased()
         var hold: Int?
         for tag in tags {

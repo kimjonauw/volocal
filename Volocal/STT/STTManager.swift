@@ -21,6 +21,10 @@ final class STTManager: ObservableObject {
     /// Called when speech is first detected (partial result arrives)
     var onSpeechDetected: (() -> Void)?
 
+    /// Called when the user talks over playback while Parakeet is paused.
+    /// Speech recognition stays off during CoreML TTS; this is energy only.
+    var onBargeIn: (() -> Void)?
+
     /// Shared audio engine — injected by VoicePipeline
     weak var sharedAudio: SharedAudioEngine?
 
@@ -40,6 +44,11 @@ final class STTManager: ObservableObject {
     private var asrResetEpoch = 0
     /// Partial already reads as a finished thought, so the energy detector may end sooner.
     private var eagerEndpoint = false
+    /// PocketTTS plays the first frame while CoreML is still running, so Parakeet
+    /// stays paused. Loud sustained mic energy must still be able to interrupt.
+    var bargeInWhilePaused = false
+    private var pausedSpeechSince: CFAbsoluteTime = 0
+    private var didFirePausedBargeIn = false
 
     /// Serial stream for backpressure — prevents unbounded Task spawning per audio buffer
     private var bufferContinuation: AsyncStream<AVAudioPCMBuffer>.Continuation?
@@ -105,9 +114,18 @@ final class STTManager: ObservableObject {
                 if decision.endTurn {
                     await self?.forceEndOfTurn()
                 }
+                let gate = await MainActor.run { () -> (paused: Bool, barge: Bool) in
+                    (self?.asrPaused == true, self?.bargeInWhilePaused == true)
+                }
+                if gate.paused {
+                    if gate.barge, rms >= 0.05 {
+                        await self?.considerPausedBargeIn()
+                    } else {
+                        await self?.clearPausedBargeIn()
+                    }
+                    continue
+                }
                 guard decision.feedAsr else { continue }
-                let paused = await MainActor.run { self?.asrPaused == true }
-                guard !paused else { continue }
                 do {
                     if let eou {
                         _ = try await eou.process(audioBuffer: buffer)
@@ -199,6 +217,23 @@ final class STTManager: ObservableObject {
         asrPauseDepth = max(0, asrPauseDepth - 1)
         guard asrPauseDepth == 0, !isStopping else { return }
         asrPaused = false
+        clearPausedBargeIn()
+        didFirePausedBargeIn = false
+    }
+
+    private func considerPausedBargeIn() {
+        let now = CFAbsoluteTimeGetCurrent()
+        if pausedSpeechSince == 0 {
+            pausedSpeechSince = now
+            return
+        }
+        guard !didFirePausedBargeIn, now - pausedSpeechSince >= 0.28 else { return }
+        didFirePausedBargeIn = true
+        onBargeIn?()
+    }
+
+    private func clearPausedBargeIn() {
+        pausedSpeechSince = 0
     }
 
     /// Simulate a transcript for testing without a real microphone.
