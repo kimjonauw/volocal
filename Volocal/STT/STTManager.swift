@@ -156,6 +156,7 @@ final class STTManager: ObservableObject {
         isListening = true
         transcript = ""
         partialResult = ""
+        lastHypothesis = ""
         hasFiredSpeechDetected = false
         lastEmittedNormalized = ""
         eagerEndpoint = false
