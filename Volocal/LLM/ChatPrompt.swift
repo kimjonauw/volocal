@@ -55,7 +55,8 @@ enum ChatPrompt {
         system: String,
         history: [(role: String, content: String)],
         thinking: Bool,
-        gemmaThoughtPrimer: Bool = false
+        gemmaThoughtPrimer: Bool = false,
+        gemmaReasoningTune: Bool = false
     ) -> String {
         switch family {
         case .gemma4:
@@ -66,7 +67,12 @@ enum ChatPrompt {
                 thoughtPrimer: gemmaThoughtPrimer
             )
         case .gemma3:
-            return gemma3(system: system, history: history, thinking: thinking)
+            return gemma3(
+                system: system,
+                history: history,
+                thinking: thinking,
+                reasoningTune: gemmaReasoningTune
+            )
         case .qwen3:
             return chatml(system: system, history: history, qwenThinkSwitch: true, thinking: thinking)
         case .chatml, .unknown:
@@ -115,13 +121,21 @@ enum ChatPrompt {
         return prompt
     }
 
-    /// Gemma 3 thinking finetunes (R1, “deep reasoning”) open `<think>` right after
-    /// `<start_of_turn>model`. A closed empty block ends that channel before the
-    /// spoken answer, same idea as Qwen’s `</think>`. Plain Gemma 3 ignores it.
+    /// Gemma 3 R1 (TheDrummer and similar) is not a special-token thinker.
+    /// Prefilling `<think>` *starts* the reasoning and the reply becomes the thought.
+    /// A closing tag alone tells that tune the thought is already over.
+    static func isGemmaReasoningTune(_ name: String) -> Bool {
+        let n = name.lowercased()
+        if n.contains("-r1") || n.contains("_r1") || n.contains("r1-") || n.contains("r1_") { return true }
+        if n.contains("reasoning") || n.contains("deep-reason") || n.contains("deep_reason") { return true }
+        return false
+    }
+
     private static func gemma3(
         system: String,
         history: [(role: String, content: String)],
-        thinking: Bool
+        thinking: Bool,
+        reasoningTune: Bool
     ) -> String {
         var systemText = system.trimmingCharacters(in: .whitespacesAndNewlines)
         if !thinking {
@@ -129,8 +143,11 @@ enum ChatPrompt {
             if !systemText.lowercased().contains("speak only the words") {
                 systemText += lock
             }
+            if reasoningTune, !systemText.lowercased().contains("do not write a think") {
+                systemText += " Do not write a think tag or a reasoning draft."
+            }
         }
-        let closeThink = thinking ? "" : "<think>\n</think>\n"
+        let closeThink = (!thinking && reasoningTune) ? "</think>\n" : ""
         var prompt = "<bos>"
         var firstUser = true
         for turn in history {
@@ -301,9 +318,24 @@ struct ThoughtChannelFilter {
     private var buffer = ""
     private var inside = false
     private var closes: [String] = []
+    /// R1-style tunes may emit the thought and only then `</think>`, with the
+    /// opening tag left in the prompt. Hold the start of the reply until we
+    /// know it is not that thought.
+    private var waitingForThinkClose: Bool
     var isInside: Bool { inside }
 
+    init(hideUntilThinkClose: Bool = false) {
+        waitingForThinkClose = hideUntilThinkClose
+    }
+
     mutating func push(_ chunk: String) -> String {
+        if waitingForThinkClose && !inside {
+            buffer += chunk
+            if let released = releaseIfThinkFinished() {
+                return released
+            }
+            return ""
+        }
         buffer += chunk
         var output = ""
         while !buffer.isEmpty {
@@ -343,6 +375,16 @@ struct ThoughtChannelFilter {
     }
 
     mutating func flush() -> String {
+        if waitingForThinkClose {
+            if let spoken = releaseIfThinkFinished() {
+                return spoken
+            }
+            let leftover = buffer
+            buffer = ""
+            waitingForThinkClose = false
+            if leftover.lowercased().contains("<think") { return "" }
+            return leftover
+        }
         if inside {
             buffer = ""
             inside = false
@@ -352,6 +394,27 @@ struct ThoughtChannelFilter {
         let leftover = buffer
         buffer = ""
         return leftover
+    }
+
+    /// Nil while this is still the hidden thought. A direct answer with no
+    /// think tag stays buffered until `flush`, so a late `</think>` can still
+    /// cut the draft out.
+    private mutating func releaseIfThinkFinished() -> String? {
+        if let end = earliestRange(among: ["</think>", "</|think|>"]) {
+            buffer.removeSubrange(buffer.startIndex..<end.upperBound)
+            if buffer.first == "\n" { buffer.removeFirst() }
+            waitingForThinkClose = false
+            let rest = buffer
+            buffer = ""
+            return push(rest)
+        }
+        if earliestOpen() != nil {
+            waitingForThinkClose = false
+            let rest = buffer
+            buffer = ""
+            return push(rest)
+        }
+        return nil
     }
 
     private func earliestOpen() -> (range: Range<String.Index>, closes: [String])? {

@@ -128,7 +128,9 @@ final class LLMManager: ObservableObject {
 
                 let startTime = CFAbsoluteTimeGetCurrent()
                 var tokenCount = 0
-                var channelFilter = ThoughtChannelFilter()
+                var channelFilter = ThoughtChannelFilter(
+                    hideUntilThinkClose: skipThink && ctx.hidesThinkUntilClose
+                )
                 var preambleFilter = ReasoningPreambleFilter()
 
                 do {

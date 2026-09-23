@@ -90,6 +90,8 @@ actor LlamaContext {
     private let chatFamily: ChatFamily
     /// 12B+ Gemma 4 gets a closed empty thought primer. E2B/E4B must not — that primer opens CoT.
     private let gemmaThoughtPrimer: Bool
+    /// Gemma 3 R1 writes the thought as the reply unless the prompt already ends with `</think>`.
+    nonisolated let hidesThinkUntilClose: Bool
     private var stopTracker = StopSequenceTracker()
     private var nCur: Int32 = 0
     private var nDecode: Int32 = 0
@@ -239,6 +241,9 @@ actor LlamaContext {
         self.chatFamily = LlamaContext.detectFamily(model: model, vocab: self.vocab, fileName: fileName)
         let params = llama_model_n_params(model)
         self.gemmaThoughtPrimer = chatFamily == .gemma4 && params >= UInt64(6_000_000_000)
+        let nameBlob = fileName + " " + LlamaContext.metaString(model, "general.name")
+            + " " + LlamaContext.metaString(model, "general.basename")
+        self.hidesThinkUntilClose = chatFamily == .gemma3 && ChatPrompt.isGemmaReasoningTune(nameBlob)
 
         // Generic voice-assistant sampling. Not tied to a single model family.
         let sparams = llama_sampler_chain_default_params()
@@ -253,7 +258,7 @@ actor LlamaContext {
         llama_sampler_chain_add(self.sampling, llama_sampler_init_min_p(0.05, 1))
         llama_sampler_chain_add(self.sampling, llama_sampler_init_temp(0.7))
         llama_sampler_chain_add(self.sampling, llama_sampler_init_dist(1234))
-        logger.info("chat family=\(self.chatFamily.rawValue, privacy: .public) gemmaPrimer=\(self.gemmaThoughtPrimer ? "1" : "0", privacy: .public)")
+        logger.info("chat family=\(self.chatFamily.rawValue, privacy: .public) gemmaPrimer=\(self.gemmaThoughtPrimer ? "1" : "0", privacy: .public) hideThink=\(self.hidesThinkUntilClose ? "1" : "0", privacy: .public)")
     }
 
     /// Format a voice conversation. Known families use native templates so thinking
@@ -270,7 +275,8 @@ actor LlamaContext {
                 system: system,
                 history: history,
                 thinking: !suppressThinking,
-                gemmaThoughtPrimer: gemmaThoughtPrimer
+                gemmaThoughtPrimer: gemmaThoughtPrimer,
+                gemmaReasoningTune: hidesThinkUntilClose
             )
         }
 
