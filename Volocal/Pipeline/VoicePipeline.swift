@@ -30,6 +30,13 @@ final class VoicePipeline: ObservableObject {
     private let sentenceBuffer = SentenceBuffer()
 
     private var generationTask: Task<Void, Never>?
+    /// Llama started on a stable partial, before the turn officially ends.
+    private var draftText = ""
+    private var draftTokens = ""
+    private var draftTask: Task<Void, Never>?
+    private var draftDebounce: Task<Void, Never>?
+    private var draftRevision = 0
+    private var draftCommitted = false
     private var sentenceQueue: [String] = []
     private var speakingTask: Task<Void, Never>?
     private var turnRevision: Int = 0
@@ -71,7 +78,12 @@ final class VoicePipeline: ObservableObject {
         setupCallbacks()
         sttManager.$partialResult
             .receive(on: DispatchQueue.main)
-            .assign(to: &$partialTranscript)
+            .sink { [weak self] text in
+                guard let self else { return }
+                self.partialTranscript = text
+                self.considerDraft(text)
+            }
+            .store(in: &cancellables)
 
         llmManager.objectWillChange
             .receive(on: DispatchQueue.main)
@@ -218,6 +230,7 @@ final class VoicePipeline: ObservableObject {
         if state == .listening {
             stopListening()
         }
+        cancelDraft()
         conversationHistory.removeAll()
         rollingMemory = ""
         memoryCompressTask?.cancel()
@@ -254,12 +267,14 @@ final class VoicePipeline: ObservableObject {
     }
 
     private func stopListening() {
+        cancelDraft()
         sttManager.stopListening()
         state = .idle
     }
 
     private func interrupt() {
         turnRevision += 1
+        cancelDraft()
         ttsManager.stop()
         llmManager.stopGeneration()
         generationTask?.cancel()
@@ -303,6 +318,7 @@ final class VoicePipeline: ObservableObject {
     private func handleUtterance(_ text: String) {
         if isLikelySpeakerEcho(text) {
             logger.info("Ignoring STT echo of TTS: \(text, privacy: .public)")
+            cancelDraft()
             sttManager.resetForNextUtterance()
             return
         }
@@ -315,70 +331,157 @@ final class VoicePipeline: ObservableObject {
         turnRevision += 1
         let myRevision = turnRevision
         memoryCompressTask?.cancel()
+        draftDebounce?.cancel()
+
+        let adopt = !draftText.isEmpty
+            && Self.normalizedWords(text) == Self.normalizedWords(draftText)
+            && (draftTask != nil || !draftTokens.isEmpty)
 
         let userMessage = ConversationMessage(role: .user, text: text)
         conversationHistory.append(userMessage)
         currentTranscript = text
-
-        // Forward partial transcript
-        partialTranscript = sttManager.partialResult
-
-        // Reset ASR for next utterance (mic stays open)
+        partialTranscript = ""
+        state = .processing
         sttManager.resetForNextUtterance()
 
-        state = .processing
-        currentResponse = ""
         sentenceBuffer.reset()
         sentenceQueue.removeAll()
 
+        if adopt {
+            draftCommitted = true
+            let seeded = draftTokens
+            draftTokens = ""
+            currentResponse = seeded
+            if !seeded.isEmpty {
+                sentenceBuffer.append(seeded)
+            }
+            let pending = draftTask
+            generationTask = Task {
+                await pending?.value
+                await finishSpeaking(myRevision)
+            }
+            return
+        }
+
+        cancelDraft()
+        currentResponse = ""
+        let history = conversationHistory
+        let memory = rollingMemory
         generationTask = Task {
             // PocketTTS/llama Metal cannot overlap after barge-in. Drain the
             // cancelled synthesizer before the next decode.
             await ttsManager.stopAndWait()
             guard !Task.isCancelled, myRevision == turnRevision else { return }
 
-            // History already includes the user message we just appended.
-            // generate() should NOT re-append the prompt. First clause starts
-            // TTS while llama is still writing; llama waits only while CoreML
-            // holds the GPU.
-            for await token in llmManager.generate(history: conversationHistory, memory: rollingMemory) {
+            for await token in llmManager.generate(history: history, memory: memory) {
                 guard !Task.isCancelled, myRevision == turnRevision else { break }
                 currentResponse += token
                 sentenceBuffer.append(token)
             }
-
-            guard !Task.isCancelled, myRevision == turnRevision else { return }
-
-            sentenceBuffer.flush()
-            processNextSentence()
-
-            // Only append non-empty assistant messages
-            if !currentResponse.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                let assistantMessage = ConversationMessage(role: .assistant, text: currentResponse)
-                conversationHistory.append(assistantMessage)
-                trimHistory()
-            }
-            // Clear so the partial response bubble disappears
-            // (the response is now in conversationHistory)
-            currentResponse = ""
-
-            // Wait for all queued sentences to finish speaking (with timeout)
-            let waitStart = CFAbsoluteTimeGetCurrent()
-            let waitTimeout: TimeInterval = 60
-            while speakingTask != nil && !Task.isCancelled && myRevision == turnRevision {
-                if CFAbsoluteTimeGetCurrent() - waitStart > waitTimeout {
-                    logger.warning("Speaking wait timeout after \(waitTimeout)s")
-                    break
-                }
-                try? await Task.sleep(for: .milliseconds(100))
-            }
-            if !Task.isCancelled && myRevision == turnRevision {
-                await sharedAudio.waitForPlaybackCompletion()
-            }
-
-            guard !Task.isCancelled, myRevision == turnRevision else { return }
-            state = .listening
+            await finishSpeaking(myRevision)
         }
+    }
+
+    /// Start llama while the partial is stable, so prefill overlaps the tail of the turn.
+    /// Tokens stay unspoken until the transcript commits. A changed partial throws the draft away.
+    private func considerDraft(_ text: String) {
+        guard state == .listening else { return }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Emitting a turn clears the partial before the commit runs. An empty
+        // update must not throw away the draft we are about to speak.
+        guard !trimmed.isEmpty else { return }
+        guard UtteranceReadiness.looksComplete(trimmed) else {
+            if !draftText.isEmpty, Self.normalizedWords(trimmed) != Self.normalizedWords(draftText) {
+                cancelDraft()
+            }
+            return
+        }
+        if Self.normalizedWords(trimmed) == Self.normalizedWords(draftText), draftTask != nil {
+            return
+        }
+        draftDebounce?.cancel()
+        let snapshot = trimmed
+        draftDebounce = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(180))
+            guard !Task.isCancelled, state == .listening else { return }
+            let live = sttManager.partialResult.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard live == snapshot else { return }
+            beginDraft(snapshot)
+        }
+    }
+
+    private func beginDraft(_ text: String) {
+        guard state == .listening else { return }
+        if Self.normalizedWords(text) == Self.normalizedWords(draftText), draftTask != nil { return }
+        cancelDraft()
+        draftRevision += 1
+        let revision = draftRevision
+        draftText = text
+        draftTokens = ""
+        draftCommitted = false
+        let history = conversationHistory + [ConversationMessage(role: .user, text: text)]
+        let memory = rollingMemory
+        draftTask = Task { @MainActor in
+            for await token in llmManager.generate(history: history, memory: memory) {
+                guard revision == draftRevision else { break }
+                if draftCommitted {
+                    guard state == .processing || state == .speaking else { break }
+                    currentResponse += token
+                    sentenceBuffer.append(token)
+                } else {
+                    guard state == .listening else { break }
+                    draftTokens += token
+                }
+            }
+        }
+    }
+
+    private func cancelDraft() {
+        draftDebounce?.cancel()
+        draftDebounce = nil
+        let hadDraft = draftTask != nil
+        draftRevision += 1
+        draftTask?.cancel()
+        draftTask = nil
+        draftText = ""
+        draftTokens = ""
+        draftCommitted = false
+        if hadDraft {
+            llmManager.stopGeneration()
+        }
+    }
+
+    private func finishSpeaking(_ myRevision: Int) async {
+        guard !Task.isCancelled, myRevision == turnRevision else { return }
+
+        sentenceBuffer.flush()
+        processNextSentence()
+
+        if !currentResponse.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let assistantMessage = ConversationMessage(role: .assistant, text: currentResponse)
+            conversationHistory.append(assistantMessage)
+            trimHistory()
+        }
+        currentResponse = ""
+        draftText = ""
+        draftTask = nil
+        draftCommitted = false
+
+        let waitStart = CFAbsoluteTimeGetCurrent()
+        let waitTimeout: TimeInterval = 60
+        while speakingTask != nil && !Task.isCancelled && myRevision == turnRevision {
+            if CFAbsoluteTimeGetCurrent() - waitStart > waitTimeout {
+                logger.warning("Speaking wait timeout after \(waitTimeout)s")
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        if !Task.isCancelled && myRevision == turnRevision {
+            await sharedAudio.waitForPlaybackCompletion()
+        }
+
+        guard !Task.isCancelled, myRevision == turnRevision else { return }
+        state = .listening
     }
 
     private func handleSentence(_ sentence: String) {

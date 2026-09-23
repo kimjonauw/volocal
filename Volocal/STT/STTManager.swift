@@ -38,6 +38,8 @@ final class STTManager: ObservableObject {
     private var asrPaused = false
     private var asrPauseDepth = 0
     private var asrResetEpoch = 0
+    /// Partial already reads as a finished thought, so the energy detector may end sooner.
+    private var eagerEndpoint = false
 
     /// Serial stream for backpressure — prevents unbounded Task spawning per audio buffer
     private var bufferContinuation: AsyncStream<AVAudioPCMBuffer>.Continuation?
@@ -98,7 +100,8 @@ final class STTManager: ObservableObject {
             for await buffer in stream {
                 guard !Task.isCancelled else { break }
                 let rms = SharedAudioEngine.rmsEnergy(buffer)
-                let decision = detector.observe(rms: rms)
+                let eager = await MainActor.run { self?.eagerEndpoint == true }
+                let decision = detector.observe(rms: rms, eager: eager)
                 if decision.endTurn {
                     await self?.forceEndOfTurn()
                 }
@@ -134,6 +137,7 @@ final class STTManager: ObservableObject {
         partialResult = ""
         hasFiredSpeechDetected = false
         lastEmittedNormalized = ""
+        eagerEndpoint = false
         asrPaused = false
         asrPauseDepth = 0
         turnDetector.resetUtterance()
@@ -169,6 +173,7 @@ final class STTManager: ObservableObject {
     func resetForNextUtterance() {
         hasFiredSpeechDetected = false
         partialResult = ""
+        eagerEndpoint = false
         nemotronDebounceTask?.cancel()
         nemotronDebounceTask = nil
         turnDetector.resetUtterance()
@@ -213,6 +218,7 @@ final class STTManager: ObservableObject {
             Task { @MainActor in
                 guard let self, !self.isStopping else { return }
                 self.partialResult = text
+                self.eagerEndpoint = UtteranceReadiness.looksComplete(text)
                 self.considerSpeechDetected(text)
             }
         }
@@ -235,6 +241,7 @@ final class STTManager: ObservableObject {
             Task { @MainActor in
                 guard let self, !self.isStopping else { return }
                 self.partialResult = text
+                self.eagerEndpoint = UtteranceReadiness.looksComplete(text)
                 self.considerSpeechDetected(text)
                 self.scheduleNemotronUtterance(text)
             }
@@ -260,12 +267,13 @@ final class STTManager: ObservableObject {
         emitUtterance(text)
     }
 
-    /// Nemotron has no EOU head — treat a ~900 ms stall in the partial as a turn.
+    /// Nemotron has no EOU head — a finished phrase ends after ~320 ms, otherwise ~900 ms.
     private func scheduleNemotronUtterance(_ text: String) {
         nemotronDebounceTask?.cancel()
         let snapshot = text
+        let waitMs = UtteranceReadiness.looksComplete(text) ? 320 : 900
         nemotronDebounceTask = Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(900))
+            try? await Task.sleep(for: .milliseconds(waitMs))
             guard !Task.isCancelled, !self.isStopping else { return }
             guard self.partialResult == snapshot else { return }
             self.emitUtterance(snapshot)
@@ -284,6 +292,7 @@ final class STTManager: ObservableObject {
         lastEmittedNormalized = normalized
         transcript = finalText
         partialResult = ""
+        eagerEndpoint = false
         hasFiredSpeechDetected = false
         nemotronDebounceTask?.cancel()
         nemotronDebounceTask = nil

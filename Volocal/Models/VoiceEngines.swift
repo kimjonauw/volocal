@@ -23,7 +23,7 @@ enum STTEngine: String, CaseIterable, Codable, Identifiable {
     var detail: String {
         switch self {
         case .parakeetEou320:
-            return "Best for live interrupt. Native end-of-utterance on ANE. Quiet ~0.8s after you stop talking now ends the turn even if a fan is on."
+            return "Best for live interrupt. Native end-of-utterance on ANE. A finished phrase starts the reply quickly; a fan or an unfinished phrase still waits about 0.8s."
         case .parakeetEou160:
             return "Same model, 160 ms chunks — snappier, a bit less accurate."
         case .nemotron560:

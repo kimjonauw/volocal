@@ -35,6 +35,14 @@ final class SentenceBuffer {
             buffer = String(buffer[range.upperBound...]).trimmingCharacters(in: .whitespaces)
         }
 
+        // First audio only: a comma clause, or the first 10 words, so speech
+        // starts before the model finishes a long sentence. Later chunks stay
+        // on .!? — chopping every phrase is what made mid-sentence pauses.
+        if !didEmit, let split = earlyClauseEnd() {
+            emit(String(buffer[buffer.startIndex..<split]))
+            buffer = String(buffer[split...]).trimmingCharacters(in: .whitespaces)
+        }
+
         if !hasIncompleteExpression(buffer), buffer.count >= maxChars {
             forceSplitAtWordBoundary(limit: maxChars)
         }
@@ -82,6 +90,39 @@ final class SentenceBuffer {
                 if nextChar == "\"" || nextChar == "\u{201D}" {
                     return i..<nextIndex
                 }
+            }
+        }
+        return nil
+    }
+
+    /// Index just past the first speakable chunk. Nil until a comma clause of
+    /// 4+ words, or an 11th word proves the first 10 are complete.
+    private func earlyClauseEnd() -> String.Index? {
+        guard !hasIncompleteExpression(buffer) else { return nil }
+        var words = 0
+        var inWord = false
+        var tenthWordEnd: String.Index?
+        for i in buffer.indices {
+            if isInsideExpression(at: i) { return nil }
+            let ch = buffer[i]
+            if ch.isWhitespace {
+                inWord = false
+                continue
+            }
+            if !inWord {
+                words += 1
+                inWord = true
+            }
+            if (ch == "," || ch == ";") && words >= 4 {
+                let next = buffer.index(after: i)
+                if next < buffer.endIndex, buffer[next].isWhitespace {
+                    return next
+                }
+            }
+            if words == 10 {
+                tenthWordEnd = buffer.index(after: i)
+            } else if words > 10, let end = tenthWordEnd {
+                return end
             }
         }
         return nil
