@@ -49,7 +49,7 @@ final class LLMManager: ObservableObject {
         return core + expressionCue
     }
 
-    static func promptWithMemory(_ system: String, memory: String) -> String {
+    nonisolated static func promptWithMemory(_ system: String, memory: String) -> String {
         let mem = memory.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !mem.isEmpty else { return system }
         return system + "\n\nEarlier conversation (facts only; do not read this block aloud):\n" + mem
