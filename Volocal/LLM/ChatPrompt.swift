@@ -510,6 +510,10 @@ struct ReasoningPreambleFilter {
     private var buffer = ""
     private var passed = false
 
+    init(systemEcho: String = "") {
+        self.systemEcho = systemEcho
+    }
+
     private static let cotPrefixes = [
         "the user",
         "the person",
