@@ -105,6 +105,59 @@ enum HuggingFaceHub {
         .sorted { ($0.sizeBytes ?? 0) < ($1.sizeBytes ?? 0) }
     }
 
+    static func resolveURL(repoId: String, path: String) -> URL? {
+        guard isValidRepoId(repoId), GGUFFile.isSafeHubPath(path) else { return nil }
+        let encodedRepo = repoId
+            .split(separator: "/")
+            .map { $0.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? String($0) }
+            .joined(separator: "/")
+        let encodedFile = path
+            .split(separator: "/")
+            .map { $0.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? String($0) }
+            .joined(separator: "/")
+        return URL(string: "https://huggingface.co/\(encodedRepo)/resolve/main/\(encodedFile)?download=true")
+    }
+
+    static func isMLXSnapshotFile(_ path: String) -> Bool {
+        guard GGUFFile.isSafeHubPath(path) else { return false }
+        let name = (path as NSString).lastPathComponent.lowercased()
+        if name.hasSuffix(".safetensors") || name.hasSuffix(".safetensors.index.json") { return true }
+        let allowed: Set<String> = [
+            "config.json", "generation_config.json", "tokenizer.json", "tokenizer_config.json",
+            "tokenizer.model", "special_tokens_map.json", "added_tokens.json", "chat_template.jinja",
+            "vocab.json", "merges.txt",
+        ]
+        return allowed.contains(name)
+    }
+
+    static func listMLXFiles(repoId: String) async throws -> [RemoteFile] {
+        guard isValidRepoId(repoId) else { throw URLError(.badURL) }
+        let encoded = repoId
+            .split(separator: "/")
+            .map { $0.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? String($0) }
+            .joined(separator: "/")
+        guard let url = URL(string: "https://huggingface.co/api/models/\(encoded)/tree/main?recursive=true") else {
+            throw URLError(.badURL)
+        }
+        let (data, response) = try await session.data(from: url)
+        try throwIfBad(response)
+        struct Item: Decodable {
+            let path: String
+            let type: String?
+            let size: Int64?
+            let lfs: LFS?
+            struct LFS: Decodable {
+                let size: Int64?
+            }
+        }
+        let items = try JSONDecoder().decode([Item].self, from: data)
+        return items.compactMap { item in
+            guard item.type == "file" || item.type == nil else { return nil }
+            guard isMLXSnapshotFile(item.path) else { return nil }
+            return RemoteFile(path: item.path, sizeBytes: item.lfs?.size ?? item.size, sha256: nil)
+        }
+    }
+
     /// Accepts `org/repo`, a Hugging Face model URL, or a direct `/resolve/` GGUF URL.
     static func parseUserInput(_ raw: String) -> (repoId: String, filename: String?)? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)

@@ -1,14 +1,27 @@
 import Foundation
 
-/// A GGUF language model that can be downloaded from Hugging Face and loaded by llama.cpp.
+/// A language model downloaded from Hugging Face.
+/// GGUF files load in llama.cpp. MLX packs are a folder of weights for MLX Swift.
 struct LLMModelSpec: Codable, Identifiable, Equatable, Hashable {
+    enum WeightKind: String, Codable {
+        case gguf
+        case mlx
+    }
+
     /// Hugging Face `org/repo`.
     var repoId: String
-    /// Path inside the repo (`model.gguf` or `subdir/model.gguf`). Disk storage uses the last component only.
+    /// Path inside the repo for a GGUF. MLX packs use a synthetic `*.mlx` name so each repo stays unique.
     var filename: String
     var displayName: String
     var sizeBytes: Int64?
     var sha256: String?
+    /// Absent on specs saved before MLX existed. Those are GGUF.
+    var kindRaw: String? = nil
+
+    var kind: WeightKind {
+        get { WeightKind(rawValue: kindRaw ?? "") ?? .gguf }
+        set { kindRaw = newValue == .gguf ? nil : newValue.rawValue }
+    }
 
     var id: String { "\(repoId)/\(filename)" }
 
@@ -17,6 +30,7 @@ struct LLMModelSpec: Codable, Identifiable, Equatable, Hashable {
     }
 
     var downloadURL: URL? {
+        guard kind == .gguf else { return nil }
         guard HuggingFaceHub.isValidRepoId(repoId), GGUFFile.isSafeHubPath(filename) else { return nil }
         let encodedRepo = repoId
             .split(separator: "/")
@@ -43,12 +57,13 @@ struct LLMModelSpec: Codable, Identifiable, Equatable, Hashable {
         (sizeBytes ?? 0) > 8_000_000_000
     }
 
-    /// Nested on-disk location: Documents/models/llm/{repo}__{file}
+    /// Nested on-disk location. GGUF is a file. MLX is the folder of weights.
     var nestedLocalURL: URL {
         let folder = repoId.replacingOccurrences(of: "/", with: "__")
-        return ModelRegistry.llmDirectory
+        let dir = ModelRegistry.llmDirectory
             .appendingPathComponent(folder, isDirectory: true)
-            .appendingPathComponent(diskFileName)
+        if kind == .mlx { return dir }
+        return dir.appendingPathComponent(diskFileName)
     }
 
     /// Original Volocal layout dumped the default GGUF in Documents/models/.
@@ -57,14 +72,21 @@ struct LLMModelSpec: Codable, Identifiable, Equatable, Hashable {
     }
 
     var localURL: URL {
+        if kind == .mlx { return mlxDirectory }
         let nested = nestedLocalURL
         if FileManager.default.fileExists(atPath: nested.path) { return nested }
         if FileManager.default.fileExists(atPath: legacyLocalURL.path) { return legacyLocalURL }
         return nested
     }
 
+    var mlxDirectory: URL {
+        let folder = repoId.replacingOccurrences(of: "/", with: "__")
+        return ModelRegistry.llmDirectory.appendingPathComponent(folder, isDirectory: true)
+    }
+
     /// True only when the file sits under the models folder, looks like GGUF, and is not truncated.
     var isDownloaded: Bool {
+        if kind == .mlx { return Self.mlxPackIsComplete(at: mlxDirectory) }
         let url = localURL.standardizedFileURL
         guard GGUFFile.isInsideModelsDirectory(url) else { return false }
         guard FileManager.default.fileExists(atPath: url.path),
@@ -81,6 +103,25 @@ struct LLMModelSpec: Codable, Identifiable, Equatable, Hashable {
         return true
     }
 
+    static func mlxPackIsComplete(at dir: URL) -> Bool {
+        let config = dir.appendingPathComponent("config.json")
+        guard FileManager.default.fileExists(atPath: config.path) else { return false }
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return false }
+        return names.contains { $0.lowercased().hasSuffix(".safetensors") }
+    }
+
+    static func mlx(repoId: String, displayName: String) -> LLMModelSpec {
+        let leaf = repoId.split(separator: "/").last.map(String.init) ?? repoId
+        return LLMModelSpec(
+            repoId: repoId,
+            filename: "\(leaf).mlx",
+            displayName: displayName,
+            sizeBytes: nil,
+            sha256: nil,
+            kindRaw: WeightKind.mlx.rawValue
+        )
+    }
+
     static let `default` = LLMModelSpec(
         repoId: "bartowski/Qwen_Qwen3.5-2B-GGUF",
         filename: "Qwen_Qwen3.5-2B-Q4_K_S.gguf",
@@ -88,6 +129,13 @@ struct LLMModelSpec: Codable, Identifiable, Equatable, Hashable {
         sizeBytes: 1_327_696_992,
         sha256: "55b574899b75180d084238ffbf5d3d165c568a3d73e1edbd3c826682a986c8d4"
     )
+
+    /// Phone-sized MLX packs. These are folders of weights, not a GGUF.
+    static let suggestedMLX: [LLMModelSpec] = [
+        mlx(repoId: "mlx-community/Qwen3.5-2B-4bit", displayName: "Qwen 3.5 2B MLX 4-bit"),
+        mlx(repoId: "mlx-community/gemma-4-e2b-it-4bit", displayName: "Gemma 4 E2B MLX 4-bit"),
+        mlx(repoId: "mlx-community/Llama-3.2-3B-Instruct-4bit", displayName: "Llama 3.2 3B MLX 4-bit"),
+    ]
 
     /// Phone-sized GGUF starting points. Search Hugging Face for anything else.
     static let suggested: [LLMModelSpec] = [

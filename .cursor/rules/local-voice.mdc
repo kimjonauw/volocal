@@ -8,7 +8,7 @@ alwaysApply: true
 Full context: `AGENTS.md`. Trust review: `docs/SECURITY.md`.
 
 - Keep audio, transcripts, and LLM tokens on-device. Hugging Face is weights-only (list/download GGUF and CoreML).
-- LLM is llama.cpp GGUF only. No MLX / safetensors / ONNX.
+- LLM is llama.cpp GGUF or an MLX Swift pack (`mlx-swift-lm` 3.31.4, Hugging Face folder, not a GGUF). No ONNX. MLX still shares the GPU with PocketTTS.
 - Do not add analytics, crash reporters, ads, or extra network SDKs.
 - Bundle ID stays `com.localiosllm.volocal`. Do not restore the upstream Apple team.
 - Barge-in: one `AVAudioEngine`, Voice Processing AEC, mic stays open during TTS. Install the input tap once; LiveContainer Multitask already holds a tap and a second `installTap` crashes (`nullptr == Tap()`). Keep LC Multitask off for this guest. Do not classify short barge-in as echo. End a finished quiet-room turn after ~0.28s; keep ~0.8s when the room is noisy or the phrase is unfinished. A stable partial may start a llama draft before commit; speak it only after commit. Drain cancelled TTS before the next llama decode. First TTS chunk may be a comma clause or ~10 words; later chunks stay on `.!?`. llama.cpp and CoreML TTS take turns on `GPUExclusive`. Next-clause TTS synthesizes during playback. Disable the idle timer while listening/speaking. `llama_memory_clear(..., true)`. Overlay `446/6144` is a GPU/KV crash, not OOM.

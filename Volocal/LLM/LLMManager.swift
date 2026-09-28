@@ -1,4 +1,5 @@
 import Foundation
+import MLXLMCommon
 import os
 
 private let logger = Logger(subsystem: "com.volocal.app", category: "llm")
@@ -24,6 +25,7 @@ final class LLMManager: ObservableObject {
     }
 
     private var llamaContext: LlamaContext?
+    private var mlxContainer: ModelContainer?
     private var generationTask: Task<Void, Never>?
     private var inferenceEpoch = 0
     /// llama.cpp Metal and CoreML TTS take turns on this lock.
@@ -66,6 +68,13 @@ final class LLMManager: ObservableObject {
     func loadModel(path: String, displayName: String? = nil) async throws {
         unload()
         await Task.yield()
+        var isDirectory: ObjCBool = false
+        let exists = FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
+        if exists, isDirectory.boolValue {
+            mlxContainer = try await MLXRuntime.load(directory: URL(fileURLWithPath: path))
+            loadedModelName = displayName ?? URL(fileURLWithPath: path).lastPathComponent
+            return
+        }
         let ctxSize = contextSize
         llamaContext = try await Task.detached(priority: .userInitiated) {
             try LlamaContext.create(path: path, contextSize: ctxSize)
@@ -76,7 +85,71 @@ final class LLMManager: ObservableObject {
     func unload() {
         stopGeneration()
         llamaContext = nil
+        mlxContainer = nil
         loadedModelName = nil
+    }
+
+    nonisolated private func streamMLX(
+        _ container: ModelContainer,
+        system: String,
+        history: [(role: String, content: String)],
+        gpu: GPUExclusive?,
+        continuation: AsyncStream<String>.Continuation
+    ) async {
+        await MainActor.run {
+            self.isGenerating = true
+            self.response = ""
+            self.tokensPerSecond = 0
+            self.hiddenTokenCount = 0
+            self.spokenCharCount = 0
+            self.generatePhase = .readingPrompt
+        }
+        let startTime = CFAbsoluteTimeGetCurrent()
+        var tokenCount = 0
+        var channelFilter = ThoughtChannelFilter()
+        var preambleFilter = ReasoningPreambleFilter(systemEcho: system)
+        do {
+            let run = {
+                let stream = try await MLXRuntime.openStream(
+                    container: container,
+                    system: system,
+                    history: history
+                )
+                for await event in stream {
+                    if Task.isCancelled { break }
+                    guard let piece = event.chunk, !piece.isEmpty else { continue }
+                    tokenCount += 1
+                    let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+                    let tps = elapsed > 0 ? Double(tokenCount) / elapsed : 0
+                    let spoken = preambleFilter.push(channelFilter.push(piece))
+                    if spoken.isEmpty { continue }
+                    continuation.yield(spoken)
+                    await MainActor.run {
+                        self.response += spoken
+                        self.tokensPerSecond = tps
+                        self.spokenCharCount = self.response.count
+                        self.generatePhase = .writingSpeech
+                    }
+                }
+                let tail = preambleFilter.push(channelFilter.flush()) + preambleFilter.flush()
+                if !tail.isEmpty {
+                    continuation.yield(tail)
+                    await MainActor.run { self.response += tail }
+                }
+            }
+            if let gpu {
+                try await gpu.run(run)
+            } else {
+                try await run()
+            }
+        } catch {
+            await MainActor.run { self.error = error.localizedDescription }
+        }
+        await MainActor.run {
+            self.isGenerating = false
+            self.generatePhase = .idle
+        }
+        continuation.finish()
     }
 
     /// Generate response from conversation history.
@@ -104,10 +177,21 @@ final class LLMManager: ObservableObject {
                     continuation.finish()
                     return
                 }
+                let mlx = await MainActor.run { self.mlxContainer }
+                if let mlx {
+                    await self.streamMLX(
+                        mlx,
+                        system: Self.promptWithMemory(promptSystem, memory: memorySnapshot),
+                        history: historySnapshot.map { ($0.role == .user ? "user" : "assistant", $0.text) },
+                        gpu: gpu,
+                        continuation: continuation
+                    )
+                    return
+                }
                 let ctx = await MainActor.run { self.llamaContext }
                 guard let ctx else {
                     await MainActor.run {
-                        self.error = "No GGUF loaded."
+                        self.error = "No language model loaded."
                     }
                     continuation.finish()
                     return
@@ -211,7 +295,7 @@ final class LLMManager: ObservableObject {
     }
 
     var isModelLoaded: Bool {
-        llamaContext != nil
+        llamaContext != nil || mlxContainer != nil
     }
 
     func tokenCount(for text: String) async -> Int? {

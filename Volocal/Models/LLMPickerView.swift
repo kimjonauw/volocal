@@ -39,7 +39,7 @@ struct LLMPickerView: View {
                 }
 
                 Section {
-                    Text("Only GGUF chat models work here. Prefer Q4_K / Q5_K of a 2B–4B. Quantization shrinks the weight file, not the 27B architecture — a Q4_0 under 4 GB on a 27B repo is the draft/MTP companion, not the model. Embedding, rerank, mmproj, draft, MTP, IQ1–3, and Unsloth UD files will not load. Qwen 3.5 2B Q4_K is the known-good pick.")
+                    Text("GGUF files run in llama.cpp. MLX packs are a folder of weights and are faster on this iPhone for the same size model. Prefer a 4-bit 2B–4B. Qwen 3.5 2B is the known-good pick in either format. A GGUF fine-tune does not load as MLX unless that exact model was published as an MLX pack.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -49,6 +49,7 @@ struct LLMPickerView: View {
                 contextSection
                 installedSection
                 suggestedSection
+                mlxSection
                 pasteSection
                 searchSection
             }
@@ -275,9 +276,20 @@ struct LLMPickerView: View {
     }
 
     private var suggestedSection: some View {
-        Section("Suggested for iPhone") {
+        Section("Suggested GGUF") {
             ForEach(LLMModelSpec.suggested) { spec in
                 modelRow(spec, trailing: spec.sizeBytes.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) })
+            }
+        }
+    }
+
+    private var mlxSection: some View {
+        Section("MLX Swift") {
+            Text("Downloads the weight folder from Hugging Face. Faster decode than GGUF. Still shares the GPU with PocketTTS.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            ForEach(LLMModelSpec.suggestedMLX) { spec in
+                modelRow(spec, trailing: "MLX")
             }
         }
     }
@@ -442,6 +454,11 @@ struct LLMPickerView: View {
                 sha256: nil
             )
             await choose(spec)
+            return
+        }
+        if parsed.repoId.lowercased().contains("mlx") {
+            let leaf = parsed.repoId.split(separator: "/").last.map(String.init) ?? parsed.repoId
+            await choose(LLMModelSpec.mlx(repoId: parsed.repoId, displayName: leaf))
             return
         }
         expandedRepo = parsed.repoId

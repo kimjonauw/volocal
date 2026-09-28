@@ -293,6 +293,13 @@ final class UnifiedModelManager: ObservableObject {
         let llmRoot = ModelRegistry.llmDirectory
         if let folders = try? fm.contentsOfDirectory(at: llmRoot, includingPropertiesForKeys: nil) {
             for folder in folders where folder.hasDirectoryPath {
+                if LLMModelSpec.mlxPackIsComplete(at: folder) {
+                    let repoId = folder.lastPathComponent.replacingOccurrences(of: "__", with: "/")
+                    let spec = LLMModelSpec.mlx(repoId: repoId, displayName: repoId)
+                    if !found.contains(where: { $0.id == spec.id }) {
+                        found.append(spec)
+                    }
+                }
                 if let files = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.fileSizeKey]) {
                     for file in files where LLMFileFilter.isLoadableGGUF(file.lastPathComponent) {
                         let repoId = folder.lastPathComponent.replacingOccurrences(of: "__", with: "/")
@@ -333,6 +340,11 @@ final class UnifiedModelManager: ObservableObject {
 
         if spec.isDownloaded {
             modelStates[.llm] = .downloaded
+            return
+        }
+
+        if spec.kind == .mlx {
+            await downloadMLXPack(spec, generation: generation)
             return
         }
 
@@ -441,6 +453,59 @@ final class UnifiedModelManager: ObservableObject {
         }
     }
 
+    private func downloadMLXPack(_ spec: LLMModelSpec, generation: Int) async {
+        let destination = spec.mlxDirectory.standardizedFileURL
+        guard GGUFFile.isInsideModelsDirectory(destination) else {
+            failLLM("Refusing to write the MLX pack outside the models folder")
+            return
+        }
+        do {
+            let files = try await HuggingFaceHub.listMLXFiles(repoId: spec.repoId)
+            guard !files.isEmpty else {
+                throw LLMDownloadError.notMLX
+            }
+            let total = files.reduce(Int64(0)) { $0 + max($1.sizeBytes ?? 0, 0) }
+            guard total == 0 || total < 6_500_000_000 else {
+                throw LLMDownloadError.tooLarge
+            }
+            try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+            var completed: Int64 = 0
+            for file in files {
+                guard generation == llmDownloadGeneration else { return }
+                guard GGUFFile.isSafeHubPath(file.path) else { continue }
+                let fileURL = destination.appendingPathComponent(file.path)
+                try FileManager.default.createDirectory(
+                    at: fileURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                guard let remote = HuggingFaceHub.resolveURL(repoId: spec.repoId, path: file.path) else {
+                    throw URLError(.badURL)
+                }
+                let (temp, response) = try await URLSession.shared.download(from: remote)
+                if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                    throw LLMDownloadError.httpStatus(http.statusCode)
+                }
+                if FileManager.default.fileExists(atPath: fileURL.path) {
+                    try FileManager.default.removeItem(at: fileURL)
+                }
+                try FileManager.default.moveItem(at: temp, to: fileURL)
+                completed += file.sizeBytes ?? 0
+                if total > 0 {
+                    modelStates[.llm] = .downloading(progress: min(Double(completed) / Double(total), 1))
+                }
+            }
+            guard generation == llmDownloadGeneration else { return }
+            guard spec.isDownloaded else { throw LLMDownloadError.notMLX }
+            modelStates[.llm] = .downloaded
+            logger.info("MLX pack downloaded: \(spec.id)")
+            markOnboardedIfReady()
+        } catch {
+            if (error as? URLError)?.code == .cancelled { return }
+            try? FileManager.default.removeItem(at: destination)
+            failLLM("MLX download failed: \(error.localizedDescription)")
+        }
+    }
+
     private func failLLM(_ message: String) {
         modelStates[.llm] = .error(message)
         error = message
@@ -532,6 +597,8 @@ enum LLMDownloadError: LocalizedError {
     case checksumMismatch
     case httpStatus(Int)
     case notGGUF
+    case notMLX
+    case tooLarge
     case truncated
 
     var errorDescription: String? {
@@ -542,6 +609,10 @@ enum LLMDownloadError: LocalizedError {
             return "Hugging Face returned HTTP \(code) instead of a GGUF."
         case .notGGUF:
             return "Download was not a GGUF file (HTML error page or wrong asset)."
+        case .notMLX:
+            return "That Hugging Face repo has no MLX weights (config.json plus a safetensors file)."
+        case .tooLarge:
+            return "That MLX pack is over 6.5 GB. Pick a 4-bit 2B–4B."
         case .truncated:
             return "Download was truncated. Delete and retry on Wi-Fi."
         }
