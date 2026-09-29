@@ -461,19 +461,30 @@ final class UnifiedModelManager: ObservableObject {
         }
         do {
             let files = try await HuggingFaceHub.listMLXFiles(repoId: spec.repoId)
-            guard !files.isEmpty else {
+            guard files.contains(where: { $0.path == "tokenizer.json" }) else {
                 throw LLMDownloadError.notMLX
             }
-            let total = files.reduce(Int64(0)) { $0 + max($1.sizeBytes ?? 0, 0) }
-            guard total == 0 || total < 6_500_000_000 else {
-                throw LLMDownloadError.tooLarge
+            let ordered = files.sorted { lhs, rhs in
+                let lhsWeight = lhs.path.lowercased().hasSuffix(".safetensors")
+                    && !lhs.path.lowercased().hasSuffix(".index.json")
+                let rhsWeight = rhs.path.lowercased().hasSuffix(".safetensors")
+                    && !rhs.path.lowercased().hasSuffix(".index.json")
+                if lhsWeight != rhsWeight { return !lhsWeight }
+                return (lhs.sizeBytes ?? 0) < (rhs.sizeBytes ?? 0)
             }
+            let total = ordered.reduce(Int64(0)) { $0 + max($1.sizeBytes ?? 0, 1) }
+            guard total < 6_500_000_000 else { throw LLMDownloadError.tooLarge }
             try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
             var completed: Int64 = 0
-            for file in files {
+            for file in ordered {
                 guard generation == llmDownloadGeneration else { return }
                 guard GGUFFile.isSafeHubPath(file.path) else { continue }
                 let fileURL = destination.appendingPathComponent(file.path)
+                if Self.mlxFileIsUsable(fileURL, expectedBytes: file.sizeBytes) {
+                    completed += file.sizeBytes ?? 0
+                    modelStates[.llm] = .downloading(progress: min(Double(completed) / Double(total), 0.99))
+                    continue
+                }
                 try FileManager.default.createDirectory(
                     at: fileURL.deletingLastPathComponent(),
                     withIntermediateDirectories: true
@@ -481,18 +492,33 @@ final class UnifiedModelManager: ObservableObject {
                 guard let remote = HuggingFaceHub.resolveURL(repoId: spec.repoId, path: file.path) else {
                     throw URLError(.badURL)
                 }
-                let (temp, response) = try await URLSession.shared.download(from: remote)
-                if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-                    throw LLMDownloadError.httpStatus(http.statusCode)
+                let temp = try await downloadRemote(
+                    remote,
+                    allowJSON: true,
+                    generation: generation
+                ) { [weak self] written, expected in
+                    let fileTotal = expected > 0 ? expected : (file.sizeBytes ?? expected)
+                    let fraction = fileTotal > 0 ? Double(written) / Double(fileTotal) : 0
+                    let overall = Double(completed) + fraction * Double(max(file.sizeBytes ?? fileTotal, 1))
+                    Task { @MainActor in
+                        guard let self, self.llmDownloadGeneration == generation else { return }
+                        self.modelStates[.llm] = .downloading(progress: min(overall / Double(total), 0.99))
+                    }
+                }
+                guard generation == llmDownloadGeneration else {
+                    try? FileManager.default.removeItem(at: temp)
+                    return
                 }
                 if FileManager.default.fileExists(atPath: fileURL.path) {
                     try FileManager.default.removeItem(at: fileURL)
                 }
                 try FileManager.default.moveItem(at: temp, to: fileURL)
-                completed += file.sizeBytes ?? 0
-                if total > 0 {
-                    modelStates[.llm] = .downloading(progress: min(Double(completed) / Double(total), 1))
+                guard Self.mlxFileIsUsable(fileURL, expectedBytes: file.sizeBytes) else {
+                    try? FileManager.default.removeItem(at: fileURL)
+                    throw LLMDownloadError.truncated
                 }
+                completed += file.sizeBytes ?? (try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.size] as? Int64) ?? 0
+                modelStates[.llm] = .downloading(progress: min(Double(completed) / Double(total), 0.99))
             }
             guard generation == llmDownloadGeneration else { return }
             guard spec.isDownloaded else { throw LLMDownloadError.notMLX }
@@ -501,8 +527,65 @@ final class UnifiedModelManager: ObservableObject {
             markOnboardedIfReady()
         } catch {
             if (error as? URLError)?.code == .cancelled { return }
-            try? FileManager.default.removeItem(at: destination)
             failLLM("MLX download failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Keep files that already match the Hub size. A half-written weight file is not usable.
+    private static func mlxFileIsUsable(_ url: URL, expectedBytes: Int64?) -> Bool {
+        guard FileManager.default.fileExists(atPath: url.path),
+              let size = try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? UInt64,
+              size > 0
+        else { return false }
+        if let expectedBytes, expectedBytes > 0, size + 65_536 < UInt64(expectedBytes) {
+            return false
+        }
+        if size < 512,
+           let data = try? Data(contentsOf: url),
+           data.starts(with: Data("<!DOCTYPE".utf8)) || data.starts(with: Data("<html".utf8)) {
+            return false
+        }
+        return true
+    }
+
+    private func downloadRemote(
+        _ url: URL,
+        allowJSON: Bool,
+        generation: Int,
+        onProgress: @escaping (Int64, Int64) -> Void
+    ) async throws -> URL {
+        try await withCheckedThrowingContinuation { continuation in
+            llmDownloadDelegate?.cancel()
+            let delegate = LLMDownloadDelegate(
+                allowJSON: allowJSON,
+                onProgress: onProgress,
+                onComplete: { tempURL, error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                    } else if let tempURL {
+                        continuation.resume(returning: tempURL)
+                    } else {
+                        continuation.resume(throwing: URLError(.badServerResponse))
+                    }
+                }
+            )
+            let config = URLSessionConfiguration.default
+            config.timeoutIntervalForRequest = 60
+            config.timeoutIntervalForResource = 3600
+            config.waitsForConnectivity = true
+            config.httpAdditionalHeaders = [
+                "User-Agent": "volocal-ios/1.0 (on-device; no-telemetry)"
+            ]
+            let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
+            delegate.session = session
+            self.llmDownloadDelegate = delegate
+            guard generation == self.llmDownloadGeneration else {
+                delegate.cancel()
+                return
+            }
+            var request = URLRequest(url: url, timeoutInterval: 3600)
+            request.setValue("volocal-ios/1.0 (on-device; no-telemetry)", forHTTPHeaderField: "User-Agent")
+            session.downloadTask(with: request).resume()
         }
     }
 
@@ -623,13 +706,16 @@ private final class LLMDownloadDelegate: NSObject, URLSessionDownloadDelegate {
     let onProgress: (Int64, Int64) -> Void
     let onComplete: (URL?, Error?) -> Void
     var session: URLSession?
+    let allowJSON: Bool
     private let lock = NSLock()
     private var hasCompleted = false
 
     init(
+        allowJSON: Bool = false,
         onProgress: @escaping (Int64, Int64) -> Void,
         onComplete: @escaping (URL?, Error?) -> Void
     ) {
+        self.allowJSON = allowJSON
         self.onProgress = onProgress
         self.onComplete = onComplete
     }
@@ -654,8 +740,13 @@ private final class LLMDownloadDelegate: NSObject, URLSessionDownloadDelegate {
             finish(tempURL: nil, error: LLMDownloadError.httpStatus(http.statusCode))
             return
         }
-        if let mime = downloadTask.response?.mimeType?.lowercased(),
-           mime.contains("text/html") || mime.contains("application/json") {
+        if let mime = downloadTask.response?.mimeType?.lowercased(), mime.contains("text/html") {
+            finish(tempURL: nil, error: LLMDownloadError.notGGUF)
+            return
+        }
+        if !allowJSON,
+           let mime = downloadTask.response?.mimeType?.lowercased(),
+           mime.contains("application/json") {
             finish(tempURL: nil, error: LLMDownloadError.notGGUF)
             return
         }

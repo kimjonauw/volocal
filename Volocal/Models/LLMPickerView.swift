@@ -99,7 +99,7 @@ struct LLMPickerView: View {
                     .font(.caption)
                 }
                 ProgressView(value: progress)
-                Text("\(Int(progress * 100))% · \(modelManager.selectedLLM.sizeDescription). Stay on this screen until it finishes — a GGUF is often 1 GB+.")
+                Text("\(Int(progress * 100))% · \(modelManager.selectedLLM.sizeDescription). Stay on this screen. An MLX pack is a folder: the percent moves while the weight file downloads, then the tokenizer is saved.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }

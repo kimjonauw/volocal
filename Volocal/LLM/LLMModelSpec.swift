@@ -105,9 +105,20 @@ struct LLMModelSpec: Codable, Identifiable, Equatable, Hashable {
 
     static func mlxPackIsComplete(at dir: URL) -> Bool {
         let config = dir.appendingPathComponent("config.json")
-        guard FileManager.default.fileExists(atPath: config.path) else { return false }
+        let tokenizer = dir.appendingPathComponent("tokenizer.json")
+        let tokenizerConfig = dir.appendingPathComponent("tokenizer_config.json")
+        guard FileManager.default.fileExists(atPath: config.path),
+              FileManager.default.fileExists(atPath: tokenizer.path),
+              FileManager.default.fileExists(atPath: tokenizerConfig.path)
+        else { return false }
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return false }
-        return names.contains { $0.lowercased().hasSuffix(".safetensors") }
+        let hasWeights = names.contains { name in
+            let lower = name.lowercased()
+            return lower.hasSuffix(".safetensors") && !lower.hasSuffix(".safetensors.index.json")
+        }
+        guard hasWeights else { return false }
+        let tokSize = (try? FileManager.default.attributesOfItem(atPath: tokenizer.path)[.size] as? UInt64) ?? 0
+        return tokSize > 10_000
     }
 
     static func mlx(repoId: String, displayName: String) -> LLMModelSpec {
