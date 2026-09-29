@@ -104,45 +104,63 @@ final class LLMManager: ObservableObject {
             self.spokenCharCount = 0
             self.generatePhase = .readingPrompt
         }
-        let startTime = CFAbsoluteTimeGetCurrent()
-        var tokenCount = 0
         var channelFilter = ThoughtChannelFilter()
         var preambleFilter = ReasoningPreambleFilter(systemEcho: system)
         do {
-            let run = {
+            let collect = { () async throws -> [String] in
+                var pieces: [String] = []
                 let stream = try await MLXRuntime.openStream(
                     container: container,
                     system: system,
                     history: history
                 )
+                // Do not yield to the voice pipeline yet. PocketTTS takes the
+                // GPU as soon as the first clause arrives, and MLX is still
+                // decoding on that same GPU.
                 for await event in stream {
                     if Task.isCancelled { break }
                     guard let piece = event.chunk, !piece.isEmpty else { continue }
-                    tokenCount += 1
-                    let elapsed = CFAbsoluteTimeGetCurrent() - startTime
-                    let tps = elapsed > 0 ? Double(tokenCount) / elapsed : 0
-                    let spoken = preambleFilter.push(channelFilter.push(piece))
-                    if spoken.isEmpty { continue }
-                    continuation.yield(spoken)
-                    await MainActor.run {
-                        self.response += spoken
-                        self.tokensPerSecond = tps
-                        self.spokenCharCount = self.response.count
-                        self.generatePhase = .writingSpeech
-                    }
+                    pieces.append(piece)
                 }
-                let tail = preambleFilter.push(channelFilter.flush()) + preambleFilter.flush()
-                if !tail.isEmpty {
-                    continuation.yield(tail)
-                    await MainActor.run { self.response += tail }
+                return pieces
+            }
+            let pieces: [String]
+            if let gpu {
+                pieces = try await gpu.run(collect)
+            } else {
+                pieces = try await collect()
+            }
+            MLXRuntime.releaseTemporaryBuffers()
+            guard !Task.isCancelled else {
+                continuation.finish()
+                await MainActor.run {
+                    self.isGenerating = false
+                    self.generatePhase = .idle
+                }
+                return
+            }
+            let startTime = CFAbsoluteTimeGetCurrent()
+            var tokenCount = 0
+            for piece in pieces {
+                tokenCount += 1
+                let spoken = preambleFilter.push(channelFilter.push(piece))
+                if spoken.isEmpty { continue }
+                continuation.yield(spoken)
+                let tps = Double(tokenCount) / max(CFAbsoluteTimeGetCurrent() - startTime, 0.001)
+                await MainActor.run {
+                    self.response += spoken
+                    self.tokensPerSecond = tps
+                    self.spokenCharCount = self.response.count
+                    self.generatePhase = .writingSpeech
                 }
             }
-            if let gpu {
-                try await gpu.run(run)
-            } else {
-                try await run()
+            let tail = preambleFilter.push(channelFilter.flush()) + preambleFilter.flush()
+            if !tail.isEmpty {
+                continuation.yield(tail)
+                await MainActor.run { self.response += tail }
             }
         } catch {
+            MLXRuntime.releaseTemporaryBuffers()
             await MainActor.run { self.error = error.localizedDescription }
         }
         await MainActor.run {

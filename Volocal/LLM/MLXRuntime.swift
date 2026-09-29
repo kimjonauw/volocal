@@ -1,4 +1,5 @@
 import Foundation
+import MLX
 import MLXHuggingFace
 import MLXLLM
 import MLXLMCommon
@@ -7,7 +8,14 @@ import Tokenizers
 /// Loads an on-disk MLX pack and streams a chat reply.
 /// The weights are a Hugging Face MLX folder, not a GGUF.
 enum MLXRuntime {
+    /// MLX keeps every temporary Metal buffer unless this is capped. On iPhone
+    /// that grows for a few turns and then the process is killed.
+    private static let configureCache: Void = {
+        Memory.cacheLimit = 32 * 1024 * 1024
+    }()
+
     static func load(directory: URL) async throws -> ModelContainer {
+        _ = configureCache
         guard LLMModelSpec.mlxPackIsComplete(at: directory) else {
             throw MLXRuntimeError.incompletePack
         }
@@ -15,6 +23,10 @@ enum MLXRuntime {
             from: directory,
             using: #huggingFaceTokenizerLoader()
         )
+    }
+
+    static func releaseTemporaryBuffers() {
+        Memory.clearCache()
     }
 
     static func openStream(
@@ -58,7 +70,7 @@ enum MLXRuntimeError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .incompletePack:
-            return "MLX folder is missing config.json or the safetensors weights."
+            return "MLX folder is missing config.json, tokenizer.json, or the safetensors weights. Delete the pack and download it again."
         case .emptyPrompt:
             return "Nothing to send to the MLX model."
         }
