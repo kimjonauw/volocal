@@ -10,6 +10,8 @@ enum HuggingFaceHub {
         let id: String
         let downloads: Int
         let likes: Int
+        /// True when the Hub tagged this repo as an MLX pack rather than a GGUF.
+        var offersMLX: Bool = false
         var displayName: String { id }
     }
 
@@ -42,14 +44,14 @@ enum HuggingFaceHub {
         return URLSession(configuration: config)
     }()
 
-    static func searchRepos(query: String) async throws -> [RepoHit] {
+    static func searchRepos(query: String, filter: String = "gguf") async throws -> [RepoHit] {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
 
         var components = URLComponents(string: "https://huggingface.co/api/models")!
         components.queryItems = [
             URLQueryItem(name: "search", value: trimmed),
-            URLQueryItem(name: "filter", value: "gguf"),
+            URLQueryItem(name: "filter", value: filter),
             URLQueryItem(name: "sort", value: "downloads"),
             URLQueryItem(name: "direction", value: "-1"),
             URLQueryItem(name: "limit", value: "30")
@@ -65,7 +67,8 @@ enum HuggingFaceHub {
             let likes: Int?
         }
         let hits = try JSONDecoder().decode([Hit].self, from: data)
-        return hits.map { RepoHit(id: $0.id, downloads: $0.downloads ?? 0, likes: $0.likes ?? 0) }
+        let mlx = filter.lowercased() == "mlx"
+        return hits.map { RepoHit(id: $0.id, downloads: $0.downloads ?? 0, likes: $0.likes ?? 0, offersMLX: mlx) }
     }
 
     static func listGGUFFiles(repoId: String) async throws -> [RemoteFile] {

@@ -13,6 +13,7 @@ struct LLMPickerView: View {
     @State private var searchText = ""
     @State private var repoHits: [HuggingFaceHub.RepoHit] = []
     @State private var filesByRepo: [String: [HuggingFaceHub.RemoteFile]] = [:]
+    @State private var mlxPackRepos: Set<String> = []
     @State private var expandedRepo: String?
     @State private var isSearching = false
     @State private var isListing = false
@@ -307,7 +308,7 @@ struct LLMPickerView: View {
     }
 
     private var searchSection: some View {
-        Section("Search Hugging Face (GGUF)") {
+        Section("Search Hugging Face") {
             TextField("qwen, llama, gemma…", text: $searchText)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
@@ -339,8 +340,11 @@ struct LLMPickerView: View {
                             )
                             modelRow(spec, trailing: spec.sizeDescription)
                         }
+                    } else if hit.offersMLX || mlxPackRepos.contains(hit.id) {
+                        let leaf = hit.id.split(separator: "/").last.map(String.init) ?? hit.id
+                        modelRow(LLMModelSpec.mlx(repoId: hit.id, displayName: leaf), trailing: "MLX")
                     } else if filesByRepo[hit.id] != nil {
-                        Text("No GGUF files in this repo")
+                        Text("No GGUF or MLX weights in this repo")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -487,14 +491,35 @@ struct LLMPickerView: View {
         isSearching = true
         defer { isSearching = false }
         do {
-            let hits = try await HuggingFaceHub.searchRepos(query: trimmed)
+            async let ggufHits = HuggingFaceHub.searchRepos(query: trimmed, filter: "gguf")
+            async let mlxHits = HuggingFaceHub.searchRepos(query: trimmed, filter: "mlx")
+            let merged = try await mergeSearchHits(gguf: ggufHits, mlx: mlxHits)
             guard generation == searchGeneration else { return }
-            repoHits = hits
+            repoHits = merged
             localError = nil
         } catch {
             guard generation == searchGeneration else { return }
             localError = error.localizedDescription
         }
+    }
+
+    private func mergeSearchHits(
+        gguf: [HuggingFaceHub.RepoHit],
+        mlx: [HuggingFaceHub.RepoHit]
+    ) -> [HuggingFaceHub.RepoHit] {
+        var byID: [String: HuggingFaceHub.RepoHit] = [:]
+        for hit in gguf {
+            byID[hit.id] = hit
+        }
+        for hit in mlx {
+            if var existing = byID[hit.id] {
+                existing.offersMLX = true
+                byID[hit.id] = existing
+            } else {
+                byID[hit.id] = hit
+            }
+        }
+        return byID.values.sorted { $0.downloads > $1.downloads }
     }
 
     private func loadFiles(_ repoId: String) async {
@@ -503,6 +528,17 @@ struct LLMPickerView: View {
         defer { isListing = false }
         do {
             filesByRepo[repoId] = try await HuggingFaceHub.listGGUFFiles(repoId: repoId)
+            if filesByRepo[repoId]?.isEmpty != false {
+                let mlxFiles = try await HuggingFaceHub.listMLXFiles(repoId: repoId)
+                let hasTokenizer = mlxFiles.contains { $0.path == "tokenizer.json" }
+                let hasWeights = mlxFiles.contains {
+                    $0.path.lowercased().hasSuffix(".safetensors")
+                        && !$0.path.lowercased().hasSuffix(".index.json")
+                }
+                if hasTokenizer && hasWeights {
+                    mlxPackRepos.insert(repoId)
+                }
+            }
             localError = nil
         } catch {
             localError = "Could not list \(repoId): \(error.localizedDescription)"
