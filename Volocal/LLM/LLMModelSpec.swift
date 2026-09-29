@@ -121,13 +121,13 @@ struct LLMModelSpec: Codable, Identifiable, Equatable, Hashable {
         return tokSize > 10_000
     }
 
-    static func mlx(repoId: String, displayName: String) -> LLMModelSpec {
+    static func mlx(repoId: String, displayName: String, sizeBytes: Int64? = nil) -> LLMModelSpec {
         let leaf = repoId.split(separator: "/").last.map(String.init) ?? repoId
         return LLMModelSpec(
             repoId: repoId,
             filename: "\(leaf).mlx",
             displayName: displayName,
-            sizeBytes: nil,
+            sizeBytes: sizeBytes,
             sha256: nil,
             kindRaw: WeightKind.mlx.rawValue
         )
@@ -143,9 +143,9 @@ struct LLMModelSpec: Codable, Identifiable, Equatable, Hashable {
 
     /// Phone-sized MLX packs. These are folders of weights, not a GGUF.
     static let suggestedMLX: [LLMModelSpec] = [
-        mlx(repoId: "mlx-community/Qwen3.5-2B-4bit", displayName: "Qwen 3.5 2B MLX 4-bit"),
-        mlx(repoId: "mlx-community/gemma-4-e2b-it-4bit", displayName: "Gemma 4 E2B MLX 4-bit"),
-        mlx(repoId: "mlx-community/Llama-3.2-3B-Instruct-4bit", displayName: "Llama 3.2 3B MLX 4-bit"),
+        mlx(repoId: "mlx-community/Qwen3.5-2B-4bit", displayName: "Qwen 3.5 2B MLX 4-bit", sizeBytes: 1_749_106_691),
+        mlx(repoId: "mlx-community/gemma-4-e2b-it-4bit", displayName: "Gemma 4 E2B MLX 4-bit", sizeBytes: 3_584_586_498),
+        mlx(repoId: "mlx-community/Llama-3.2-3B-Instruct-4bit", displayName: "Llama 3.2 3B MLX 4-bit", sizeBytes: 1_824_607_894),
     ]
 
     /// Phone-sized GGUF starting points. Search Hugging Face for anything else.

@@ -295,9 +295,13 @@ final class UnifiedModelManager: ObservableObject {
             for folder in folders where folder.hasDirectoryPath {
                 if LLMModelSpec.mlxPackIsComplete(at: folder) {
                     let repoId = folder.lastPathComponent.replacingOccurrences(of: "__", with: "/")
-                    let spec = LLMModelSpec.mlx(repoId: repoId, displayName: repoId)
-                    if !found.contains(where: { $0.id == spec.id }) {
-                        found.append(spec)
+                    let bytes = Self.directoryByteCount(folder)
+                    if let index = found.firstIndex(where: { $0.id == LLMModelSpec.mlx(repoId: repoId, displayName: repoId).id }) {
+                        if found[index].sizeBytes == nil {
+                            found[index].sizeBytes = bytes
+                        }
+                    } else {
+                        found.append(LLMModelSpec.mlx(repoId: repoId, displayName: repoId, sizeBytes: bytes))
                     }
                 }
                 if let files = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.fileSizeKey]) {
@@ -326,6 +330,20 @@ final class UnifiedModelManager: ObservableObject {
         }
 
         return found
+    }
+
+    private static func directoryByteCount(_ dir: URL) -> Int64 {
+        guard let enumerator = FileManager.default.enumerator(
+            at: dir,
+            includingPropertiesForKeys: [.fileSizeKey],
+            options: [.skipsHiddenFiles]
+        ) else { return 0 }
+        var total: Int64 = 0
+        for case let file as URL in enumerator {
+            let size = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            total += Int64(size)
+        }
+        return total
     }
 
     private func downloadLLM() async {

@@ -14,6 +14,7 @@ struct LLMPickerView: View {
     @State private var repoHits: [HuggingFaceHub.RepoHit] = []
     @State private var filesByRepo: [String: [HuggingFaceHub.RemoteFile]] = [:]
     @State private var mlxPackRepos: Set<String> = []
+    @State private var mlxPackBytes: [String: Int64] = [:]
     @State private var expandedRepo: String?
     @State private var isSearching = false
     @State private var isListing = false
@@ -252,7 +253,7 @@ struct LLMPickerView: View {
                     .foregroundStyle(.secondary)
             } else {
                 ForEach(installed) { spec in
-                    modelRow(spec, trailing: spec.isDownloaded ? "Ready" : nil)
+                    modelRow(spec, trailing: installedTrailing(spec))
                         .buttonStyle(.plain)
                         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                             Button(role: .destructive) {
@@ -290,7 +291,7 @@ struct LLMPickerView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             ForEach(LLMModelSpec.suggestedMLX) { spec in
-                modelRow(spec, trailing: "MLX")
+                modelRow(spec, trailing: spec.sizeDescription)
             }
         }
     }
@@ -342,7 +343,9 @@ struct LLMPickerView: View {
                         }
                     } else if hit.offersMLX || mlxPackRepos.contains(hit.id) {
                         let leaf = hit.id.split(separator: "/").last.map(String.init) ?? hit.id
-                        modelRow(LLMModelSpec.mlx(repoId: hit.id, displayName: leaf), trailing: "MLX")
+                        let bytes = mlxPackBytes[hit.id]
+                        let spec = LLMModelSpec.mlx(repoId: hit.id, displayName: leaf, sizeBytes: bytes)
+                        modelRow(spec, trailing: bytes == nil ? "MLX" : spec.sizeDescription)
                     } else if filesByRepo[hit.id] != nil {
                         Text("No GGUF or MLX weights in this repo")
                             .font(.caption)
@@ -359,6 +362,13 @@ struct LLMPickerView: View {
                 }
             }
         }
+    }
+
+    private func installedTrailing(_ spec: LLMModelSpec) -> String? {
+        if let size = spec.sizeBytes, size > 0 {
+            return ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
+        }
+        return spec.isDownloaded ? "Ready" : nil
     }
 
     private func modelRow(_ spec: LLMModelSpec, trailing: String?) -> some View {
@@ -537,6 +547,10 @@ struct LLMPickerView: View {
                 }
                 if hasTokenizer && hasWeights {
                     mlxPackRepos.insert(repoId)
+                    let total = mlxFiles.reduce(Int64(0)) { $0 + max($1.sizeBytes ?? 0, 0) }
+                    if total > 0 {
+                        mlxPackBytes[repoId] = total
+                    }
                 }
             }
             localError = nil
