@@ -352,7 +352,7 @@ struct LLMPickerView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(hit.id)
                             .font(.subheadline.weight(.medium))
-                        Text("\(hit.downloads) downloads")
+                        Text(hit.offersMLX ? "MLX pack · \(hit.downloads) downloads" : "\(hit.downloads) downloads")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
