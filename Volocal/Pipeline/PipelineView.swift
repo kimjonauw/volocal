@@ -228,56 +228,60 @@ struct PipelineView: View {
     }
 }
 
-/// Flat cartoon face. Expression is a few shapes (brows, lids, pupils, mouth)
-/// driven by the conversation, plus squash-and-stretch from the audio.
-/// No face model.
+/// Kawaii ball: big eyes low on the face, a tiny mouth tucked under them,
+/// blush, and no brows. Baby-face proportions, shapes only.
 private struct VoicePresence: View {
     let pipeline: VoicePipeline
+    private let ink = Color(red: 0.33, green: 0.2, blue: 0.14)
 
     var body: some View {
         TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: false)) { timeline in
             let levels = pipeline.sharedAudio.bridge.levels()
             let time = timeline.date.timeIntervalSinceReferenceDate
             let mood = Mood(state: pipeline.state, mic: levels.mic, playback: levels.playback, time: time)
+            let blink = blinkAmount(time)
             ZStack {
                 Circle()
-                    .fill(Color(red: 0.99, green: 0.78, blue: 0.16))
-                    .overlay(Circle().stroke(Color.black.opacity(0.22), lineWidth: 2.5))
-                    .frame(width: 120, height: 120)
-                    .scaleEffect(x: mood.squashX, y: mood.squashY)
+                    .fill(
+                        RadialGradient(
+                            colors: [
+                                Color(red: 1, green: 0.93, blue: 0.62),
+                                Color(red: 1, green: 0.78, blue: 0.28)
+                            ],
+                            center: UnitPoint(x: 0.38, y: 0.32),
+                            startRadius: 2,
+                            endRadius: 78
+                        )
+                    )
+                    .frame(width: 116, height: 116)
+                    .shadow(color: Color(red: 0.9, green: 0.62, blue: 0.12).opacity(0.35), radius: 10, y: 6)
 
                 Ellipse()
-                    .fill(.white.opacity(0.55))
-                    .frame(width: 34, height: 16)
-                    .offset(x: -24, y: -34)
+                    .fill(Color.white.opacity(0.7))
+                    .frame(width: 28, height: 14)
+                    .offset(x: -26, y: -32)
 
-                Circle()
-                    .fill(Color.pink.opacity(mood.blush))
-                    .frame(width: 16, height: 10)
-                    .offset(x: -36, y: 16)
-                Circle()
-                    .fill(Color.pink.opacity(mood.blush))
-                    .frame(width: 16, height: 10)
-                    .offset(x: 36, y: 16)
+                Ellipse()
+                    .fill(Color(red: 1, green: 0.55, blue: 0.62).opacity(mood.blush))
+                    .frame(width: 22, height: 12)
+                    .offset(x: -34, y: 18)
+                Ellipse()
+                    .fill(Color(red: 1, green: 0.55, blue: 0.62).opacity(mood.blush))
+                    .frame(width: 22, height: 12)
+                    .offset(x: 34, y: 18)
 
-                HStack(spacing: 30) {
-                    brow(lift: mood.browLeft, tilt: mood.browTilt)
-                    brow(lift: mood.browRight, tilt: -mood.browTilt)
+                HStack(spacing: 22) {
+                    eye(mood: mood, blink: blink)
+                    eye(mood: mood, blink: blink)
                 }
-                .offset(y: -38)
+                .offset(y: 8 + mood.eyeShiftY)
 
-                HStack(spacing: 18) {
-                    eye(mood: mood, blink: blinkAmount(time, delay: 0))
-                    eye(mood: mood, blink: blinkAmount(time, delay: 0.04))
-                }
-                .offset(y: -8)
-
-                MouthShape(open: mood.mouthOpen, smile: mood.smile)
-                    .fill(.black.opacity(0.9))
-                    .frame(width: 40, height: 30)
-                    .offset(y: 30)
+                mouth(open: mood.mouthOpen)
+                    .offset(y: 34)
             }
-            .frame(height: 136)
+            .scaleEffect(x: mood.squashX, y: mood.squashY)
+            .offset(y: mood.bob)
+            .frame(height: 140)
         }
         .accessibilityLabel(accessibilityName)
     }
@@ -291,142 +295,142 @@ private struct VoicePresence: View {
         }
     }
 
-    private func blinkAmount(_ time: TimeInterval, delay: TimeInterval) -> CGFloat {
-        let phase = (time + delay).truncatingRemainder(dividingBy: 3.6)
-        if phase < 0.08 { return 0.12 }
-        if phase > 0.18 && phase < 0.26 { return 0.18 }
+    private func blinkAmount(_ time: TimeInterval) -> CGFloat {
+        let phase = time.truncatingRemainder(dividingBy: 4.2)
+        if phase < 0.09 { return 0.08 }
         return 1
     }
 
-    private func brow(lift: CGFloat, tilt: Double) -> some View {
-        Capsule()
-            .fill(.black.opacity(0.82))
-            .frame(width: 22, height: 4)
-            .rotationEffect(.degrees(tilt))
-            .offset(y: lift)
+    private func eye(mood: Mood, blink: CGFloat) -> some View {
+        let tall = 32 * mood.eyeScale * blink
+        let wide = 24 * mood.eyeScale
+        return ZStack {
+            if mood.happy > 0.5 {
+                HappyEye()
+                    .stroke(ink, style: StrokeStyle(lineWidth: 3.4, lineCap: .round))
+                    .frame(width: wide + 4, height: 16)
+                    .scaleEffect(y: max(0.2, blink))
+            } else {
+                Capsule()
+                    .fill(ink)
+                    .frame(width: wide, height: max(3, tall))
+                    .offset(x: mood.lookX, y: mood.lookY)
+                Circle()
+                    .fill(.white)
+                    .frame(width: 8, height: 8)
+                    .offset(x: mood.lookX - 4, y: mood.lookY - 7)
+                    .opacity(blink > 0.4 ? 1 : 0)
+                Circle()
+                    .fill(.white.opacity(0.9))
+                    .frame(width: 3, height: 3)
+                    .offset(x: mood.lookX + 3, y: mood.lookY - 1)
+                    .opacity(blink > 0.4 ? 1 : 0)
+            }
+        }
+        .frame(width: 32, height: 34)
     }
 
-    private func eye(mood: Mood, blink: CGFloat) -> some View {
+    private func mouth(open: CGFloat) -> some View {
         ZStack {
-            Ellipse()
-                .fill(.white)
-                .frame(width: mood.eyeWidth, height: mood.eyeHeight * blink)
-            Circle()
-                .fill(.black)
-                .frame(width: mood.pupil, height: mood.pupil)
-                .offset(x: mood.lookX, y: mood.lookY)
-                .opacity(blink > 0.4 ? 1 : 0)
-            Circle()
-                .fill(.white)
-                .frame(width: 3.5, height: 3.5)
-                .offset(x: mood.lookX + 2.5, y: mood.lookY - 2)
-                .opacity(blink > 0.4 ? 1 : 0)
+            SmileArc()
+                .stroke(ink, style: StrokeStyle(lineWidth: 3.2, lineCap: .round))
+                .frame(width: 16, height: 8)
+                .opacity(open < 0.22 ? 1 : 0)
+            Capsule()
+                .fill(ink)
+                .frame(width: 9 + open * 5, height: 5 + open * 7)
+                .opacity(open < 0.22 ? 0 : 1)
         }
-        .frame(width: 32, height: 32)
-        .clipped()
+        .frame(width: 22, height: 16)
     }
 }
 
 private struct Mood {
     var squashX: CGFloat
     var squashY: CGFloat
-    var browLeft: CGFloat
-    var browRight: CGFloat
-    var browTilt: Double
-    var eyeWidth: CGFloat
-    var eyeHeight: CGFloat
-    var pupil: CGFloat
+    var bob: CGFloat
+    var eyeScale: CGFloat
+    var eyeShiftY: CGFloat
     var lookX: CGFloat
     var lookY: CGFloat
+    var happy: CGFloat
     var mouthOpen: CGFloat
-    var smile: CGFloat
     var blush: Double
 
     init(state: VoicePipeline.PipelineState, mic: Float, playback: Float, time: TimeInterval) {
-        let chatter = CGFloat(abs(sin(time * 16)))
-        let slot = floor(time / 0.9)
-        let glance = CGFloat(sin(slot * 12.9898)) * 3
+        let chatter = CGFloat(abs(sin(time * 14)))
+        bob = CGFloat(sin(time * 1.6)) * 2.5
         switch state {
         case .idle:
             squashX = 1
-            squashY = 1 + 0.02 * CGFloat(sin(time * 1.5))
-            browLeft = -1
-            browRight = -1
-            browTilt = 10
-            eyeWidth = 24
-            eyeHeight = 24
-            pupil = 10
-            lookX = glance
-            lookY = CGFloat(sin(slot * 4.2)) 
-            mouthOpen = 0.04
-            smile = 0.9
-            blush = 0.12
-        case .listening:
-            let heard = CGFloat(min(1, mic / 0.07))
-            squashX = 1 + heard * 0.04
-            squashY = 1 - heard * 0.03
-            browLeft = -9
-            browRight = -9
-            browTilt = 16
-            eyeWidth = 26
-            eyeHeight = 28
-            pupil = 13
-            lookX = glance * 0.6
-            lookY = 2
-            mouthOpen = 0.1 + heard * 0.4
-            smile = 0.75
-            blush = 0.28
-        case .processing:
-            squashX = 0.98
-            squashY = 1.02
-            browLeft = -8
-            browRight = 3
-            browTilt = -8
-            eyeWidth = 22
-            eyeHeight = 14
-            pupil = 8
-            lookX = -4
-            lookY = -5
-            mouthOpen = 0.15 + 0.1 * CGFloat(sin(time * 2.4))
-            smile = 0.1
-            blush = 0
-        case .speaking:
-            let said = max(0.4, CGFloat(min(1, playback / 0.07)))
-            let jabber = said * (0.35 + 0.65 * chatter)
-            squashX = 1 + jabber * 0.14
-            squashY = 1 - jabber * 0.16
-            browLeft = -4 - jabber * 4
-            browRight = -4 - jabber * 4
-            browTilt = 12
-            eyeWidth = 24
-            eyeHeight = 20
-            pupil = 10
-            lookX = glance * 0.4
+            squashY = 1
+            eyeScale = 1
+            eyeShiftY = 0
+            lookX = 0
             lookY = 0
-            mouthOpen = jabber
-            smile = 0.45 + (1 - said) * 0.3
+            happy = 0
+            mouthOpen = 0
+            blush = 0.38
+        case .listening:
+            let heard = CGFloat(min(1, mic / 0.08))
+            squashX = 1 + heard * 0.02
+            squashY = 1 - heard * 0.015
+            eyeScale = 1.08
+            eyeShiftY = 0
+            lookX = 0
+            lookY = 1
+            happy = 0
+            mouthOpen = heard * 0.35
             blush = 0.5
+        case .processing:
+            squashX = 1
+            squashY = 1
+            eyeScale = 0.94
+            eyeShiftY = -7
+            lookX = -1
+            lookY = -3
+            happy = 0
+            mouthOpen = 0
+            blush = 0.28
+            bob = CGFloat(sin(time * 0.9)) * 1.5
+        case .speaking:
+            let said = CGFloat(min(1, playback / 0.08))
+            let jabber = 0.25 + 0.75 * said * (0.45 + 0.55 * chatter)
+            squashX = 1 + jabber * 0.045
+            squashY = 1 - jabber * 0.04
+            eyeScale = 1
+            eyeShiftY = 0
+            lookX = 0
+            lookY = 0
+            happy = 1
+            mouthOpen = 0.28 + jabber * 0.55
+            blush = 0.62
         }
     }
 }
 
-/// Closed smile, or a tall open mouth while the voice is loud.
-private struct MouthShape: Shape {
-    var open: CGFloat
-    var smile: CGFloat
-
+/// Upward crescent, the closed-eye smile.
+private struct HappyEye: Shape {
     func path(in rect: CGRect) -> Path {
         var path = Path()
-        let open = min(1, max(0, open))
-        let smile = min(1, max(0, smile))
-        let left = CGPoint(x: rect.minX + 2, y: rect.midY - open * 2)
-        let right = CGPoint(x: rect.maxX - 2, y: rect.midY - open * 2)
-        let dip = rect.midY + 4 + smile * 10 + open * rect.height * 0.55
-        let roof = rect.midY - 2 - open * rect.height * 0.28
-        path.move(to: left)
-        path.addQuadCurve(to: right, control: CGPoint(x: rect.midX, y: dip))
-        path.addQuadCurve(to: left, control: CGPoint(x: rect.midX, y: roof))
-        path.closeSubpath()
+        path.move(to: CGPoint(x: rect.minX, y: rect.maxY - 1))
+        path.addQuadCurve(
+            to: CGPoint(x: rect.maxX, y: rect.maxY - 1),
+            control: CGPoint(x: rect.midX, y: rect.minY)
+        )
+        return path
+    }
+}
+
+/// Short smile tucked under the eyes.
+private struct SmileArc: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX, y: rect.minY + 1))
+        path.addQuadCurve(
+            to: CGPoint(x: rect.maxX, y: rect.minY + 1),
+            control: CGPoint(x: rect.midX, y: rect.maxY)
+        )
         return path
     }
 }
