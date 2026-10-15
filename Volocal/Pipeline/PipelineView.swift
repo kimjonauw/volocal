@@ -228,60 +228,60 @@ struct PipelineView: View {
     }
 }
 
-/// Kawaii ball: big eyes low on the face, a tiny mouth tucked under them,
-/// blush, and no brows. Baby-face proportions, shapes only.
+/// Glowing orb. Soft color fields drift inside a circle and swell with the
+/// mic and the speaker, the same idea as the ChatGPT and Gemini live spheres.
 private struct VoicePresence: View {
     let pipeline: VoicePipeline
-    private let ink = Color(red: 0.33, green: 0.2, blue: 0.14)
 
     var body: some View {
         TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: false)) { timeline in
             let levels = pipeline.sharedAudio.bridge.levels()
             let time = timeline.date.timeIntervalSinceReferenceDate
-            let mood = Mood(state: pipeline.state, mic: levels.mic, playback: levels.playback, time: time)
-            let blink = blinkAmount(time)
+            let motion = OrbMotion(
+                state: pipeline.state,
+                mic: levels.mic,
+                playback: levels.playback,
+                time: time
+            )
             ZStack {
                 Circle()
-                    .fill(
-                        RadialGradient(
-                            colors: [
-                                Color(red: 1, green: 0.93, blue: 0.62),
-                                Color(red: 1, green: 0.78, blue: 0.28)
-                            ],
-                            center: UnitPoint(x: 0.38, y: 0.32),
-                            startRadius: 2,
-                            endRadius: 78
-                        )
-                    )
-                    .frame(width: 116, height: 116)
-                    .shadow(color: Color(red: 0.9, green: 0.62, blue: 0.12).opacity(0.35), radius: 10, y: 6)
+                    .fill(motion.glow)
+                    .frame(width: 96, height: 96)
+                    .blur(radius: 28)
+                    .opacity(0.5 + motion.energy * 0.45)
+                    .scaleEffect(1.15 + motion.energy * 0.2)
 
-                Ellipse()
-                    .fill(Color.white.opacity(0.7))
-                    .frame(width: 28, height: 14)
-                    .offset(x: -26, y: -32)
-
-                Ellipse()
-                    .fill(Color(red: 1, green: 0.55, blue: 0.62).opacity(mood.blush))
-                    .frame(width: 22, height: 12)
-                    .offset(x: -34, y: 18)
-                Ellipse()
-                    .fill(Color(red: 1, green: 0.55, blue: 0.62).opacity(mood.blush))
-                    .frame(width: 22, height: 12)
-                    .offset(x: 34, y: 18)
-
-                HStack(spacing: 22) {
-                    eye(mood: mood, blink: blink)
-                    eye(mood: mood, blink: blink)
+                ZStack {
+                    field(Color(red: 0.2, green: 0.45, blue: 1), time * motion.spin, 26)
+                    field(Color(red: 0.5, green: 0.28, blue: 1), time * motion.spin * 0.82 + 2.1, 30)
+                    field(Color(red: 0.95, green: 0.38, blue: 0.72), time * motion.spin * 1.12 + 3.9, 24)
+                    field(Color(red: 0.25, green: 0.86, blue: 0.95), time * motion.spin * 0.7 + 5.3, 28)
+                    Circle()
+                        .fill(.white.opacity(0.2 + motion.energy * 0.5))
+                        .frame(width: 26 + motion.energy * 20, height: 26 + motion.energy * 20)
+                        .blur(radius: 10)
+                    Ellipse()
+                        .fill(.white.opacity(0.5))
+                        .frame(width: 34, height: 14)
+                        .blur(radius: 5)
+                        .offset(x: -14, y: -24)
                 }
-                .offset(y: 8 + mood.eyeShiftY)
-
-                mouth(open: mood.mouthOpen)
-                    .offset(y: 34)
+                .frame(width: 108, height: 108)
+                .clipShape(Circle())
+                .overlay(
+                    Circle()
+                        .stroke(
+                            LinearGradient(
+                                colors: [.white.opacity(0.75), .white.opacity(0.05), .white.opacity(0.28)],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            ),
+                            lineWidth: 1.5
+                        )
+                )
+                .scaleEffect(motion.scale)
             }
-            .scaleEffect(x: mood.squashX, y: mood.squashY)
-            .offset(y: mood.bob)
-            .frame(height: 140)
+            .frame(height: 136)
         }
         .accessibilityLabel(accessibilityName)
     }
@@ -295,143 +295,44 @@ private struct VoicePresence: View {
         }
     }
 
-    private func blinkAmount(_ time: TimeInterval) -> CGFloat {
-        let phase = time.truncatingRemainder(dividingBy: 4.2)
-        if phase < 0.09 { return 0.08 }
-        return 1
-    }
-
-    private func eye(mood: Mood, blink: CGFloat) -> some View {
-        let tall = 32 * mood.eyeScale * blink
-        let wide = 24 * mood.eyeScale
-        return ZStack {
-            if mood.happy > 0.5 {
-                HappyEye()
-                    .stroke(ink, style: StrokeStyle(lineWidth: 3.4, lineCap: .round))
-                    .frame(width: wide + 4, height: 16)
-                    .scaleEffect(y: max(0.2, blink))
-            } else {
-                Capsule()
-                    .fill(ink)
-                    .frame(width: wide, height: max(3, tall))
-                    .offset(x: mood.lookX, y: mood.lookY)
-                Circle()
-                    .fill(.white)
-                    .frame(width: 8, height: 8)
-                    .offset(x: mood.lookX - 4, y: mood.lookY - 7)
-                    .opacity(blink > 0.4 ? 1 : 0)
-                Circle()
-                    .fill(.white.opacity(0.9))
-                    .frame(width: 3, height: 3)
-                    .offset(x: mood.lookX + 3, y: mood.lookY - 1)
-                    .opacity(blink > 0.4 ? 1 : 0)
-            }
-        }
-        .frame(width: 32, height: 34)
-    }
-
-    private func mouth(open: CGFloat) -> some View {
-        ZStack {
-            SmileArc()
-                .stroke(ink, style: StrokeStyle(lineWidth: 3.2, lineCap: .round))
-                .frame(width: 16, height: 8)
-                .opacity(open < 0.22 ? 1 : 0)
-            Capsule()
-                .fill(ink)
-                .frame(width: 9 + open * 5, height: 5 + open * 7)
-                .opacity(open < 0.22 ? 0 : 1)
-        }
-        .frame(width: 22, height: 16)
+    private func field(_ color: Color, _ angle: Double, _ radius: CGFloat) -> some View {
+        Circle()
+            .fill(color)
+            .frame(width: 74, height: 74)
+            .blur(radius: 18)
+            .offset(x: CGFloat(cos(angle)) * radius, y: CGFloat(sin(angle)) * radius)
     }
 }
 
-private struct Mood {
-    var squashX: CGFloat
-    var squashY: CGFloat
-    var bob: CGFloat
-    var eyeScale: CGFloat
-    var eyeShiftY: CGFloat
-    var lookX: CGFloat
-    var lookY: CGFloat
-    var happy: CGFloat
-    var mouthOpen: CGFloat
-    var blush: Double
+private struct OrbMotion {
+    var energy: CGFloat
+    var scale: CGFloat
+    var spin: Double
+    var glow: Color
 
     init(state: VoicePipeline.PipelineState, mic: Float, playback: Float, time: TimeInterval) {
-        let chatter = CGFloat(abs(sin(time * 14)))
-        bob = CGFloat(sin(time * 1.6)) * 2.5
+        let breathe = CGFloat(0.5 + 0.5 * sin(time * 1.3))
         switch state {
         case .idle:
-            squashX = 1
-            squashY = 1
-            eyeScale = 1
-            eyeShiftY = 0
-            lookX = 0
-            lookY = 0
-            happy = 0
-            mouthOpen = 0
-            blush = 0.38
+            energy = 0.1 + breathe * 0.08
+            spin = 0.35
+            glow = Color(red: 0.35, green: 0.45, blue: 1)
         case .listening:
-            let heard = CGFloat(min(1, mic / 0.08))
-            squashX = 1 + heard * 0.02
-            squashY = 1 - heard * 0.015
-            eyeScale = 1.08
-            eyeShiftY = 0
-            lookX = 0
-            lookY = 1
-            happy = 0
-            mouthOpen = heard * 0.35
-            blush = 0.5
+            let heard = CGFloat(min(1, mic / 0.07))
+            energy = 0.22 + heard * 0.78
+            spin = 0.65 + Double(heard) * 0.45
+            glow = Color(red: 0.25, green: 0.72, blue: 1)
         case .processing:
-            squashX = 1
-            squashY = 1
-            eyeScale = 0.94
-            eyeShiftY = -7
-            lookX = -1
-            lookY = -3
-            happy = 0
-            mouthOpen = 0
-            blush = 0.28
-            bob = CGFloat(sin(time * 0.9)) * 1.5
+            energy = 0.32 + breathe * 0.22
+            spin = 1.05
+            glow = Color(red: 0.55, green: 0.38, blue: 1)
         case .speaking:
-            let said = CGFloat(min(1, playback / 0.08))
-            let jabber = 0.25 + 0.75 * said * (0.45 + 0.55 * chatter)
-            squashX = 1 + jabber * 0.045
-            squashY = 1 - jabber * 0.04
-            eyeScale = 1
-            eyeShiftY = 0
-            lookX = 0
-            lookY = 0
-            happy = 1
-            mouthOpen = 0.28 + jabber * 0.55
-            blush = 0.62
+            let said = CGFloat(min(1, playback / 0.07))
+            energy = 0.38 + said * 0.62
+            spin = 0.85 + Double(said) * 0.55
+            glow = Color(red: 0.4, green: 0.55, blue: 1)
         }
-    }
-}
-
-/// Upward crescent, the closed-eye smile.
-private struct HappyEye: Shape {
-    func path(in rect: CGRect) -> Path {
-        var path = Path()
-        path.move(to: CGPoint(x: rect.minX, y: rect.maxY - 1))
-        path.addQuadCurve(
-            to: CGPoint(x: rect.maxX, y: rect.maxY - 1),
-            control: CGPoint(x: rect.midX, y: rect.minY)
-        )
-        return path
-    }
-}
-
-/// Short smile tucked under the eyes.
-private struct SmileArc: Shape {
-    func path(in rect: CGRect) -> Path {
-        var path = Path()
-        path.move(to: CGPoint(x: rect.minX, y: rect.minY + 1))
-        path.addQuadCurve(
-            to: CGPoint(x: rect.maxX, y: rect.minY + 1),
-            control: CGPoint(x: rect.midX, y: rect.maxY)
-        )
-        return path
+        scale = 1 + energy * 0.08
     }
 }
 
