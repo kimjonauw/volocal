@@ -54,7 +54,7 @@ struct LLMModelSpec: Codable, Identifiable, Equatable, Hashable {
     }
 
     var isLikelyTooLargeForPhone: Bool {
-        (sizeBytes ?? 0) > 8_000_000_000
+        !PhoneMemoryBudget.fits(sizeBytes)
     }
 
     /// Nested on-disk location. GGUF is a file. MLX is the folder of weights.
@@ -187,6 +187,33 @@ struct LLMModelSpec: Codable, Identifiable, Equatable, Hashable {
             sha256: nil
         )
     ]
+}
+
+/// How big a weight file can be on this phone.
+/// The cap is footprint plus memory iOS will still grant. Speech recognition and
+/// the voice need about 1.2 GB of that besides the language model.
+enum PhoneMemoryBudget {
+    static let speechReserveBytes: Int64 = 1_200_000_000
+    /// Same ceiling llama.cpp already refuses. A larger file jetsams LiveContainer.
+    static let hardCeilingBytes: Int64 = 6_500_000_000
+
+    static var maxWeightBytes: Int64 {
+        let footprint = Int64(SystemMetrics.appMemoryMB() * 1024 * 1024)
+        let cap = footprint + Int64(VolocalAvailableMemory())
+        guard cap > 512_000_000 else { return hardCeilingBytes }
+        let room = cap - speechReserveBytes
+        return min(max(room, 800_000_000), hardCeilingBytes)
+    }
+
+    static var maxWeightDescription: String {
+        ByteCountFormatter.string(fromByteCount: maxWeightBytes, countStyle: .file)
+    }
+
+    /// Unknown size stays visible. A known size over the cap does not.
+    static func fits(_ bytes: Int64?) -> Bool {
+        guard let bytes, bytes > 0 else { return true }
+        return bytes <= maxWeightBytes
+    }
 }
 
 enum LLMFileFilter {

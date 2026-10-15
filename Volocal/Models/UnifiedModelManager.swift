@@ -491,7 +491,7 @@ final class UnifiedModelManager: ObservableObject {
                 return (lhs.sizeBytes ?? 0) < (rhs.sizeBytes ?? 0)
             }
             let total = ordered.reduce(Int64(0)) { $0 + max($1.sizeBytes ?? 0, 1) }
-            guard total < 6_500_000_000 else { throw LLMDownloadError.tooLarge }
+            guard total < PhoneMemoryBudget.hardCeilingBytes else { throw LLMDownloadError.tooLarge }
             try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
             var completed: Int64 = 0
             for file in ordered {

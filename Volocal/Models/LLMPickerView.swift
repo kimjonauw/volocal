@@ -330,26 +330,36 @@ struct LLMPickerView: View {
                 ) {
                     if isListing && expandedRepo == hit.id {
                         ProgressView()
-                    } else if let files = filesByRepo[hit.id], !files.isEmpty {
-                        ForEach(files) { file in
-                            let spec = LLMModelSpec(
-                                repoId: hit.id,
-                                filename: file.path,
-                                displayName: "\(hit.id.split(separator: "/").last ?? "") · \(file.filename)",
-                                sizeBytes: file.sizeBytes,
-                                sha256: file.sha256
-                            )
-                            modelRow(spec, trailing: spec.sizeDescription)
+                    } else if let files = filesByRepo[hit.id] {
+                        let visible = files.filter { PhoneMemoryBudget.fits($0.sizeBytes) }
+                        let mlxBytes = mlxPackBytes[hit.id]
+                        let showMLX = (hit.offersMLX || mlxPackRepos.contains(hit.id)) && PhoneMemoryBudget.fits(mlxBytes)
+                        let hidOversized = files.contains { !PhoneMemoryBudget.fits($0.sizeBytes) }
+                            || ((hit.offersMLX || mlxPackRepos.contains(hit.id)) && !PhoneMemoryBudget.fits(mlxBytes))
+                        if !visible.isEmpty {
+                            ForEach(visible) { file in
+                                let spec = LLMModelSpec(
+                                    repoId: hit.id,
+                                    filename: file.path,
+                                    displayName: "\(hit.id.split(separator: "/").last ?? "") · \(file.filename)",
+                                    sizeBytes: file.sizeBytes,
+                                    sha256: file.sha256
+                                )
+                                modelRow(spec, trailing: spec.sizeDescription)
+                            }
+                        } else if showMLX {
+                            let leaf = hit.id.split(separator: "/").last.map(String.init) ?? hit.id
+                            let spec = LLMModelSpec.mlx(repoId: hit.id, displayName: leaf, sizeBytes: mlxBytes)
+                            modelRow(spec, trailing: mlxBytes == nil ? "MLX" : spec.sizeDescription)
+                        } else if hidOversized {
+                            Text("Over \(PhoneMemoryBudget.maxWeightDescription). That will not fit in this iPhone's RAM next to the speech models.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Text("No GGUF or MLX weights in this repo")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
-                    } else if hit.offersMLX || mlxPackRepos.contains(hit.id) {
-                        let leaf = hit.id.split(separator: "/").last.map(String.init) ?? hit.id
-                        let bytes = mlxPackBytes[hit.id]
-                        let spec = LLMModelSpec.mlx(repoId: hit.id, displayName: leaf, sizeBytes: bytes)
-                        modelRow(spec, trailing: bytes == nil ? "MLX" : spec.sizeDescription)
-                    } else if filesByRepo[hit.id] != nil {
-                        Text("No GGUF or MLX weights in this repo")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
                     }
                 } label: {
                     VStack(alignment: .leading, spacing: 2) {
@@ -361,6 +371,8 @@ struct LLMPickerView: View {
                     }
                 }
             }
+        } footer: {
+            Text("Weights over \(PhoneMemoryBudget.maxWeightDescription) are hidden. Speech recognition and the voice need about 1.2 GB of this phone's RAM cap besides the language model.")
         }
     }
 

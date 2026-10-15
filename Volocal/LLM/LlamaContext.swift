@@ -132,7 +132,7 @@ actor LlamaContext {
             throw LlamaContextError.modelLoadFailed("File is not a GGUF (wrong magic).")
         }
         let bytes = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? UInt64) ?? 0
-        if bytes > 6_500_000_000 {
+        if bytes > UInt64(PhoneMemoryBudget.hardCeilingBytes) {
             throw LlamaContextError.tooLarge(bytes)
         }
         if bytes < 1_048_576 {
