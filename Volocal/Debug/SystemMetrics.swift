@@ -98,7 +98,7 @@ final class SystemMetrics: ObservableObject {
         thermalState = ProcessInfo.processInfo.thermalState
     }
 
-    static func appMemoryMB() -> Double {
+    nonisolated static func appMemoryMB() -> Double {
         var info = task_vm_info_data_t()
         var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
         let result = withUnsafeMutablePointer(to: &info) {

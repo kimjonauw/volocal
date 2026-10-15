@@ -309,7 +309,7 @@ struct LLMPickerView: View {
     }
 
     private var searchSection: some View {
-        Section("Search Hugging Face") {
+        Section {
             TextField("qwen, llama, gemma…", text: $searchText)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
@@ -371,6 +371,8 @@ struct LLMPickerView: View {
                     }
                 }
             }
+        } header: {
+            Text("Search Hugging Face")
         } footer: {
             Text("Weights over \(PhoneMemoryBudget.maxWeightDescription) are hidden. Speech recognition and the voice need about 1.2 GB of this phone's RAM cap besides the language model.")
         }
