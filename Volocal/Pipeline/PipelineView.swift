@@ -228,36 +228,36 @@ struct PipelineView: View {
     }
 }
 
-/// Cheap stand-in for a face: a few bars driven by the mic and the speaker.
-/// No image model, no extra GPU work.
+/// A flat cartoon face, in the spirit of Verity's helper: a yellow head,
+/// a mood, and a mouth that opens with the audio. Shapes only — no face model.
 private struct VoicePresence: View {
     let pipeline: VoicePipeline
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: pipeline.state == .idle)) { timeline in
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: false)) { timeline in
             let levels = pipeline.sharedAudio.bridge.levels()
             let time = timeline.date.timeIntervalSinceReferenceDate
-            let drive = level(for: pipeline.state, mic: levels.mic, playback: levels.playback, time: time)
-            HStack(alignment: .center, spacing: 5) {
-                ForEach(0..<7, id: \.self) { index in
-                    Capsule()
-                        .fill(color.opacity(0.9))
-                        .frame(width: 7, height: height(index: index, drive: drive, time: time))
+            let talk = mouth(mic: levels.mic, playback: levels.playback)
+            let blink = blinkScale(time)
+            ZStack {
+                Circle()
+                    .fill(Color(red: 0.98, green: 0.78, blue: 0.18))
+                    .overlay(Circle().stroke(Color.black.opacity(0.18), lineWidth: 2))
+                    .frame(width: 112, height: 112)
+                    .scaleEffect(x: 1 + talk * 0.05, y: 1 - talk * 0.07)
+
+                HStack(spacing: 18) {
+                    eye(blink: blink, look: lookOffset(time))
+                    eye(blink: blink, look: lookOffset(time))
                 }
+                .offset(y: -10)
+
+                mouthShape(open: talk)
+                    .offset(y: 26)
             }
-            .frame(height: 44)
-            .animation(.easeOut(duration: 0.08), value: drive)
+            .frame(height: 124)
         }
         .accessibilityLabel(accessibilityName)
-    }
-
-    private var color: Color {
-        switch pipeline.state {
-        case .idle: return Color(.systemGray3)
-        case .listening: return .red
-        case .processing: return .orange
-        case .speaking: return .green
-        }
     }
 
     private var accessibilityName: String {
@@ -269,25 +269,58 @@ private struct VoicePresence: View {
         }
     }
 
-    private func level(for state: VoicePipeline.PipelineState, mic: Float, playback: Float, time: TimeInterval) -> CGFloat {
-        switch state {
+    private func mouth(mic: Float, playback: Float) -> CGFloat {
+        switch pipeline.state {
         case .idle:
-            return 0.08
+            return 0.12
         case .listening:
-            return CGFloat(min(1, mic / 0.08))
+            return CGFloat(min(0.55, mic / 0.1))
         case .processing:
-            return 0.22 + 0.08 * CGFloat(sin(time * 2.2))
+            return 0.05
         case .speaking:
-            let spoken = CGFloat(min(1, playback / 0.12))
-            return max(0.35, spoken)
+            return max(0.28, CGFloat(min(1, playback / 0.1)))
         }
     }
 
-    private func height(index: Int, drive: CGFloat, time: TimeInterval) -> CGFloat {
-        let center = abs(CGFloat(index) - 3) / 3
-        let wave = 0.65 + 0.35 * sin(time * (pipeline.state == .speaking ? 9 : 4) + Double(index) * 0.7)
-        let shaped = (1 - center * 0.45) * (0.25 + 0.75 * drive) * wave
-        return 8 + 32 * min(1, max(0.12, shaped))
+    private func lookOffset(_ time: TimeInterval) -> CGFloat {
+        switch pipeline.state {
+        case .processing:
+            return -3
+        case .listening:
+            return CGFloat(sin(time * 1.4) * 1.5)
+        default:
+            return CGFloat(sin(time * 0.6) * 1.2)
+        }
+    }
+
+    private func blinkScale(_ time: TimeInterval) -> CGFloat {
+        let phase = time.truncatingRemainder(dividingBy: 3.4)
+        if phase < 0.12 { return 0.12 }
+        return 1
+    }
+
+    private func eye(blink: CGFloat, look: CGFloat) -> some View {
+        ZStack {
+            Circle()
+                .fill(.white)
+                .frame(width: 26, height: 26)
+            Circle()
+                .fill(.black)
+                .frame(width: 11, height: 11)
+                .offset(x: look, y: pipeline.state == .processing ? -2 : 0)
+            Capsule()
+                .fill(Color(red: 0.98, green: 0.78, blue: 0.18))
+                .frame(width: 28, height: 26 * (1 - blink))
+                .offset(y: -13 * blink)
+        }
+        .frame(width: 28, height: 28)
+        .clipped()
+    }
+
+    private func mouthShape(open: CGFloat) -> some View {
+        Capsule()
+            .fill(.black.opacity(0.85))
+            .frame(width: 22 + open * 10, height: 6 + open * 18)
     }
 }
 

@@ -518,8 +518,20 @@ struct LLMPickerView: View {
             async let ggufHits = HuggingFaceHub.searchRepos(query: trimmed, filter: "gguf")
             async let mlxHits = HuggingFaceHub.searchRepos(query: trimmed, filter: "mlx")
             let merged = try await mergeSearchHits(gguf: ggufHits, mlx: mlxHits)
+            let sized = await phoneSizedHits(merged)
             guard generation == searchGeneration else { return }
-            repoHits = merged
+            repoHits = sized.map(\.hit)
+            for item in sized {
+                if let files = item.gguf {
+                    filesByRepo[item.hit.id] = files
+                }
+                if item.isMLXPack {
+                    mlxPackRepos.insert(item.hit.id)
+                    if let bytes = item.mlxBytes {
+                        mlxPackBytes[item.hit.id] = bytes
+                    }
+                }
+            }
             localError = nil
         } catch {
             guard generation == searchGeneration else { return }
@@ -544,6 +556,78 @@ struct LLMPickerView: View {
             }
         }
         return byID.values.sorted { $0.downloads > $1.downloads }
+    }
+
+    private struct SizedSearchHit {
+        var hit: HuggingFaceHub.RepoHit
+        var gguf: [HuggingFaceHub.RemoteFile]?
+        var mlxBytes: Int64?
+        var isMLXPack: Bool
+    }
+
+    /// Drop a repo when every weight in it is over this phone's RAM budget.
+    /// A repo that still has a small file stays, with the huge files removed.
+    private func phoneSizedHits(_ hits: [HuggingFaceHub.RepoHit]) async -> [SizedSearchHit] {
+        var kept: [SizedSearchHit] = []
+        var index = 0
+        while index < hits.count {
+            let end = min(index + 8, hits.count)
+            let batch = Array(hits[index..<end])
+            index = end
+            await withTaskGroup(of: SizedSearchHit.self) { group in
+                for hit in batch {
+                    group.addTask {
+                        await Self.inspectSearchHit(hit)
+                    }
+                }
+                for await item in group where Self.keepSearchHit(item) {
+                    kept.append(item)
+                }
+            }
+        }
+        return kept.sorted { $0.hit.downloads > $1.hit.downloads }
+    }
+
+    private static func inspectSearchHit(_ hit: HuggingFaceHub.RepoHit) async -> SizedSearchHit {
+        var gguf: [HuggingFaceHub.RemoteFile]?
+        do {
+            let files = try await HuggingFaceHub.listGGUFFiles(repoId: hit.id)
+            gguf = files.filter { PhoneMemoryBudget.fits($0.sizeBytes) }
+        } catch {
+            gguf = nil
+        }
+        var mlxBytes: Int64?
+        var isPack = false
+        let shouldProbeMLX = hit.offersMLX || gguf?.isEmpty != false
+        if shouldProbeMLX {
+            do {
+                let mlxFiles = try await HuggingFaceHub.listMLXFiles(repoId: hit.id)
+                let hasTokenizer = mlxFiles.contains { $0.path == "tokenizer.json" }
+                let hasWeights = mlxFiles.contains {
+                    $0.path.lowercased().hasSuffix(".safetensors")
+                        && !$0.path.lowercased().hasSuffix(".index.json")
+                }
+                if hasTokenizer && hasWeights {
+                    let total = mlxFiles.reduce(Int64(0)) { $0 + max($1.sizeBytes ?? 0, 0) }
+                    if PhoneMemoryBudget.fits(total) {
+                        mlxBytes = total
+                        isPack = true
+                    }
+                }
+            } catch {
+                if hit.offersMLX {
+                    isPack = true
+                }
+            }
+        }
+        return SizedSearchHit(hit: hit, gguf: gguf, mlxBytes: mlxBytes, isMLXPack: isPack)
+    }
+
+    private static func keepSearchHit(_ item: SizedSearchHit) -> Bool {
+        if let files = item.gguf, !files.isEmpty { return true }
+        if item.isMLXPack { return true }
+        if item.gguf == nil && !item.hit.offersMLX { return true }
+        return false
     }
 
     private func loadFiles(_ repoId: String) async {
