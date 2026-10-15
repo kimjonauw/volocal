@@ -83,6 +83,8 @@ struct PipelineView: View {
                             .padding(.horizontal)
                     }
 
+                    VoicePresence(pipeline: pipeline)
+
                     // Mic button
                     Button {
                         pipeline.toggleListening()
@@ -223,6 +225,69 @@ struct PipelineView: View {
         case .processing: return "brain"
         case .speaking: return "speaker.wave.2.fill"
         }
+    }
+}
+
+/// Cheap stand-in for a face: a few bars driven by the mic and the speaker.
+/// No image model, no extra GPU work.
+private struct VoicePresence: View {
+    let pipeline: VoicePipeline
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: pipeline.state == .idle)) { timeline in
+            let levels = pipeline.sharedAudio.bridge.levels()
+            let time = timeline.date.timeIntervalSinceReferenceDate
+            let drive = level(for: pipeline.state, mic: levels.mic, playback: levels.playback, time: time)
+            HStack(alignment: .center, spacing: 5) {
+                ForEach(0..<7, id: \.self) { index in
+                    Capsule()
+                        .fill(color.opacity(0.9))
+                        .frame(width: 7, height: height(index: index, drive: drive, time: time))
+                }
+            }
+            .frame(height: 44)
+            .animation(.easeOut(duration: 0.08), value: drive)
+        }
+        .accessibilityLabel(accessibilityName)
+    }
+
+    private var color: Color {
+        switch pipeline.state {
+        case .idle: return Color(.systemGray3)
+        case .listening: return .red
+        case .processing: return .orange
+        case .speaking: return .green
+        }
+    }
+
+    private var accessibilityName: String {
+        switch pipeline.state {
+        case .idle: return "Idle"
+        case .listening: return "Listening"
+        case .processing: return "Thinking"
+        case .speaking: return "Speaking"
+        }
+    }
+
+    private func level(for state: VoicePipeline.PipelineState, mic: Float, playback: Float, time: TimeInterval) -> CGFloat {
+        switch state {
+        case .idle:
+            return 0.08
+        case .listening:
+            return CGFloat(min(1, mic / 0.08))
+        case .processing:
+            return 0.22 + 0.08 * CGFloat(sin(time * 2.2))
+        case .speaking:
+            let spoken = CGFloat(min(1, playback / 0.12))
+            return max(0.35, spoken)
+        }
+    }
+
+    private func height(index: Int, drive: CGFloat, time: TimeInterval) -> CGFloat {
+        let center = abs(CGFloat(index) - 3) / 3
+        let wave = 0.65 + 0.35 * sin(time * (pipeline.state == .speaking ? 9 : 4) + Double(index) * 0.7)
+        let shaped = (1 - center * 0.45) * (0.25 + 0.75 * drive) * wave
+        return 8 + 32 * min(1, max(0.12, shaped))
     }
 }
 

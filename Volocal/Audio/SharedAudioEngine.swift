@@ -10,6 +10,29 @@ private let logger = Logger(subsystem: "com.volocal.app", category: "audio")
 final class AudioBridge: @unchecked Sendable {
     /// Speaking gate — true while TTS is playing. Audio thread reads, MainActor writes.
     var isSpeaking: Bool = false
+    /// Latest mic energy for the on-screen presence. Not a published property:
+    /// the audio thread writes it, and the view samples it.
+    private let levelLock = NSLock()
+    private var micLevel: Float = 0
+    private var playbackLevel: Float = 0
+
+    func setMicLevel(_ value: Float) {
+        levelLock.lock()
+        micLevel = value
+        levelLock.unlock()
+    }
+
+    func setPlaybackLevel(_ value: Float) {
+        levelLock.lock()
+        playbackLevel = value
+        levelLock.unlock()
+    }
+
+    func levels() -> (mic: Float, playback: Float) {
+        levelLock.lock()
+        defer { levelLock.unlock() }
+        return (micLevel, playbackLevel)
+    }
 
     /// STT buffer continuation — set by STTManager on MainActor, yielded from audio thread.
     var inputContinuation: AsyncStream<AVAudioPCMBuffer>.Continuation?
@@ -154,6 +177,7 @@ final class SharedAudioEngine: ObservableObject {
     /// sits in `pendingChunks` so CoreML can start the next clause immediately.
     func scheduleTTSBuffer(_ samples: [Float]) {
         if Task.isCancelled || samples.isEmpty { return }
+        bridge.setPlaybackLevel(Self.sampleRMS(samples))
         pendingChunks.append(samples)
         bridge.isSpeaking = true
         pumpPending()
@@ -192,6 +216,7 @@ final class SharedAudioEngine: ObservableObject {
                         self.pumpPending()
                         if self.queuedBuffers == 0 && self.pendingChunks.isEmpty {
                             self.bridge.isSpeaking = false
+                            self.bridge.setPlaybackLevel(0)
                         }
                     }
                 }
@@ -203,6 +228,7 @@ final class SharedAudioEngine: ObservableObject {
         }
         if queuedBuffers == 0 && pendingChunks.isEmpty {
             bridge.isSpeaking = false
+            bridge.setPlaybackLevel(0)
         }
     }
 
@@ -212,6 +238,7 @@ final class SharedAudioEngine: ObservableObject {
         queuedBuffers = 0
         pendingChunks.removeAll()
         bridge.isSpeaking = false
+        bridge.setPlaybackLevel(0)
         guard let node = playerNode else { return }
         var nsError: NSError?
         _ = VolocalCatchException({
@@ -244,6 +271,15 @@ final class SharedAudioEngine: ObservableObject {
             sum += x * x
         }
         return sqrtf(sum / Float(n))
+    }
+
+    nonisolated static func sampleRMS(_ samples: [Float]) -> Float {
+        guard !samples.isEmpty else { return 0 }
+        var sum: Float = 0
+        for x in samples {
+            sum += x * x
+        }
+        return sqrtf(sum / Float(samples.count))
     }
 
     // MARK: - Mic tap
@@ -335,6 +371,7 @@ final class SharedAudioEngine: ObservableObject {
 
         // RMS on the tap buffer first so silence during TTS does not allocate.
         let rms = rmsEnergy(buffer)
+        bridge.setMicLevel(rms)
         if bridge.isSpeaking, rms < 0.012 { return }
 
         guard let copy = AVAudioPCMBuffer(
