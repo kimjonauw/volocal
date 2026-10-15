@@ -352,7 +352,7 @@ struct LLMPickerView: View {
                             let spec = LLMModelSpec.mlx(repoId: hit.id, displayName: leaf, sizeBytes: mlxBytes)
                             modelRow(spec, trailing: mlxBytes == nil ? "MLX" : spec.sizeDescription)
                         } else if hidOversized {
-                            Text("Over \(PhoneMemoryBudget.maxWeightDescription). That will not fit in this iPhone's RAM next to the speech models.")
+                            Text("Over \(PhoneMemoryBudget.maxWeightDescription). That will not fit on this iPhone.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         } else {
@@ -374,7 +374,7 @@ struct LLMPickerView: View {
         } header: {
             Text("Search Hugging Face")
         } footer: {
-            Text("Weights over \(PhoneMemoryBudget.maxWeightDescription) are hidden. Speech recognition and the voice need about 1.2 GB of this phone's RAM cap besides the language model.")
+            Text("Weights over \(PhoneMemoryBudget.maxWeightDescription) are hidden. A quantized 4B is about 2–5 GB and still shows.")
         }
     }
 

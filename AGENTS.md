@@ -35,7 +35,7 @@ MIT-licensed on-device iOS voice app: modular GGUF LLM, selectable STT/TTS, unsi
 - `project.yml` is source of truth; CI runs `xcodegen generate`. Keep `Volocal.xcodeproj` in sync.
 - `Volocal/LLM/` — GGUF load, HF search (`HuggingFaceHub`), native chat prompts (`ChatPrompt`: Gemma 4 / Gemma 3 / Qwen 3 / ChatML / Llama 3).
 - `Volocal/Models/` — downloads, onboarding, `LLMPickerView`, `VoiceEnginePickerView`, `VoiceEngines.swift`.
-- `Volocal/STT`, `TTS`, `Audio`, `Pipeline` — live loop. `VoicePresence` is a flat yellow cartoon face (eyes, blink, mouth). It follows mic and speaker level. Do not add a photoreal face or an image model. Hugging Face search hides a repo when every weight is over `PhoneMemoryBudget` (jetsam cap minus ~1.2 GB for speech).
+- `Volocal/STT`, `TTS`, `Audio`, `Pipeline` — live loop. `VoicePresence` is a flat yellow cartoon face: brows, blink, look, squash-and-stretch, and a mouth that chatters with the audio. Do not add a photoreal face or an image model. Hugging Face search hides a weight only when it is over `PhoneMemoryBudget` (6.5 GB). A quantized 4B stays listed.
 - `.github/workflows/ios-ipa.yml` + `scripts/package-unsigned-ipa.sh` — unsigned device IPA for SideStore.
 
 ## Build (no local Mac)
