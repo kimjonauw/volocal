@@ -21,6 +21,8 @@ struct LLMPickerView: View {
     @State private var pasteText = ""
     @State private var localError: String?
     @State private var searchGeneration = 0
+    @AppStorage("volocal.hubLibrary") private var libraryRaw = HuggingFaceHub.LibraryFilter.both.rawValue
+    @AppStorage("volocal.hubSignals") private var signalsRaw = "likes,newest"
     @State private var instructionsDraft = ""
     @State private var contextLog = LLMContextWindow.logValue(LLMContextWindow.default)
     @State private var contextAtDragStart = LLMContextWindow.default
@@ -64,6 +66,12 @@ struct LLMPickerView: View {
             }
             .onChange(of: searchText) { _, newValue in
                 scheduleSearch(newValue)
+            }
+            .onChange(of: libraryRaw) { _, _ in
+                scheduleSearch(searchText)
+            }
+            .onChange(of: signalsRaw) { _, _ in
+                scheduleSearch(searchText)
             }
             .onAppear {
                 instructionsDraft = modelManager.customInstructions
@@ -310,6 +318,15 @@ struct LLMPickerView: View {
 
     private var searchSection: some View {
         Section {
+            Picker("Format", selection: $libraryRaw) {
+                ForEach(HuggingFaceHub.LibraryFilter.allCases) { item in
+                    Text(item.label).tag(item.rawValue)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            rankChips
+
             TextField("qwen, llama, gemma…", text: $searchText)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
@@ -365,7 +382,7 @@ struct LLMPickerView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(hit.id)
                             .font(.subheadline.weight(.medium))
-                        Text(hit.offersMLX ? "MLX pack · \(hit.downloads) downloads" : "\(hit.downloads) downloads")
+                        Text(hitCaption(hit))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -374,9 +391,79 @@ struct LLMPickerView: View {
         } header: {
             Text("Search Hugging Face")
         } footer: {
-            Text("Weights over \(PhoneMemoryBudget.maxWeightDescription) are hidden. A quantized 4B is about 2–5 GB and still shows.")
+            Text("Turn on more than one rank to mix them. Newest and likes together favor models that are both recent and liked. Downloads stays off unless you turn it on. Opening a repo hides weights over \(PhoneMemoryBudget.maxWeightDescription).")
         }
     }
+
+    private var rankChips: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(HuggingFaceHub.RankSignal.allCases) { signal in
+                    rankChip(signal)
+                }
+            }
+        }
+    }
+
+    private func rankChip(_ signal: HuggingFaceHub.RankSignal) -> some View {
+        let on = HuggingFaceHub.RankSignal.decoded(signalsRaw).contains(signal)
+        return Button {
+            toggleSignal(signal)
+        } label: {
+            Text(signal.label)
+                .font(.caption.weight(.semibold))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(on ? Color.accentColor : Color(.secondarySystemFill), in: Capsule())
+                .foregroundStyle(on ? Color.white : Color.primary)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func toggleSignal(_ signal: HuggingFaceHub.RankSignal) {
+        var next = HuggingFaceHub.RankSignal.decoded(signalsRaw)
+        if next.contains(signal) {
+            guard next.count > 1 else { return }
+            next.remove(signal)
+        } else {
+            next.insert(signal)
+        }
+        signalsRaw = HuggingFaceHub.RankSignal.encoded(next)
+    }
+
+    private func hitCaption(_ hit: HuggingFaceHub.RepoHit) -> String {
+        let signals = HuggingFaceHub.RankSignal.decoded(signalsRaw)
+        var parts: [String] = []
+        if hit.offersGGUF && hit.offersMLX {
+            parts.append("GGUF and MLX")
+        } else if hit.offersMLX {
+            parts.append("MLX")
+        } else {
+            parts.append("GGUF")
+        }
+        if signals.contains(.likes) {
+            parts.append("\(hit.likes.formatted()) likes")
+        }
+        if signals.contains(.newest), let created = hit.createdAt {
+            parts.append("new \(Self.relativeDate.localizedString(for: created, relativeTo: Date()))")
+        }
+        if signals.contains(.updated), let modified = hit.lastModified {
+            parts.append("updated \(Self.relativeDate.localizedString(for: modified, relativeTo: Date()))")
+        }
+        if signals.contains(.trending), let score = hit.trendingScore {
+            parts.append("trending \(Int(score.rounded()))")
+        }
+        if signals.contains(.downloads) {
+            parts.append("\(hit.downloads.formatted()) downloads")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private static let relativeDate: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return formatter
+    }()
 
     private func installedTrailing(_ spec: LLMModelSpec) -> String? {
         if let size = spec.sizeBytes, size > 0 {
@@ -514,24 +601,12 @@ struct LLMPickerView: View {
         }
         isSearching = true
         defer { isSearching = false }
+        let library = HuggingFaceHub.LibraryFilter(rawValue: libraryRaw) ?? .both
+        let signals = HuggingFaceHub.RankSignal.decoded(signalsRaw)
         do {
-            async let ggufHits = HuggingFaceHub.searchRepos(query: trimmed, filter: "gguf")
-            async let mlxHits = HuggingFaceHub.searchRepos(query: trimmed, filter: "mlx")
-            let merged = try await mergeSearchHits(gguf: ggufHits, mlx: mlxHits)
-            let sized = await phoneSizedHits(merged)
+            let hits = try await fetchSearchHits(query: trimmed, library: library, signals: signals)
             guard generation == searchGeneration else { return }
-            repoHits = sized.map(\.hit)
-            for item in sized {
-                if let files = item.gguf {
-                    filesByRepo[item.hit.id] = files
-                }
-                if item.isMLXPack {
-                    mlxPackRepos.insert(item.hit.id)
-                    if let bytes = item.mlxBytes {
-                        mlxPackBytes[item.hit.id] = bytes
-                    }
-                }
-            }
+            repoHits = HuggingFaceHub.rank(hits, by: signals)
             localError = nil
         } catch {
             guard generation == searchGeneration else { return }
@@ -539,95 +614,49 @@ struct LLMPickerView: View {
         }
     }
 
-    private func mergeSearchHits(
-        gguf: [HuggingFaceHub.RepoHit],
-        mlx: [HuggingFaceHub.RepoHit]
-    ) -> [HuggingFaceHub.RepoHit] {
-        var byID: [String: HuggingFaceHub.RepoHit] = [:]
-        for hit in gguf {
-            byID[hit.id] = hit
-        }
-        for hit in mlx {
-            if var existing = byID[hit.id] {
-                existing.offersMLX = true
-                byID[hit.id] = existing
-            } else {
-                byID[hit.id] = hit
-            }
-        }
-        return byID.values.sorted { $0.downloads > $1.downloads }
-    }
-
-    private struct SizedSearchHit {
-        var hit: HuggingFaceHub.RepoHit
-        var gguf: [HuggingFaceHub.RemoteFile]?
-        var mlxBytes: Int64?
-        var isMLXPack: Bool
-    }
-
-    /// Drop a repo when every weight in it is over this phone's RAM budget.
-    /// A repo that still has a small file stays, with the huge files removed.
-    private func phoneSizedHits(_ hits: [HuggingFaceHub.RepoHit]) async -> [SizedSearchHit] {
-        var kept: [SizedSearchHit] = []
-        var index = 0
-        while index < hits.count {
-            let end = min(index + 8, hits.count)
-            let batch = Array(hits[index..<end])
-            index = end
-            await withTaskGroup(of: SizedSearchHit.self) { group in
-                for hit in batch {
+    /// One Hub request per format and per selected rank. No per-repo file listing.
+    private func fetchSearchHits(
+        query: String,
+        library: HuggingFaceHub.LibraryFilter,
+        signals: Set<HuggingFaceHub.RankSignal>
+    ) async throws -> [HuggingFaceHub.RepoHit] {
+        try await withThrowingTaskGroup(of: [HuggingFaceHub.RepoHit].self) { group in
+            for name in library.libraries {
+                for signal in signals {
                     group.addTask {
-                        await Self.inspectSearchHit(hit)
+                        try await HuggingFaceHub.searchRepos(query: query, library: name, sort: signal.hubSort)
                     }
                 }
-                for await item in group where Self.keepSearchHit(item) {
-                    kept.append(item)
+            }
+            var merged: [String: HuggingFaceHub.RepoHit] = [:]
+            for try await batch in group {
+                for hit in batch {
+                    merged[hit.id] = Self.mergedHit(merged[hit.id], hit)
                 }
             }
+            return Array(merged.values)
         }
-        return kept.sorted { $0.hit.downloads > $1.hit.downloads }
     }
 
-    private static func inspectSearchHit(_ hit: HuggingFaceHub.RepoHit) async -> SizedSearchHit {
-        var gguf: [HuggingFaceHub.RemoteFile]?
-        do {
-            let files = try await HuggingFaceHub.listGGUFFiles(repoId: hit.id)
-            gguf = files.filter { PhoneMemoryBudget.fits($0.sizeBytes) }
-        } catch {
-            gguf = nil
+    private static func mergedHit(
+        _ existing: HuggingFaceHub.RepoHit?,
+        _ hit: HuggingFaceHub.RepoHit
+    ) -> HuggingFaceHub.RepoHit {
+        guard var existing else { return hit }
+        existing.downloads = max(existing.downloads, hit.downloads)
+        existing.likes = max(existing.likes, hit.likes)
+        if let score = hit.trendingScore {
+            existing.trendingScore = max(existing.trendingScore ?? score, score)
         }
-        var mlxBytes: Int64?
-        var isPack = false
-        let shouldProbeMLX = hit.offersMLX || gguf?.isEmpty != false
-        if shouldProbeMLX {
-            do {
-                let mlxFiles = try await HuggingFaceHub.listMLXFiles(repoId: hit.id)
-                let hasTokenizer = mlxFiles.contains { $0.path == "tokenizer.json" }
-                let hasWeights = mlxFiles.contains {
-                    $0.path.lowercased().hasSuffix(".safetensors")
-                        && !$0.path.lowercased().hasSuffix(".index.json")
-                }
-                if hasTokenizer && hasWeights {
-                    let total = mlxFiles.reduce(Int64(0)) { $0 + max($1.sizeBytes ?? 0, 0) }
-                    if PhoneMemoryBudget.fits(total) {
-                        mlxBytes = total
-                        isPack = true
-                    }
-                }
-            } catch {
-                if hit.offersMLX {
-                    isPack = true
-                }
-            }
+        if let created = hit.createdAt, existing.createdAt == nil || created < (existing.createdAt ?? created) {
+            existing.createdAt = created
         }
-        return SizedSearchHit(hit: hit, gguf: gguf, mlxBytes: mlxBytes, isMLXPack: isPack)
-    }
-
-    private static func keepSearchHit(_ item: SizedSearchHit) -> Bool {
-        if let files = item.gguf, !files.isEmpty { return true }
-        if item.isMLXPack { return true }
-        if item.gguf == nil && !item.hit.offersMLX { return true }
-        return false
+        if let modified = hit.lastModified, existing.lastModified == nil || modified > (existing.lastModified ?? modified) {
+            existing.lastModified = modified
+        }
+        existing.offersMLX = existing.offersMLX || hit.offersMLX
+        existing.offersGGUF = existing.offersGGUF || hit.offersGGUF
+        return existing
     }
 
     private func loadFiles(_ repoId: String) async {

@@ -6,12 +6,80 @@ private let logger = Logger(subsystem: "com.volocal.app", category: "huggingface
 /// Hugging Face Hub client used only to list and download public GGUF files.
 /// Conversation audio/text never goes through here.
 enum HuggingFaceHub {
+    /// One Hub sort. Several can be on at once; their lists are merged and scored together.
+    enum RankSignal: String, CaseIterable, Identifiable {
+        case likes
+        case newest
+        case updated
+        case trending
+        case downloads
+
+        var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .likes: return "Likes"
+            case .newest: return "Newest"
+            case .updated: return "Updated"
+            case .trending: return "Trending"
+            case .downloads: return "Downloads"
+            }
+        }
+
+        var hubSort: String {
+            switch self {
+            case .likes: return "likes"
+            case .newest: return "createdAt"
+            case .updated: return "lastModified"
+            case .trending: return "trendingScore"
+            case .downloads: return "downloads"
+            }
+        }
+
+        static func decoded(_ raw: String) -> Set<RankSignal> {
+            let parsed = Set(raw.split(separator: ",").compactMap { RankSignal(rawValue: String($0)) })
+            return parsed.isEmpty ? [.likes, .newest] : parsed
+        }
+
+        static func encoded(_ signals: Set<RankSignal>) -> String {
+            allCases.filter { signals.contains($0) }.map(\.rawValue).joined(separator: ",")
+        }
+    }
+
+    enum LibraryFilter: String, CaseIterable, Identifiable {
+        case both
+        case gguf
+        case mlx
+
+        var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .both: return "Both"
+            case .gguf: return "GGUF"
+            case .mlx: return "MLX"
+            }
+        }
+
+        var libraries: [String] {
+            switch self {
+            case .both: return ["gguf", "mlx"]
+            case .gguf: return ["gguf"]
+            case .mlx: return ["mlx"]
+            }
+        }
+    }
+
     struct RepoHit: Identifiable, Equatable {
         let id: String
-        let downloads: Int
-        let likes: Int
+        var downloads: Int
+        var likes: Int
+        var trendingScore: Double?
+        var createdAt: Date?
+        var lastModified: Date?
         /// True when the Hub tagged this repo as an MLX pack rather than a GGUF.
         var offersMLX: Bool = false
+        var offersGGUF: Bool = false
         var displayName: String { id }
     }
 
@@ -44,31 +112,86 @@ enum HuggingFaceHub {
         return URLSession(configuration: config)
     }()
 
-    static func searchRepos(query: String, filter: String = "gguf") async throws -> [RepoHit] {
+    static func searchRepos(query: String, library: String, sort: String) async throws -> [RepoHit] {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
 
         var components = URLComponents(string: "https://huggingface.co/api/models")!
         components.queryItems = [
             URLQueryItem(name: "search", value: trimmed),
-            URLQueryItem(name: "filter", value: filter),
-            URLQueryItem(name: "sort", value: "downloads"),
+            URLQueryItem(name: "filter", value: library),
+            URLQueryItem(name: "sort", value: sort),
             URLQueryItem(name: "direction", value: "-1"),
-            URLQueryItem(name: "limit", value: "30")
+            URLQueryItem(name: "limit", value: "25")
         ]
         guard let url = components.url else { throw URLError(.badURL) }
 
-        let (data, response) = try await session.data(from: url)
-        try throwIfBad(response)
-
+        let data = try await fetchData(from: url)
         struct Hit: Decodable {
             let id: String
             let downloads: Int?
             let likes: Int?
+            let trendingScore: Double?
+            let createdAt: String?
+            let lastModified: String?
         }
-        let hits = try JSONDecoder().decode([Hit].self, from: data)
-        let mlx = filter.lowercased() == "mlx"
-        return hits.map { RepoHit(id: $0.id, downloads: $0.downloads ?? 0, likes: $0.likes ?? 0, offersMLX: mlx) }
+        let hits: [Hit]
+        do {
+            hits = try JSONDecoder().decode([Hit].self, from: data)
+        } catch {
+            throw HubError(status: 200, message: "Could not read the Hugging Face search results.")
+        }
+        let mlx = library.lowercased() == "mlx"
+        return hits.map { hit in
+            RepoHit(
+                id: hit.id,
+                downloads: hit.downloads ?? 0,
+                likes: hit.likes ?? 0,
+                trendingScore: hit.trendingScore,
+                createdAt: parseHubDate(hit.createdAt),
+                lastModified: parseHubDate(hit.lastModified),
+                offersMLX: mlx,
+                offersGGUF: !mlx
+            )
+        }
+    }
+
+    /// Merge lists from each selected rank, then score every repo on those ranks together.
+    static func rank(_ hits: [RepoHit], by signals: Set<RankSignal>) -> [RepoHit] {
+        let active = signals.isEmpty ? [.likes, .newest] : signals
+        let likesMax = log1p(Double(hits.map(\.likes).max() ?? 0))
+        let downloadsMax = log1p(Double(hits.map(\.downloads).max() ?? 0))
+        let trendingMax = hits.compactMap(\.trendingScore).max() ?? 0
+        let created = hits.compactMap(\.createdAt)
+        let modified = hits.compactMap(\.lastModified)
+
+        func score(_ hit: RepoHit) -> Double {
+            var total = 0.0
+            if active.contains(.likes), likesMax > 0 {
+                total += log1p(Double(hit.likes)) / likesMax
+            }
+            if active.contains(.downloads), downloadsMax > 0 {
+                total += log1p(Double(hit.downloads)) / downloadsMax
+            }
+            if active.contains(.trending), trendingMax > 0 {
+                total += (hit.trendingScore ?? 0) / trendingMax
+            }
+            if active.contains(.newest) {
+                total += recency(hit.createdAt, among: created)
+            }
+            if active.contains(.updated) {
+                total += recency(hit.lastModified, among: modified)
+            }
+            return total
+        }
+
+        return hits.sorted { lhs, rhs in
+            let left = score(lhs)
+            let right = score(rhs)
+            if left != right { return left > right }
+            if lhs.likes != rhs.likes { return lhs.likes > rhs.likes }
+            return lhs.id < rhs.id
+        }
     }
 
     static func listGGUFFiles(repoId: String) async throws -> [RemoteFile] {
@@ -81,8 +204,7 @@ enum HuggingFaceHub {
             throw URLError(.badURL)
         }
 
-        let (data, response) = try await session.data(from: url)
-        try throwIfBad(response)
+        let data = try await fetchData(from: url)
 
         struct Item: Decodable {
             let path: String
@@ -142,8 +264,7 @@ enum HuggingFaceHub {
         guard let url = URL(string: "https://huggingface.co/api/models/\(encoded)/tree/main?recursive=true") else {
             throw URLError(.badURL)
         }
-        let (data, response) = try await session.data(from: url)
-        try throwIfBad(response)
+        let data = try await fetchData(from: url)
         struct Item: Decodable {
             let path: String
             let type: String?
@@ -193,11 +314,79 @@ enum HuggingFaceHub {
         return (repoId, nil)
     }
 
-    private static func throwIfBad(_ response: URLResponse) throws {
-        guard let http = response as? HTTPURLResponse else { return }
-        guard (200..<300).contains(http.statusCode) else {
-            logger.error("Hugging Face HTTP \(http.statusCode)")
-            throw URLError(.badServerResponse)
+    private static func fetchData(from url: URL) async throws -> Data {
+        var attempt = 0
+        while true {
+            let (data, response) = try await session.data(from: url)
+            guard let http = response as? HTTPURLResponse else { return data }
+            if (200..<300).contains(http.statusCode) {
+                return data
+            }
+            let message = hubMessage(from: data)
+            logger.error("Hugging Face HTTP \(http.statusCode) \(message)")
+            if http.statusCode == 429, attempt == 0 {
+                let wait = retryDelay(http: http, data: data)
+                if wait <= 8 {
+                    attempt += 1
+                    try await Task.sleep(for: .seconds(wait))
+                    continue
+                }
+            }
+            throw HubError(status: http.statusCode, message: message)
         }
+    }
+
+    private static func hubMessage(from data: Data) -> String {
+        struct Body: Decodable { let error: String? }
+        let text = (try? JSONDecoder().decode(Body.self, from: data))?.error ?? ""
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func retryDelay(http: HTTPURLResponse, data: Data) -> TimeInterval {
+        if let header = http.value(forHTTPHeaderField: "retry-after"),
+           let seconds = TimeInterval(header), seconds > 0 {
+            return seconds
+        }
+        struct Body: Decodable { let retryAfter: Double? }
+        if let seconds = (try? JSONDecoder().decode(Body.self, from: data))?.retryAfter, seconds > 0 {
+            return seconds
+        }
+        return 5
+    }
+
+    private static func parseHubDate(_ raw: String?) -> Date? {
+        guard let raw, !raw.isEmpty else { return nil }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = formatter.date(from: raw) { return date }
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: raw)
+    }
+
+    /// 1 for the newest date in the pool, 0 for the oldest. Missing dates score 0.
+    private static func recency(_ date: Date?, among dates: [Date]) -> Double {
+        guard let date, let oldest = dates.min(), let newest = dates.max() else { return 0 }
+        let span = newest.timeIntervalSince(oldest)
+        guard span > 0 else { return 1 }
+        return date.timeIntervalSince(oldest) / span
+    }
+}
+
+struct HubError: LocalizedError {
+    let status: Int
+    let message: String
+
+    var errorDescription: String? {
+        if status == 429 {
+            return "Hugging Face is limiting requests from this network. Wait a minute, then search again."
+        }
+        if status == 401 || status == 403 {
+            return "Hugging Face refused the request (HTTP \(status)). The repo may be gated."
+        }
+        if message.isEmpty {
+            return "Hugging Face returned HTTP \(status)."
+        }
+        let clipped = message.count > 180 ? String(message.prefix(180)) : message
+        return "Hugging Face returned HTTP \(status). \(clipped)"
     }
 }
