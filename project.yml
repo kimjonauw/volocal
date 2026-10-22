@@ -2,7 +2,7 @@ name: Volocal
 options:
   bundleIdPrefix: com.localiosllm
   deploymentTarget:
-    iOS: "17.0"
+    iOS: "18.0"
   xcodeVersion: "16.0"
   generateEmptyDirectories: true
 
@@ -20,7 +20,7 @@ packages:
     exactVersion: "2.10549.0"
   FluidAudio:
     url: https://github.com/FluidInference/FluidAudio.git
-    exactVersion: "0.15.8"
+    revision: "c79c4106b954f81205113c3343e5a7e59a1089b5"
   mlx-swift-lm:
     url: https://github.com/ml-explore/mlx-swift-lm
     exactVersion: "3.31.4"
@@ -50,7 +50,7 @@ targets:
         CURRENT_PROJECT_VERSION: 1
         CODE_SIGN_STYLE: Automatic
         TARGETED_DEVICE_FAMILY: 1
-        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+        IPHONEOS_DEPLOYMENT_TARGET: "18.0"
         SWIFT_OBJC_BRIDGING_HEADER: Volocal/Audio/Volocal-Bridging-Header.h
     dependencies:
       - package: llama-swift

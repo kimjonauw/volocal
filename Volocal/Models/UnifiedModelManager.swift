@@ -83,6 +83,7 @@ final class UnifiedModelManager: ObservableObject {
         }
         RetiredTTSCache.wipeChatterboxNano()
         RetiredTTSCache.wipeKokoro()
+        RetiredTTSCache.wipePocketTtsLegacy()
         if let raw = UserDefaults.standard.string(forKey: selectedTTSVoiceKey),
            selectedTTS.voiceNames.contains(raw) {
             selectedTTSVoice = raw
@@ -668,7 +669,7 @@ final class UnifiedModelManager: ObservableObject {
         do {
             switch engine {
             case .pocketTts:
-                _ = try await PocketTtsResourceDownloader.ensureModels(language: .english) { [weak self] progress in
+                _ = try await PocketTtsSmallDownloader.ensurePack(.english18m) { [weak self] progress in
                     Task { @MainActor in
                         self?.modelStates[.tts] = .downloading(progress: progress.fractionCompleted)
                     }

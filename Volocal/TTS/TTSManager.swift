@@ -22,7 +22,7 @@ final class TTSManager: ObservableObject {
         case playing
     }
 
-    private var pocket: PocketTtsManager?
+    private var pocket: PocketTtsSmallManager?
     private var superonic: Supertonic3Manager?
     private var superonicStyles: [String: Supertonic3VoiceStyle] = [:]
     private var speakTask: Task<Void, Never>?
@@ -75,10 +75,11 @@ final class TTSManager: ObservableObject {
     }
 
     private func loadPocketTTS() async throws {
-        let manager = PocketTtsManager(
+        let manager = PocketTtsSmallManager(
+            model: .english18m,
             defaultVoice: TTSEngine.pocketTts.defaultVoice,
-            language: .english,
-            placement: .gpu
+            computeUnits: .cpuAndNeuralEngine,
+            mimiPrecision: .fp32
         )
         try await manager.initialize()
         pocket = manager
@@ -86,7 +87,7 @@ final class TTSManager: ObservableObject {
         if !TTSEngine.pocketTts.voiceNames.contains(selectedVoice) {
             selectedVoice = TTSEngine.pocketTts.defaultVoice
         }
-        logger.info("TTS warmup: PocketTTS dummy generation…")
+        logger.info("TTS warmup: PocketTTS small dummy generation…")
         let stream = try await manager.synthesizeStreaming(text: "Hi", voice: selectedVoice)
         for try await _ in stream { break }
     }

@@ -81,7 +81,7 @@ enum TTSEngine: String, CaseIterable, Codable, Identifiable {
 
     var displayName: String {
         switch self {
-        case .pocketTts: return "PocketTTS v2.1"
+        case .pocketTts: return "PocketTTS v4 (18M)"
         case .supertonic3: return "Supertonic-3"
         }
     }
@@ -89,7 +89,7 @@ enum TTSEngine: String, CaseIterable, Codable, Identifiable {
     var detail: String {
         switch self {
         case .pocketTts:
-            return "Speaks whole sentences without pausing mid-phrase. Several voices. Laughs are short cues, not acted speech."
+            return "Ultra-compact 18.2M parameter model (Kyutai v4.0). Fast streaming on Apple Silicon without mid-phrase pauses."
         case .supertonic3:
             return "Newer CoreML voice (2025). Ten speakers, very fast. Stays off the Neural Engine so the recognizer can keep running. Kokoro is not offered — it crashes this iPhone on iOS 26.5."
         }
@@ -97,14 +97,14 @@ enum TTSEngine: String, CaseIterable, Codable, Identifiable {
 
     var sizeDescription: String {
         switch self {
-        case .pocketTts: return "~550 MB"
+        case .pocketTts: return "~100 MB"
         case .supertonic3: return "~200 MB"
         }
     }
 
     var defaultVoice: String {
         switch self {
-        case .pocketTts: return "fantine"
+        case .pocketTts: return "alba"
         case .supertonic3: return "F1"
         }
     }
@@ -113,11 +113,11 @@ enum TTSEngine: String, CaseIterable, Codable, Identifiable {
         switch self {
         case .pocketTts:
             return [
-                TTSVoiceChoice(id: "fantine", displayName: "Fantine", detail: "Woman"),
-                TTSVoiceChoice(id: "cosette", displayName: "Cosette", detail: "Woman"),
-                TTSVoiceChoice(id: "eponine", displayName: "Éponine", detail: "Woman"),
-                TTSVoiceChoice(id: "azelma", displayName: "Azelma", detail: "Woman"),
                 TTSVoiceChoice(id: "alba", displayName: "Alba", detail: "Woman"),
+                TTSVoiceChoice(id: "azelma", displayName: "Azelma", detail: "Woman"),
+                TTSVoiceChoice(id: "cosette", displayName: "Cosette", detail: "Woman"),
+                TTSVoiceChoice(id: "fantine", displayName: "Fantine", detail: "Woman"),
+                TTSVoiceChoice(id: "eponine", displayName: "Éponine", detail: "Woman"),
                 TTSVoiceChoice(id: "marius", displayName: "Marius", detail: "Man"),
                 TTSVoiceChoice(id: "jean", displayName: "Jean", detail: "Man"),
                 TTSVoiceChoice(id: "javert", displayName: "Javert", detail: "Man"),
@@ -150,11 +150,18 @@ enum TTSEngine: String, CaseIterable, Codable, Identifiable {
         let models = cache.appendingPathComponent(PocketTtsConstants.defaultModelsSubdirectory)
         switch self {
         case .pocketTts:
-            let languageRoot = models
+            let pack = models
                 .appendingPathComponent(Repo.pocketTts.folderName)
-                .appendingPathComponent(PocketTtsLanguage.english.repoSubdirectory)
-            return ModelNames.PocketTTS.requiredModels.allSatisfy { name in
-                FileManager.default.fileExists(atPath: languageRoot.appendingPathComponent(name).path)
+                .appendingPathComponent(PocketTtsSmallModel.english18m.repoSubdirectory)
+            let required = [
+                "arch.json",
+                "pocket_state.json",
+                ModelNames.PocketTTS.pocketStateFile,
+                ModelNames.PocketTTS.mimiDecoderFile,
+                ModelNames.PocketTTS.constantsBinDir,
+            ]
+            return required.allSatisfy { name in
+                FileManager.default.fileExists(atPath: pack.appendingPathComponent(name).path)
             }
         case .supertonic3:
             let repoDir = models.appendingPathComponent(Repo.supertonic3.folderName)
@@ -191,6 +198,15 @@ enum RetiredTTSCache {
 
     static func wipeKokoro() {
         wipeRepoFolder(Repo.kokoroAne.folderName)
+    }
+
+    static func wipePocketTtsLegacy() {
+        guard let cache = try? TtsCacheDirectory.ensure() else { return }
+        let dir = cache
+            .appendingPathComponent(PocketTtsConstants.defaultModelsSubdirectory)
+            .appendingPathComponent(Repo.pocketTts.folderName)
+            .appendingPathComponent("v2.1")
+        try? FileManager.default.removeItem(at: dir)
     }
 
     private static func wipeRepoFolder(_ name: String) {
