@@ -230,54 +230,61 @@ struct PipelineView: View {
 }
 
 /// Glowing orb. Soft color fields drift inside a circle and swell with the
-/// mic and the speaker, the same idea as the ChatGPT and Gemini live spheres.
+/// mic and the speaker, reminiscent of the Siri, ChatGPT, and Gemini live spheres.
 private struct VoicePresence: View {
     let pipeline: VoicePipeline
 
     var body: some View {
         TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: false)) { timeline in
             let levels = pipeline.sharedAudio.bridge.levels()
-            let time = timeline.date.timeIntervalSinceReferenceDate
+            // Bound elapsed time to avoid floating point precision degradation over long sessions
+            let t = timeline.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 10000.0)
             let motion = OrbMotion(
                 state: pipeline.state,
                 mic: levels.mic,
                 playback: levels.playback,
-                time: time
+                time: t
             )
             ZStack {
+                // Outer breathing aura
                 Circle()
                     .fill(motion.glow)
                     .frame(width: 96, height: 96)
-                    .blur(radius: 28)
-                    .opacity(0.5 + motion.energy * 0.45)
-                    .scaleEffect(1.15 + motion.energy * 0.2)
+                    .blur(radius: 22 + motion.energy * 14)
+                    .opacity(0.45 + motion.energy * 0.45)
+                    .scaleEffect(1.08 + motion.energy * 0.18)
 
+                // Fluid inner color fields with calm, constant rotation
                 ZStack {
-                    field(Color(red: 0.2, green: 0.45, blue: 1), time * motion.spin, 26)
-                    field(Color(red: 0.5, green: 0.28, blue: 1), time * motion.spin * 0.82 + 2.1, 30)
-                    field(Color(red: 0.95, green: 0.38, blue: 0.72), time * motion.spin * 1.12 + 3.9, 24)
-                    field(Color(red: 0.25, green: 0.86, blue: 0.95), time * motion.spin * 0.7 + 5.3, 28)
+                    field(Color(red: 0.2, green: 0.45, blue: 1.0), t * 0.25, 20 + motion.energy * 6)
+                    field(Color(red: 0.5, green: 0.28, blue: 1.0), -t * 0.18 + 2.1, 24 + motion.energy * 6)
+                    field(Color(red: 0.95, green: 0.38, blue: 0.72), t * 0.32 + 3.9, 18 + motion.energy * 6)
+                    field(Color(red: 0.25, green: 0.86, blue: 0.95), -t * 0.14 + 5.3, 22 + motion.energy * 6)
+
+                    // Core soft illumination
                     Circle()
-                        .fill(.white.opacity(0.2 + motion.energy * 0.5))
-                        .frame(width: 26 + motion.energy * 20, height: 26 + motion.energy * 20)
-                        .blur(radius: 10)
+                        .fill(.white.opacity(0.18 + motion.energy * 0.45))
+                        .frame(width: 28 + motion.energy * 18, height: 28 + motion.energy * 18)
+                        .blur(radius: 12)
+
+                    // Glass sheen highlight
                     Ellipse()
-                        .fill(.white.opacity(0.5))
-                        .frame(width: 34, height: 14)
-                        .blur(radius: 5)
-                        .offset(x: -14, y: -24)
+                        .fill(.white.opacity(0.38))
+                        .frame(width: 32, height: 12)
+                        .blur(radius: 4)
+                        .offset(x: -12, y: -22)
                 }
-                .frame(width: 108, height: 108)
+                .frame(width: 104, height: 104)
                 .clipShape(Circle())
                 .overlay(
                     Circle()
                         .stroke(
                             LinearGradient(
-                                colors: [.white.opacity(0.75), .white.opacity(0.05), .white.opacity(0.28)],
+                                colors: [.white.opacity(0.65), .white.opacity(0.08), .white.opacity(0.25)],
                                 startPoint: .topLeading,
                                 endPoint: .bottomTrailing
                             ),
-                            lineWidth: 1.5
+                            lineWidth: 1.2
                         )
                 )
                 .scaleEffect(motion.scale)
@@ -308,32 +315,36 @@ private struct VoicePresence: View {
 private struct OrbMotion {
     var energy: CGFloat
     var scale: CGFloat
-    var spin: Double
     var glow: Color
 
-    init(state: VoicePipeline.PipelineState, mic: Float, playback: Float, time: TimeInterval) {
-        let breathe = CGFloat(0.5 + 0.5 * sin(time * 1.3))
+    init(state: VoicePipeline.PipelineState, mic: Float, playback: Float, time: Double) {
+        let breathe = CGFloat(0.5 + 0.5 * sin(time * 1.4))
         switch state {
         case .idle:
-            energy = 0.1 + breathe * 0.08
-            spin = 0.35
-            glow = Color(red: 0.35, green: 0.45, blue: 1)
+            // Serene, slow breathing
+            energy = 0.06 + breathe * 0.05
+            scale = 0.98 + breathe * 0.03
+            glow = Color(red: 0.32, green: 0.48, blue: 0.98)
         case .listening:
-            let heard = CGFloat(min(1, mic / 0.07))
-            energy = 0.22 + heard * 0.78
-            spin = 0.65 + Double(heard) * 0.45
-            glow = Color(red: 0.25, green: 0.72, blue: 1)
+            // Reactive to user voice energy
+            let heard = CGFloat(min(1.0, max(0.0, mic / 0.05)))
+            energy = 0.12 + heard * 0.65
+            scale = 1.0 + energy * 0.12
+            glow = Color(red: 0.22, green: 0.78, blue: 0.95)
         case .processing:
-            energy = 0.32 + breathe * 0.22
-            spin = 1.05
-            glow = Color(red: 0.55, green: 0.38, blue: 1)
+            // Calm, meditative pulse while the LLM generates tokens.
+            // Stays steady and doesn't frantically spin or swell while text is being written.
+            let gentlePulse = CGFloat(0.5 + 0.5 * sin(time * 2.2))
+            energy = 0.10 + gentlePulse * 0.08
+            scale = 1.0 + gentlePulse * 0.04
+            glow = Color(red: 0.48, green: 0.32, blue: 0.95)
         case .speaking:
-            let said = CGFloat(min(1, playback / 0.07))
-            energy = 0.38 + said * 0.62
-            spin = 0.85 + Double(said) * 0.55
-            glow = Color(red: 0.4, green: 0.55, blue: 1)
+            // Highly dynamic bloom tracking speech audio volume
+            let said = CGFloat(min(1.0, max(0.0, playback / 0.06)))
+            energy = 0.18 + said * 0.65
+            scale = 1.02 + energy * 0.16
+            glow = Color(red: 0.40, green: 0.50, blue: 1.0)
         }
-        scale = 1 + energy * 0.08
     }
 }
 
