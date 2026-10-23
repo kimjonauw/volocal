@@ -13,7 +13,7 @@ final class TTSManager: ObservableObject {
     @Published var isSpeaking: Bool = false
     @Published var selectedVoice: String = PocketTtsConstants.defaultVoice
     @Published var error: String?
-    @Published private(set) var engineKind: TTSEngine = .pocketTts
+    @Published private(set) var engineKind: TTSEngine = .pocketTtsSmall
     @Published var playbackPhase: PlaybackPhase = .idle
 
     enum PlaybackPhase: Equatable {
@@ -22,7 +22,8 @@ final class TTSManager: ObservableObject {
         case playing
     }
 
-    private var pocket: PocketTtsSmallManager?
+    private var pocketSmall: PocketTtsSmallManager?
+    private var pocket100M: PocketTtsManager?
     private var superonic: Supertonic3Manager?
     private var superonicStyles: [String: Supertonic3VoiceStyle] = [:]
     private var speakTask: Task<Void, Never>?
@@ -50,7 +51,8 @@ final class TTSManager: ObservableObject {
     /// then runs a dummy generation to warm up.
     func initialize(engine: TTSEngine, voice: String? = nil) async {
         await stopAndWait()
-        pocket = nil
+        pocketSmall = nil
+        pocket100M = nil
         superonic = nil
         superonicStyles.removeAll()
         engineKind = engine
@@ -62,8 +64,10 @@ final class TTSManager: ObservableObject {
 
         do {
             switch engine {
+            case .pocketTtsSmall:
+                try await loadPocketSmallTTS()
             case .pocketTts:
-                try await loadPocketTTS()
+                try await loadPocket100MTTS()
             case .supertonic3:
                 try await loadSupertonic()
             }
@@ -74,20 +78,38 @@ final class TTSManager: ObservableObject {
         }
     }
 
-    private func loadPocketTTS() async throws {
+    private func loadPocketSmallTTS() async throws {
         let manager = PocketTtsSmallManager(
             model: .english18m,
-            defaultVoice: TTSEngine.pocketTts.defaultVoice,
+            defaultVoice: TTSEngine.pocketTtsSmall.defaultVoice,
             computeUnits: .cpuAndNeuralEngine,
             mimiPrecision: .fp32
         )
         try await manager.initialize()
-        pocket = manager
+        pocketSmall = manager
+        engineKind = .pocketTtsSmall
+        if !TTSEngine.pocketTtsSmall.voiceNames.contains(selectedVoice) {
+            selectedVoice = TTSEngine.pocketTtsSmall.defaultVoice
+        }
+        logger.info("TTS warmup: PocketTTS small dummy generation…")
+        let stream = try await manager.synthesizeStreaming(text: "Hi", voice: selectedVoice)
+        for try await _ in stream { break }
+    }
+
+    private func loadPocket100MTTS() async throws {
+        _ = try await PocketTtsResourceDownloader.ensureModels(language: .english)
+        let manager = PocketTtsManager(
+            defaultVoice: TTSEngine.pocketTts.defaultVoice,
+            language: .english,
+            placement: .gpu
+        )
+        try await manager.initialize()
+        pocket100M = manager
         engineKind = .pocketTts
         if !TTSEngine.pocketTts.voiceNames.contains(selectedVoice) {
             selectedVoice = TTSEngine.pocketTts.defaultVoice
         }
-        logger.info("TTS warmup: PocketTTS small dummy generation…")
+        logger.info("TTS warmup: PocketTTS 100M dummy generation…")
         let stream = try await manager.synthesizeStreaming(text: "Hi", voice: selectedVoice)
         for try await _ in stream { break }
     }
@@ -209,19 +231,21 @@ final class TTSManager: ObservableObject {
     private func playSynthesized(
         _ text: String,
         whisper: Bool,
+        voiceOverride: String? = nil,
         audio: SharedAudioEngine
     ) async throws -> Int {
         stt?.pauseInference()
         defer { stt?.resumeInference() }
 
         var chunks = 0
-        if let pocket {
-            let voice = selectedVoice
-            let temperature: Float = whisper ? 0.2 : 0.4
-            let applyWhisper = whisper
-            let generation = speakGeneration
+        let voice = voiceOverride ?? selectedVoice
+        let temperature: Float = whisper ? 0.2 : 0.4
+        let applyWhisper = whisper
+        let generation = speakGeneration
+
+        if let pocketSmall {
             chunks = try await withGPU {
-                let stream = try await pocket.synthesizeStreaming(
+                let stream = try await pocketSmall.synthesizeStreaming(
                     text: text,
                     voice: voice,
                     temperature: temperature
@@ -245,8 +269,57 @@ final class TTSManager: ObservableObject {
                 }
                 return count
             }
+        } else if let pocket100M {
+            let isCloned = Self.isClonedVoice(voice)
+            chunks = try await withGPU {
+                var count = 0
+                if isCloned {
+                    let fileURL = Self.clonedVoiceURL(named: voice)
+                    let voiceData = try PocketTtsVoiceCloner.loadVoice(from: fileURL)
+                    let stream = try await pocket100M.synthesizeStreaming(
+                        text: text,
+                        voiceData: voiceData,
+                        temperature: temperature
+                    )
+                    for try await frame in stream {
+                        try Task.checkCancellation()
+                        let samples = applyWhisper ? Self.applyWhisper(frame.samples) : frame.samples
+                        count += 1
+                        let isFirst = count == 1
+                        Task { @MainActor in
+                            guard generation == self.speakGeneration else { return }
+                            if isFirst {
+                                self.markFirstInferenceIfNeeded()
+                                self.playbackPhase = .playing
+                            }
+                            audio.scheduleTTSBuffer(samples)
+                        }
+                    }
+                } else {
+                    let stream = try await pocket100M.synthesizeStreaming(
+                        text: text,
+                        voice: voice,
+                        temperature: temperature
+                    )
+                    for try await frame in stream {
+                        try Task.checkCancellation()
+                        let samples = applyWhisper ? Self.applyWhisper(frame.samples) : frame.samples
+                        count += 1
+                        let isFirst = count == 1
+                        Task { @MainActor in
+                            guard generation == self.speakGeneration else { return }
+                            if isFirst {
+                                self.markFirstInferenceIfNeeded()
+                                self.playbackPhase = .playing
+                            }
+                            audio.scheduleTTSBuffer(samples)
+                        }
+                    }
+                }
+                return count
+            }
         } else if let superonic {
-            let style = try await superonicStyle(named: selectedVoice)
+            let style = try await superonicStyle(named: voice)
             let samples: [Float] = try await withGPU {
                 let result = try await superonic.synthesize(
                     text: text,
@@ -267,6 +340,128 @@ final class TTSManager: ObservableObject {
             throw TTSError.engineNotLoaded
         }
         return chunks
+    }
+
+    /// Synthesizes and plays a short preview of the given voice.
+    func speakPreview(_ text: String, voice: String) async {
+        let leftover = speakTask
+        leftover?.cancel()
+        speakGeneration += 1
+        let speakGen = speakGeneration
+        if let leftover {
+            await leftover.value
+        }
+        guard speakGen == speakGeneration else { return }
+
+        isSpeaking = true
+        playbackPhase = .synthesizing
+        error = nil
+
+        let task = Task {
+            do {
+                guard let sharedAudio else {
+                    throw TTSError.noSharedAudio
+                }
+                _ = try await self.playSynthesized(
+                    text,
+                    whisper: false,
+                    voiceOverride: voice,
+                    audio: sharedAudio
+                )
+            } catch {
+                if !Task.isCancelled {
+                    logger.error("speakPreview failed: \(error.localizedDescription)")
+                    self.error = "Preview failed: \(error.localizedDescription)"
+                }
+            }
+            if !Task.isCancelled {
+                self.isSpeaking = sharedAudio?.isSpeaking == true
+                if !self.isSpeaking {
+                    self.playbackPhase = .idle
+                }
+            }
+        }
+        speakTask = task
+        await task.value
+    }
+
+    // MARK: - Cloned Voices
+
+    static var clonedVoicesDirectory: URL {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let dir = docs.appendingPathComponent("cloned_voices", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        return dir
+    }
+
+    static func listClonedVoiceNames() -> [String] {
+        let dir = clonedVoicesDirectory
+        guard let files = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return [] }
+        return files
+            .filter { $0.hasSuffix(".bin") }
+            .map { ($0 as NSString).deletingPathExtension }
+            .sorted()
+    }
+
+    static func isClonedVoice(_ name: String) -> Bool {
+        listClonedVoiceNames().contains(name)
+    }
+
+    static func clonedVoiceURL(named name: String) -> URL {
+        clonedVoicesDirectory.appendingPathComponent("\(name).bin")
+    }
+
+    static func deleteClonedVoice(named name: String) {
+        let file = clonedVoiceURL(named: name)
+        try? FileManager.default.removeItem(at: file)
+    }
+
+    func cloneVoice(from sourceURL: URL, as rawName: String) async throws {
+        if pocket100M == nil {
+            try await loadPocket100MTTS()
+        }
+        guard let manager = pocket100M else {
+            throw TTSError.cloningRequires100M
+        }
+
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: " ", with: "_")
+            .filter { $0.isLetter || $0.isNumber || $0 == "_" }
+
+        guard !name.isEmpty else {
+            throw TTSError.invalidVoiceName
+        }
+
+        let voiceData = try await manager.cloneVoice(from: sourceURL)
+        let destination = Self.clonedVoiceURL(named: name)
+        try PocketTtsVoiceCloner.saveVoice(voiceData, to: destination)
+        logger.info("Cloned voice '\(name)' saved successfully")
+    }
+
+    func cloneVoice(from samples: [Float], as rawName: String) async throws {
+        if pocket100M == nil {
+            try await loadPocket100MTTS()
+        }
+        guard let manager = pocket100M else {
+            throw TTSError.cloningRequires100M
+        }
+
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: " ", with: "_")
+            .filter { $0.isLetter || $0.isNumber || $0 == "_" }
+
+        guard !name.isEmpty else {
+            throw TTSError.invalidVoiceName
+        }
+
+        let voiceData = try await manager.cloneVoice(from: samples)
+        let destination = Self.clonedVoiceURL(named: name)
+        try PocketTtsVoiceCloner.saveVoice(voiceData, to: destination)
+        logger.info("Cloned voice '\(name)' saved successfully from samples")
     }
 
     private func withGPU<T>(_ body: () async throws -> T) async throws -> T {
@@ -359,6 +554,8 @@ final class TTSManager: ObservableObject {
 enum TTSError: LocalizedError {
     case engineNotLoaded
     case noSharedAudio
+    case cloningRequires100M
+    case invalidVoiceName
 
     var errorDescription: String? {
         switch self {
@@ -366,6 +563,10 @@ enum TTSError: LocalizedError {
             return "TTS engine not loaded. Call initialize() first."
         case .noSharedAudio:
             return "No shared audio engine available."
+        case .cloningRequires100M:
+            return "Voice cloning is supported on PocketTTS 100M."
+        case .invalidVoiceName:
+            return "Please provide a valid voice name (letters, numbers, underscores)."
         }
     }
 }

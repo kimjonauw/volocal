@@ -71,7 +71,9 @@ enum STTEngine: String, CaseIterable, Codable, Identifiable {
 
 /// Text-to-speech backends. Player is 24 kHz mono; Supertonic is resampled from 44.1 kHz.
 enum TTSEngine: String, CaseIterable, Codable, Identifiable {
-    /// Default. Streaming (~80 ms frames). Leaves ANE for STT.
+    /// Default. Fast streaming (~80 ms frames, ~100 MB). Kyutai v4.0.
+    case pocketTtsSmall
+    /// Full 100M parameter model (~550 MB). Classic PocketTTS with live voice cloning.
     case pocketTts
     /// Faster, 10 voices. Flow-matching CoreML off the Neural Engine so it
     /// does not collide with Parakeet. Kokoro was removed — it aborts on iOS 26.5.
@@ -81,15 +83,18 @@ enum TTSEngine: String, CaseIterable, Codable, Identifiable {
 
     var displayName: String {
         switch self {
-        case .pocketTts: return "PocketTTS v4 (18M)"
+        case .pocketTtsSmall: return "PocketTTS 18M (v4)"
+        case .pocketTts: return "PocketTTS 100M"
         case .supertonic3: return "Supertonic-3"
         }
     }
 
     var detail: String {
         switch self {
+        case .pocketTtsSmall:
+            return "Ultra-compact 18.2M model (Kyutai v4.0). Fast streaming on Apple Silicon without mid-phrase pauses (~100 MB)."
         case .pocketTts:
-            return "Ultra-compact 18.2M parameter model (Kyutai v4.0). Fast streaming on Apple Silicon without mid-phrase pauses."
+            return "Full 100M parameter model (~550 MB). Higher nuance and supports on-device custom voice cloning."
         case .supertonic3:
             return "Newer CoreML voice (2025). Ten speakers, very fast. Stays off the Neural Engine so the recognizer can keep running. Kokoro is not offered — it crashes this iPhone on iOS 26.5."
         }
@@ -97,21 +102,23 @@ enum TTSEngine: String, CaseIterable, Codable, Identifiable {
 
     var sizeDescription: String {
         switch self {
-        case .pocketTts: return "~100 MB"
+        case .pocketTtsSmall: return "~100 MB"
+        case .pocketTts: return "~550 MB"
         case .supertonic3: return "~200 MB"
         }
     }
 
     var defaultVoice: String {
         switch self {
-        case .pocketTts: return "alba"
+        case .pocketTtsSmall: return "alba"
+        case .pocketTts: return "fantine"
         case .supertonic3: return "F1"
         }
     }
 
     var voiceChoices: [TTSVoiceChoice] {
         switch self {
-        case .pocketTts:
+        case .pocketTtsSmall:
             return [
                 TTSVoiceChoice(id: "alba", displayName: "Alba", detail: "Woman"),
                 TTSVoiceChoice(id: "azelma", displayName: "Azelma", detail: "Woman"),
@@ -122,6 +129,21 @@ enum TTSEngine: String, CaseIterable, Codable, Identifiable {
                 TTSVoiceChoice(id: "jean", displayName: "Jean", detail: "Man"),
                 TTSVoiceChoice(id: "javert", displayName: "Javert", detail: "Man"),
             ]
+        case .pocketTts:
+            let presets = [
+                TTSVoiceChoice(id: "fantine", displayName: "Fantine", detail: "Woman"),
+                TTSVoiceChoice(id: "cosette", displayName: "Cosette", detail: "Woman"),
+                TTSVoiceChoice(id: "eponine", displayName: "Éponine", detail: "Woman"),
+                TTSVoiceChoice(id: "azelma", displayName: "Azelma", detail: "Woman"),
+                TTSVoiceChoice(id: "alba", displayName: "Alba", detail: "Woman"),
+                TTSVoiceChoice(id: "marius", displayName: "Marius", detail: "Man"),
+                TTSVoiceChoice(id: "jean", displayName: "Jean", detail: "Man"),
+                TTSVoiceChoice(id: "javert", displayName: "Javert", detail: "Man"),
+            ]
+            let cloned = TTSManager.listClonedVoiceNames().map {
+                TTSVoiceChoice(id: $0, displayName: $0.capitalized, detail: "Cloned voice")
+            }
+            return presets + cloned
         case .supertonic3:
             return [
                 TTSVoiceChoice(id: "F1", displayName: "F1", detail: "Woman"),
@@ -149,7 +171,7 @@ enum TTSEngine: String, CaseIterable, Codable, Identifiable {
         guard let cache = try? TtsCacheDirectory.ensure() else { return false }
         let models = cache.appendingPathComponent(PocketTtsConstants.defaultModelsSubdirectory)
         switch self {
-        case .pocketTts:
+        case .pocketTtsSmall:
             let pack = models
                 .appendingPathComponent(Repo.pocketTts.folderName)
                 .appendingPathComponent(PocketTtsSmallModel.english18m.repoSubdirectory)
@@ -162,6 +184,13 @@ enum TTSEngine: String, CaseIterable, Codable, Identifiable {
             ]
             return required.allSatisfy { name in
                 FileManager.default.fileExists(atPath: pack.appendingPathComponent(name).path)
+            }
+        case .pocketTts:
+            let languageRoot = models
+                .appendingPathComponent(Repo.pocketTts.folderName)
+                .appendingPathComponent(PocketTtsLanguage.english.repoSubdirectory)
+            return ModelNames.PocketTTS.requiredModels.allSatisfy { name in
+                FileManager.default.fileExists(atPath: languageRoot.appendingPathComponent(name).path)
             }
         case .supertonic3:
             let repoDir = models.appendingPathComponent(Repo.supertonic3.folderName)
@@ -198,15 +227,6 @@ enum RetiredTTSCache {
 
     static func wipeKokoro() {
         wipeRepoFolder(Repo.kokoroAne.folderName)
-    }
-
-    static func wipePocketTtsLegacy() {
-        guard let cache = try? TtsCacheDirectory.ensure() else { return }
-        let dir = cache
-            .appendingPathComponent(PocketTtsConstants.defaultModelsSubdirectory)
-            .appendingPathComponent(Repo.pocketTts.folderName)
-            .appendingPathComponent("v2.1")
-        try? FileManager.default.removeItem(at: dir)
     }
 
     private static func wipeRepoFolder(_ name: String) {

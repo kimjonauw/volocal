@@ -206,6 +206,21 @@ enum PhoneMemoryBudget {
         guard let bytes, bytes > 0 else { return true }
         return bytes <= maxWeightBytes
     }
+
+    /// Identifies repos whose parameter size is obviously beyond phone memory (>= 14B or large MoE).
+    static func isLikelyOversizedRepo(_ repoId: String) -> Bool {
+        let name = repoId.lowercased()
+        if name.contains("8x7b") || name.contains("8x22b") || name.contains("deepseek-v3")
+            || name.contains("deepseek-r1") || name.contains("command-r-plus") {
+            return true
+        }
+        // Match numbers 14-999 followed by 'b' e.g. -70b-, -72b, 32b, 14b, 405b
+        let pattern = #"(^|[^0-9a-z])(1[4-9]|[2-9][0-9]|[1-9][0-9]{2,})b([^0-9a-z]|$)"#
+        if name.range(of: pattern, options: .regularExpression) != nil {
+            return true
+        }
+        return false
+    }
 }
 
 enum LLMFileFilter {

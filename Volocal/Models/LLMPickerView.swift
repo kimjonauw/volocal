@@ -31,6 +31,23 @@ struct LLMPickerView: View {
     @State private var instructionTokensAreExact = false
     @State private var tokenCountGeneration = 0
 
+    private var displayedRepoHits: [HuggingFaceHub.RepoHit] {
+        repoHits.filter { hit in
+            if PhoneMemoryBudget.isLikelyOversizedRepo(hit.id) {
+                return false
+            }
+            if let files = filesByRepo[hit.id] {
+                let visible = files.filter { PhoneMemoryBudget.fits($0.sizeBytes) }
+                let mlxBytes = mlxPackBytes[hit.id]
+                let showMLX = (hit.offersMLX || mlxPackRepos.contains(hit.id)) && PhoneMemoryBudget.fits(mlxBytes)
+                if visible.isEmpty && !showMLX {
+                    return false
+                }
+            }
+            return true
+        }
+    }
+
     var body: some View {
         NavigationStack {
             List {
@@ -335,7 +352,7 @@ struct LLMPickerView: View {
                 ProgressView()
             }
 
-            ForEach(repoHits) { hit in
+            ForEach(displayedRepoHits) { hit in
                 DisclosureGroup(
                     isExpanded: Binding(
                         get: { expandedRepo == hit.id },

@@ -182,6 +182,28 @@ final class VoicePipeline: ObservableObject {
         ttsManager.selectedVoice = name
     }
 
+    func previewVoice(_ voiceId: String, displayName: String? = nil) async {
+        let label = displayName ?? voiceId.capitalized
+        let text = "Hello! This is a preview of the \(label) voice in Volocal."
+        await ttsManager.speakPreview(text, voice: voiceId)
+    }
+
+    func stopVoicePreview() {
+        ttsManager.stop()
+    }
+
+    func cloneVoice(from url: URL, as name: String) async throws {
+        try await ttsManager.cloneVoice(from: url, as: name)
+    }
+
+    func cloneVoice(from samples: [Float], as name: String) async throws {
+        try await ttsManager.cloneVoice(from: samples, as: name)
+    }
+
+    func deleteClonedVoice(_ name: String) {
+        TTSManager.deleteClonedVoice(named: name)
+    }
+
     func setExpressions(_ enabled: Bool) {
         ttsManager.expressionsEnabled = enabled
         applyInstructions(baseInstructions)

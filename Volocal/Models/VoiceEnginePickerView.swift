@@ -1,15 +1,27 @@
 import SwiftUI
+import AVFoundation
+import UniformTypeIdentifiers
 
 struct VoiceEnginePickerView: View {
     @EnvironmentObject var modelManager: UnifiedModelManager
     @Environment(\.dismiss) private var dismiss
 
+    var pipeline: VoicePipeline?
     var onEnginesChanged: (() -> Void)?
     var onVoiceChanged: ((String) -> Void)?
     var onExpressionsChanged: ((Bool) -> Void)?
 
     @State private var busyLabel: String?
     @State private var localError: String?
+    @State private var previewingVoice: String?
+    @State private var voiceListRefreshID = UUID()
+
+    // Voice cloning state
+    @State private var showRecorderSheet = false
+    @State private var showFileImporter = false
+    @State private var showNamePrompt = false
+    @State private var pendingImportURL: URL?
+    @State private var pendingVoiceName: String = ""
 
     var body: some View {
         NavigationStack {
@@ -85,38 +97,174 @@ struct VoiceEnginePickerView: View {
                     }
                 }
 
+                if modelManager.selectedTTS == .pocketTts {
+                    Section(
+                        header: Text("Voice cloning"),
+                        footer: Text("Record a 5–10s audio clip or import a WAV/M4A/MP3 file. Audio is encoded on-device using the Mimi Neural Audio Codec into conditioning weights for PocketTTS 100M.")
+                    ) {
+                        Button {
+                            showRecorderSheet = true
+                        } label: {
+                            Label("Record voice clip (5–10s)", systemImage: "mic.badge.plus")
+                        }
+
+                        Button {
+                            showFileImporter = true
+                        } label: {
+                            Label("Import audio file…", systemImage: "square.and.arrow.down")
+                        }
+                    }
+                }
+
                 Section("Speaker") {
                     ForEach(modelManager.selectedTTS.voiceChoices) { voice in
-                        Button {
-                            modelManager.selectTTSVoice(voice.id)
-                            onVoiceChanged?(voice.id)
-                        } label: {
-                            HStack {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(voice.displayName)
-                                        .foregroundStyle(.primary)
-                                    Text(voice.detail)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
+                        HStack {
+                            Button {
+                                modelManager.selectTTSVoice(voice.id)
+                                onVoiceChanged?(voice.id)
+                            } label: {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(voice.displayName)
+                                            .foregroundStyle(.primary)
+                                        Text(voice.detail)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    if modelManager.selectedTTSVoice == voice.id {
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .foregroundStyle(Color.accentColor)
+                                    }
                                 }
-                                Spacer()
-                                if modelManager.selectedTTSVoice == voice.id {
-                                    Image(systemName: "checkmark.circle.fill")
-                                        .foregroundStyle(Color.accentColor)
+                            }
+                            .buttonStyle(.plain)
+
+                            // Preview button
+                            Button {
+                                togglePreview(for: voice)
+                            } label: {
+                                Image(systemName: previewingVoice == voice.id && (pipeline?.ttsManager.isSpeaking == true) ? "stop.circle.fill" : "play.circle")
+                                    .font(.title3)
+                                    .foregroundStyle(Color.accentColor)
+                            }
+                            .buttonStyle(.borderless)
+                            .padding(.leading, 8)
+                            .accessibilityLabel("Preview \(voice.displayName) voice")
+                        }
+                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                            if TTSManager.isClonedVoice(voice.id) {
+                                Button(role: .destructive) {
+                                    deleteClonedVoice(voice.id)
+                                } label: {
+                                    Label("Delete", systemImage: "trash")
                                 }
                             }
                         }
                     }
                 }
+                .id(voiceListRefreshID)
             }
             .navigationTitle("Voice engines")
             .navigationBarTitleDisplayMode(.inline)
             .disabled(busyLabel != nil)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("Done") { dismiss() }
+                    Button("Done") {
+                        pipeline?.stopVoicePreview()
+                        dismiss()
+                    }
                 }
             }
+            .onDisappear {
+                pipeline?.stopVoicePreview()
+            }
+            .sheet(isPresented: $showRecorderSheet) {
+                VoiceClipRecorderSheet(pipeline: pipeline) { newVoice in
+                    voiceListRefreshID = UUID()
+                    modelManager.selectTTSVoice(newVoice)
+                    onVoiceChanged?(newVoice)
+                }
+            }
+            .fileImporter(
+                isPresented: $showFileImporter,
+                allowedContentTypes: [.audio],
+                allowsMultipleSelection: false
+            ) { result in
+                switch result {
+                case .success(let urls):
+                    guard let url = urls.first else { return }
+                    pendingImportURL = url
+                    let base = url.deletingPathExtension().lastPathComponent
+                    pendingVoiceName = base.prefix(1).capitalized + base.dropFirst()
+                    showNamePrompt = true
+                case .failure(let error):
+                    localError = "Failed to select file: \(error.localizedDescription)"
+                }
+            }
+            .alert("Name Cloned Voice", isPresented: $showNamePrompt) {
+                TextField("Voice name (e.g. Rachel)", text: $pendingVoiceName)
+                Button("Cancel", role: .cancel) {
+                    pendingImportURL = nil
+                }
+                Button("Clone") {
+                    if let url = pendingImportURL {
+                        Task { await cloneFromAudioFile(url, name: pendingVoiceName) }
+                    }
+                }
+            } message: {
+                Text("Enter a unique name for this cloned voice.")
+            }
+        }
+    }
+
+    private func togglePreview(for voice: TTSVoiceChoice) {
+        if previewingVoice == voice.id && pipeline?.ttsManager.isSpeaking == true {
+            pipeline?.stopVoicePreview()
+            previewingVoice = nil
+        } else {
+            previewingVoice = voice.id
+            Task {
+                await pipeline?.previewVoice(voice.id, displayName: voice.displayName)
+            }
+        }
+    }
+
+    private func deleteClonedVoice(_ voiceId: String) {
+        pipeline?.deleteClonedVoice(voiceId)
+        voiceListRefreshID = UUID()
+        if modelManager.selectedTTSVoice == voiceId {
+            let fallback = modelManager.selectedTTS.defaultVoice
+            modelManager.selectTTSVoice(fallback)
+            onVoiceChanged?(fallback)
+        }
+    }
+
+    private func cloneFromAudioFile(_ url: URL, name: String) async {
+        localError = nil
+        let targetName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !targetName.isEmpty else {
+            localError = "Please enter a voice name."
+            return
+        }
+
+        busyLabel = "Cloning voice '\(targetName)' on device…"
+        let accessing = url.startAccessingSecurityScopedResource()
+        defer {
+            if accessing { url.stopAccessingSecurityScopedResource() }
+            pendingImportURL = nil
+        }
+
+        do {
+            try await pipeline?.cloneVoice(from: url, as: targetName)
+            let sanitized = targetName.lowercased().replacingOccurrences(of: " ", with: "_").filter { $0.isLetter || $0.isNumber || $0 == "_" }
+            voiceListRefreshID = UUID()
+            modelManager.selectTTSVoice(sanitized)
+            onVoiceChanged?(sanitized)
+            busyLabel = nil
+        } catch {
+            busyLabel = nil
+            localError = "Voice cloning failed: \(error.localizedDescription)"
         }
     }
 
@@ -184,5 +332,318 @@ struct VoiceEnginePickerView: View {
             }
         }
         .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Voice Clip Recorder Sheet
+
+private struct VoiceClipRecorderSheet: View {
+    let pipeline: VoicePipeline?
+    let onCloned: (String) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    @StateObject private var recorder: VoiceClipRecorder
+    @State private var voiceName: String = ""
+    @State private var isCloning = false
+    @State private var cloneError: String?
+
+    init(pipeline: VoicePipeline?, onCloned: @escaping (String) -> Void) {
+        self.pipeline = pipeline
+        self.onCloned = onCloned
+        _recorder = StateObject(wrappedValue: VoiceClipRecorder(sharedAudio: pipeline?.sharedAudio))
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 24) {
+                if let cloneError {
+                    Text(cloneError)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .padding(.horizontal)
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Voice name")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    TextField("e.g. My Voice", text: $voiceName)
+                        .textFieldStyle(.roundedBorder)
+                        .autocorrectionDisabled()
+                }
+                .padding(.horizontal)
+
+                Spacer()
+
+                // Mic / Status Section
+                VStack(spacing: 16) {
+                    Text(statusMessage)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+
+                    Button {
+                        handleMicTap()
+                    } label: {
+                        ZStack {
+                            Circle()
+                                .fill(micColor)
+                                .frame(width: 88, height: 88)
+
+                            Image(systemName: micIcon)
+                                .font(.system(size: 34))
+                                .foregroundStyle(.white)
+                        }
+                    }
+                    .disabled(isCloning)
+
+                    if recorder.isRecording {
+                        ProgressView(value: recorder.elapsedSeconds, total: 10.0)
+                            .tint(.red)
+                            .padding(.horizontal, 48)
+                    }
+
+                    if recorder.isFinished, let _ = recorder.recordedURL {
+                        HStack(spacing: 16) {
+                            Button {
+                                if recorder.isPlayingPreview {
+                                    recorder.stopRecordedPreview()
+                                } else {
+                                    recorder.playRecordedPreview()
+                                }
+                            } label: {
+                                Label(recorder.isPlayingPreview ? "Stop" : "Listen", systemImage: recorder.isPlayingPreview ? "stop.fill" : "play.fill")
+                            }
+                            .buttonStyle(.bordered)
+
+                            Button {
+                                recorder.cleanupTempFile()
+                            } label: {
+                                Label("Re-record", systemImage: "arrow.counterclockwise")
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
+                }
+
+                Spacer()
+
+                // Clone button
+                if isCloning {
+                    VStack(spacing: 8) {
+                        ProgressView()
+                        Text("Encoding voice on Neural Engine…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.bottom, 24)
+                } else {
+                    Button {
+                        Task { await doClone() }
+                    } label: {
+                        Text("Create Cloned Voice")
+                            .font(.headline)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 14)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!canClone)
+                    .padding(.horizontal)
+                    .padding(.bottom, 24)
+                }
+            }
+            .navigationTitle("Record Voice")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Cancel") {
+                        recorder.cleanupTempFile()
+                        dismiss()
+                    }
+                    .disabled(isCloning)
+                }
+            }
+            .onDisappear {
+                recorder.cleanupTempFile()
+            }
+        }
+    }
+
+    private var canClone: Bool {
+        let name = voiceName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !name.isEmpty && recorder.isFinished && recorder.elapsedSeconds >= 1.0 && !isCloning
+    }
+
+    private var statusMessage: String {
+        if recorder.isRecording {
+            return "Recording: \(String(format: "%.1f", recorder.elapsedSeconds))s / 10.0s\n(Speak naturally)"
+        } else if recorder.isFinished {
+            return "Sample recorded (\(String(format: "%.1f", recorder.elapsedSeconds))s). Ready to clone!"
+        } else {
+            return "Tap microphone and speak for 5 to 10 seconds."
+        }
+    }
+
+    private var micColor: Color {
+        if recorder.isRecording {
+            return .red
+        } else if recorder.isFinished {
+            return .green
+        } else {
+            return Color.accentColor
+        }
+    }
+
+    private var micIcon: String {
+        if recorder.isRecording {
+            return "stop.fill"
+        } else if recorder.isFinished {
+            return "checkmark"
+        } else {
+            return "mic.fill"
+        }
+    }
+
+    private func handleMicTap() {
+        if recorder.isRecording {
+            recorder.stopRecording()
+        } else if !recorder.isFinished {
+            Task { await recorder.startRecording() }
+        }
+    }
+
+    private func doClone() async {
+        guard let url = recorder.recordedURL else { return }
+        cloneError = nil
+        isCloning = true
+        let targetName = voiceName.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        do {
+            try await pipeline?.cloneVoice(from: url, as: targetName)
+            let sanitized = targetName.lowercased().replacingOccurrences(of: " ", with: "_").filter { $0.isLetter || $0.isNumber || $0 == "_" }
+            recorder.cleanupTempFile()
+            isCloning = false
+            onCloned(sanitized)
+            dismiss()
+        } catch {
+            isCloning = false
+            cloneError = "Cloning failed: \(error.localizedDescription)"
+        }
+    }
+}
+
+// MARK: - Voice Clip Recorder Helper
+
+@MainActor
+private final class VoiceClipRecorder: ObservableObject {
+    @Published var isRecording = false
+    @Published var isFinished = false
+    @Published var elapsedSeconds: Double = 0
+    @Published var isPlayingPreview = false
+    @Published var error: String?
+
+    private var audioFile: AVAudioFile?
+    private var tempURL: URL?
+    private var timer: Timer?
+    private var audioPlayer: AVAudioPlayer?
+    private weak var sharedAudio: SharedAudioEngine?
+    private var captureTask: Task<Void, Never>?
+
+    init(sharedAudio: SharedAudioEngine?) {
+        self.sharedAudio = sharedAudio
+    }
+
+    var recordedURL: URL? {
+        tempURL
+    }
+
+    func startRecording() async {
+        guard let sharedAudio else {
+            error = "Audio engine unavailable"
+            return
+        }
+
+        cleanupTempFile()
+        error = nil
+        isRecording = true
+        isFinished = false
+        elapsedSeconds = 0
+
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("cloning_\(UUID().uuidString).wav")
+        self.tempURL = url
+
+        let (stream, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
+        sharedAudio.bridge.inputContinuation = continuation
+        await sharedAudio.beginInputCapture()
+
+        captureTask = Task { [weak self] in
+            for await buffer in stream {
+                guard let self else { break }
+                if self.audioFile == nil {
+                    do {
+                        self.audioFile = try AVAudioFile(forWriting: url, settings: buffer.format.settings)
+                    } catch {
+                        Task { @MainActor in self.error = "File write failed: \(error.localizedDescription)" }
+                        break
+                    }
+                }
+                try? self.audioFile?.write(from: buffer)
+            }
+        }
+
+        timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.elapsedSeconds += 0.1
+            if self.elapsedSeconds >= 10.0 {
+                self.stopRecording()
+            }
+        }
+    }
+
+    func stopRecording() {
+        guard isRecording else { return }
+        timer?.invalidate()
+        timer = nil
+        isRecording = false
+        isFinished = true
+        captureTask?.cancel()
+        captureTask = nil
+        sharedAudio?.endInputCapture()
+        audioFile = nil
+    }
+
+    func playRecordedPreview() {
+        guard let url = tempURL else { return }
+        do {
+            audioPlayer = try AVAudioPlayer(contentsOf: url)
+            audioPlayer?.play()
+            isPlayingPreview = true
+            Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] t in
+                guard let self else { t.invalidate(); return }
+                if self.audioPlayer?.isPlaying != true {
+                    self.isPlayingPreview = false
+                    t.invalidate()
+                }
+            }
+        } catch {
+            self.error = "Playback failed: \(error.localizedDescription)"
+        }
+    }
+
+    func stopRecordedPreview() {
+        audioPlayer?.stop()
+        isPlayingPreview = false
+    }
+
+    func cleanupTempFile() {
+        if let url = tempURL {
+            try? FileManager.default.removeItem(at: url)
+            tempURL = nil
+        }
+        audioFile = nil
+        audioPlayer?.stop()
+        audioPlayer = nil
+        isFinished = false
+        elapsedSeconds = 0
     }
 }

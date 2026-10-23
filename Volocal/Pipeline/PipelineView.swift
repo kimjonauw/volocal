@@ -149,6 +149,7 @@ struct PipelineView: View {
             }
             .sheet(isPresented: $showVoicePicker) {
                 VoiceEnginePickerView(
+                    pipeline: pipeline,
                     onEnginesChanged: { pipeline.invalidateForReload() },
                     onVoiceChanged: { pipeline.setTTSVoice($0) },
                     onExpressionsChanged: { pipeline.setExpressions($0) }

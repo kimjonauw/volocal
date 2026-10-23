@@ -74,6 +74,7 @@ struct ModelLoadingView: View {
         }
         .sheet(isPresented: $showVoicePicker) {
             VoiceEnginePickerView(
+                pipeline: pipeline,
                 onEnginesChanged: {
                     pipeline.invalidateForReload()
                     Task { await load() }

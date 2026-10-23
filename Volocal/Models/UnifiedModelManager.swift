@@ -79,11 +79,10 @@ final class UnifiedModelManager: ObservableObject {
            let engine = TTSEngine(rawValue: raw) {
             selectedTTS = engine
         } else {
-            selectedTTS = .pocketTts
+            selectedTTS = .pocketTtsSmall
         }
         RetiredTTSCache.wipeChatterboxNano()
         RetiredTTSCache.wipeKokoro()
-        RetiredTTSCache.wipePocketTtsLegacy()
         if let raw = UserDefaults.standard.string(forKey: selectedTTSVoiceKey),
            selectedTTS.voiceNames.contains(raw) {
             selectedTTSVoice = raw
@@ -668,12 +667,18 @@ final class UnifiedModelManager: ObservableObject {
 
         do {
             switch engine {
-            case .pocketTts:
-                _ = try await PocketTtsSmallDownloader.ensurePack(.english18m) { [weak self] progress in
+            case .pocketTtsSmall:
+                _ = try await PocketTtsSmallDownloader.ensurePack(.english18m, progressHandler: { [weak self] progress in
                     Task { @MainActor in
                         self?.modelStates[.tts] = .downloading(progress: progress.fractionCompleted)
                     }
-                }
+                })
+            case .pocketTts:
+                _ = try await PocketTtsResourceDownloader.ensureModels(language: .english, progressHandler: { [weak self] progress in
+                    Task { @MainActor in
+                        self?.modelStates[.tts] = .downloading(progress: progress.fractionCompleted)
+                    }
+                })
             case .supertonic3:
                 _ = try await Supertonic3ResourceDownloader.ensureModels(
                     veVariant: TTSEngine.superonicVariantToken
