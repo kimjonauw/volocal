@@ -592,10 +592,12 @@ private final class VoiceClipRecorder: ObservableObject {
         }
 
         timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            self.elapsedSeconds += 0.1
-            if self.elapsedSeconds >= 10.0 {
-                self.stopRecording()
+            Task { @MainActor [weak self] in
+                guard let self, self.isRecording else { return }
+                self.elapsedSeconds += 0.1
+                if self.elapsedSeconds >= 10.0 {
+                    self.stopRecording()
+                }
             }
         }
     }
@@ -619,10 +621,12 @@ private final class VoiceClipRecorder: ObservableObject {
             audioPlayer?.play()
             isPlayingPreview = true
             Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] t in
-                guard let self else { t.invalidate(); return }
-                if self.audioPlayer?.isPlaying != true {
-                    self.isPlayingPreview = false
-                    t.invalidate()
+                Task { @MainActor [weak self] in
+                    guard let self else { t.invalidate(); return }
+                    if self.audioPlayer?.isPlaying != true {
+                        self.isPlayingPreview = false
+                        t.invalidate()
+                    }
                 }
             }
         } catch {

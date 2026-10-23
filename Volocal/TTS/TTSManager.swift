@@ -387,7 +387,7 @@ final class TTSManager: ObservableObject {
 
     // MARK: - Cloned Voices
 
-    static var clonedVoicesDirectory: URL {
+    nonisolated static var clonedVoicesDirectory: URL {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let dir = docs.appendingPathComponent("cloned_voices", isDirectory: true)
         if !FileManager.default.fileExists(atPath: dir.path) {
@@ -396,7 +396,7 @@ final class TTSManager: ObservableObject {
         return dir
     }
 
-    static func listClonedVoiceNames() -> [String] {
+    nonisolated static func listClonedVoiceNames() -> [String] {
         let dir = clonedVoicesDirectory
         guard let files = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return [] }
         return files
@@ -405,15 +405,15 @@ final class TTSManager: ObservableObject {
             .sorted()
     }
 
-    static func isClonedVoice(_ name: String) -> Bool {
+    nonisolated static func isClonedVoice(_ name: String) -> Bool {
         listClonedVoiceNames().contains(name)
     }
 
-    static func clonedVoiceURL(named name: String) -> URL {
+    nonisolated static func clonedVoiceURL(named name: String) -> URL {
         clonedVoicesDirectory.appendingPathComponent("\(name).bin")
     }
 
-    static func deleteClonedVoice(named name: String) {
+    nonisolated static func deleteClonedVoice(named name: String) {
         let file = clonedVoiceURL(named: name)
         try? FileManager.default.removeItem(at: file)
     }
