@@ -116,51 +116,28 @@ struct VoiceEnginePickerView: View {
                     }
                 }
 
-                Section("Speaker") {
-                    ForEach(modelManager.selectedTTS.voiceChoices) { voice in
-                        HStack {
-                            Button {
-                                modelManager.selectTTSVoice(voice.id)
-                                onVoiceChanged?(voice.id)
-                            } label: {
-                                HStack {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(voice.displayName)
-                                            .foregroundStyle(.primary)
-                                        Text(voice.detail)
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    Spacer()
-                                    if modelManager.selectedTTSVoice == voice.id {
-                                        Image(systemName: "checkmark.circle.fill")
-                                            .foregroundStyle(Color.accentColor)
-                                    }
-                                }
-                            }
-                            .buttonStyle(.plain)
+                let allVoices = modelManager.selectedTTS.voiceChoices
+                let clonedVoices = allVoices.filter { TTSManager.isClonedVoice($0.id) }
+                let presetVoices = allVoices.filter { !TTSManager.isClonedVoice($0.id) }
 
-                            // Preview button
-                            Button {
-                                togglePreview(for: voice)
-                            } label: {
-                                Image(systemName: previewingVoice == voice.id && (pipeline?.ttsManager.isSpeaking == true) ? "stop.circle.fill" : "play.circle")
-                                    .font(.title3)
-                                    .foregroundStyle(Color.accentColor)
-                            }
-                            .buttonStyle(.borderless)
-                            .padding(.leading, 8)
-                            .accessibilityLabel("Preview \(voice.displayName) voice")
-                        }
-                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                            if TTSManager.isClonedVoice(voice.id) {
-                                Button(role: .destructive) {
-                                    deleteClonedVoice(voice.id)
-                                } label: {
-                                    Label("Delete", systemImage: "trash")
+                if !clonedVoices.isEmpty {
+                    Section("My Cloned Voices") {
+                        ForEach(clonedVoices) { voice in
+                            voiceRow(for: voice)
+                                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                    Button(role: .destructive) {
+                                        deleteClonedVoice(voice.id)
+                                    } label: {
+                                        Label("Delete", systemImage: "trash")
+                                    }
                                 }
-                            }
                         }
+                    }
+                }
+
+                Section(clonedVoices.isEmpty ? "Speaker" : "Preset Voices") {
+                    ForEach(presetVoices) { voice in
+                        voiceRow(for: voice)
                     }
                 }
                 .id(voiceListRefreshID)
@@ -216,6 +193,51 @@ struct VoiceEnginePickerView: View {
                 Text("Enter a unique name for this cloned voice.")
             }
         }
+    }
+
+    @ViewBuilder
+    private func voiceRow(for voice: TTSVoiceChoice) -> some View {
+        HStack(spacing: 12) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(voice.displayName)
+                        .foregroundStyle(.primary)
+                    Text(voice.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if modelManager.selectedTTSVoice == voice.id {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(Color.accentColor)
+                }
+            }
+            .contentShape(Rectangle())
+            .onTapGesture {
+                selectVoice(voice.id)
+            }
+
+            Button {
+                togglePreview(for: voice)
+            } label: {
+                Image(systemName: previewingVoice == voice.id && (pipeline?.ttsManager.isSpeaking == true) ? "stop.circle.fill" : "play.circle")
+                    .font(.title3)
+                    .foregroundStyle(Color.accentColor)
+                    .frame(width: 36, height: 36)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel("Preview \(voice.displayName) voice")
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(modelManager.selectedTTSVoice == voice.id ? [.isSelected] : [])
+    }
+
+    private func selectVoice(_ voiceId: String) {
+        pipeline?.stopVoicePreview()
+        previewingVoice = nil
+        modelManager.selectTTSVoice(voiceId)
+        onVoiceChanged?(voiceId)
     }
 
     private func togglePreview(for voice: TTSVoiceChoice) {
@@ -330,6 +352,7 @@ struct VoiceEnginePickerView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }
@@ -424,6 +447,12 @@ private struct VoiceClipRecorderSheet: View {
                             .buttonStyle(.bordered)
                         }
                     }
+
+                    Text("Tip: Speak clearly close to the mic in a quiet room for 5–8 seconds. Leading/trailing silence is trimmed and volume is normalized automatically.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 24)
                 }
 
                 Spacer()

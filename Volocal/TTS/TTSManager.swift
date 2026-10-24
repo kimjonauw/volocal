@@ -92,7 +92,7 @@ final class TTSManager: ObservableObject {
             selectedVoice = TTSEngine.pocketTtsSmall.defaultVoice
         }
         logger.info("TTS warmup: PocketTTS small dummy generation…")
-        let stream = try await manager.synthesizeStreaming(text: "Hi", voice: selectedVoice)
+        let stream = try await manager.synthesizeStreaming(text: "Hi", voice: TTSEngine.pocketTtsSmall.defaultVoice)
         for try await _ in stream { break }
     }
 
@@ -110,7 +110,7 @@ final class TTSManager: ObservableObject {
             selectedVoice = TTSEngine.pocketTts.defaultVoice
         }
         logger.info("TTS warmup: PocketTTS 100M dummy generation…")
-        let stream = try await manager.synthesizeStreaming(text: "Hi", voice: selectedVoice)
+        let stream = try await manager.synthesizeStreaming(text: "Hi", voice: TTSEngine.pocketTts.defaultVoice)
         for try await _ in stream { break }
     }
 
@@ -435,10 +435,15 @@ final class TTSManager: ObservableObject {
             throw TTSError.invalidVoiceName
         }
 
-        let voiceData = try await manager.cloneVoice(from: sourceURL)
+        let preprocessed = try Self.loadAndPreprocessAudio(from: sourceURL)
+        guard preprocessed.count >= 24000 else {
+            throw TTSError.audioTooShort
+        }
+
+        let voiceData = try await manager.cloneVoice(from: preprocessed)
         let destination = Self.clonedVoiceURL(named: name)
         try PocketTtsVoiceCloner.saveVoice(voiceData, to: destination)
-        logger.info("Cloned voice '\(name)' saved successfully")
+        logger.info("Cloned voice '\(name)' saved successfully (\(preprocessed.count) samples)")
     }
 
     func cloneVoice(from samples: [Float], as rawName: String) async throws {
@@ -458,10 +463,15 @@ final class TTSManager: ObservableObject {
             throw TTSError.invalidVoiceName
         }
 
-        let voiceData = try await manager.cloneVoice(from: samples)
+        let preprocessed = Self.preprocessSamples(samples)
+        guard preprocessed.count >= 24000 else {
+            throw TTSError.audioTooShort
+        }
+
+        let voiceData = try await manager.cloneVoice(from: preprocessed)
         let destination = Self.clonedVoiceURL(named: name)
         try PocketTtsVoiceCloner.saveVoice(voiceData, to: destination)
-        logger.info("Cloned voice '\(name)' saved successfully from samples")
+        logger.info("Cloned voice '\(name)' saved successfully from samples (\(preprocessed.count) samples)")
     }
 
     private func withGPU<T>(_ body: () async throws -> T) async throws -> T {
@@ -480,6 +490,109 @@ final class TTSManager: ObservableObject {
             prev = lp
             return lp * 0.36
         }
+    }
+
+    nonisolated private static func loadAndPreprocessAudio(from url: URL) throws -> [Float] {
+        let (rawSamples, sampleRate) = try loadAudioFile(at: url)
+        let resampled: [Float]
+        if sampleRate != 24000 {
+            resampled = resample(rawSamples, from: sampleRate, to: 24000)
+        } else {
+            resampled = rawSamples
+        }
+        return preprocessSamples(resampled)
+    }
+
+    nonisolated private static func loadAudioFile(at url: URL) throws -> (samples: [Float], sampleRate: Double) {
+        let file = try AVAudioFile(forReading: url)
+        let format = file.processingFormat
+        let frameCount = AVAudioFrameCount(file.length)
+        guard frameCount > 0 else {
+            throw TTSError.audioTooShort
+        }
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else {
+            throw TTSError.audioConversionFailed
+        }
+        try file.read(into: buffer)
+        guard let channelData = buffer.floatChannelData else {
+            throw TTSError.audioConversionFailed
+        }
+        let channels = Int(format.channelCount)
+        let count = Int(buffer.frameLength)
+        var mono = [Float](repeating: 0, count: count)
+        if channels == 1 {
+            mono.withUnsafeMutableBufferPointer { ptr in
+                _ = memcpy(ptr.baseAddress!, channelData[0], count * MemoryLayout<Float>.size)
+            }
+        } else {
+            let scale: Float = 1.0 / Float(channels)
+            for ch in 0..<channels {
+                let src = channelData[ch]
+                for i in 0..<count {
+                    mono[i] += src[i] * scale
+                }
+            }
+        }
+        return (mono, format.sampleRate)
+    }
+
+    nonisolated static func preprocessSamples(_ samples: [Float]) -> [Float] {
+        guard !samples.isEmpty else { return [] }
+
+        // 1. Peak Normalization
+        var maxPeak: Float = 0
+        for s in samples {
+            let a = abs(s)
+            if a > maxPeak { maxPeak = a }
+        }
+
+        guard maxPeak > 0.005 else {
+            return samples
+        }
+
+        // Target nominal level ~ -1.0 dBFS (0.89) with a gain clamp to prevent amplifying faint noise
+        let gain = min(0.89 / maxPeak, 15.0)
+        let normalized = samples.map { $0 * gain }
+
+        // 2. Windowed RMS Silence Trimming (20ms windows = 480 samples @ 24kHz)
+        let windowSize = 480
+        let threshold: Float = 0.015
+        var startIdx = 0
+        var endIdx = normalized.count
+
+        for i in stride(from: 0, to: normalized.count - windowSize, by: windowSize) {
+            var sum: Float = 0
+            for j in 0..<windowSize {
+                let v = normalized[i + j]
+                sum += v * v
+            }
+            let rms = sqrt(sum / Float(windowSize))
+            if rms > threshold {
+                // Keep ~150ms before speech start to protect initial consonants
+                startIdx = max(0, i - (24000 * 15 / 100))
+                break
+            }
+        }
+
+        for i in stride(from: normalized.count - windowSize, through: 0, by: -windowSize) {
+            var sum: Float = 0
+            for j in 0..<windowSize {
+                let v = normalized[i + j]
+                sum += v * v
+            }
+            let rms = sqrt(sum / Float(windowSize))
+            if rms > threshold {
+                // Keep ~200ms after speech end to preserve trailing release
+                endIdx = min(normalized.count, i + windowSize + (24000 * 20 / 100))
+                break
+            }
+        }
+
+        if startIdx < endIdx && (endIdx - startIdx) >= 24000 {
+            return Array(normalized[startIdx..<endIdx])
+        }
+
+        return normalized
     }
 
     nonisolated private static func resample(
@@ -556,6 +669,8 @@ enum TTSError: LocalizedError {
     case noSharedAudio
     case cloningRequires100M
     case invalidVoiceName
+    case audioConversionFailed
+    case audioTooShort
 
     var errorDescription: String? {
         switch self {
@@ -567,6 +682,10 @@ enum TTSError: LocalizedError {
             return "Voice cloning is supported on PocketTTS 100M."
         case .invalidVoiceName:
             return "Please provide a valid voice name (letters, numbers, underscores)."
+        case .audioConversionFailed:
+            return "Failed to read or convert audio file."
+        case .audioTooShort:
+            return "Audio recording too short. Please speak clearly for at least 3 to 5 seconds."
         }
     }
 }
