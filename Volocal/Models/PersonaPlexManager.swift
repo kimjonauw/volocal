@@ -39,7 +39,7 @@ final class PersonaPlexManager: ObservableObject {
             return
         }
 
-        guard PersonaPlexSpec.isDownloaded else {
+        if !PersonaPlexSpec.isDownloaded && !pipeline.llmManager.isLoaded {
             pipeline.currentError = "PersonaPlex 7B (~3.8 GB) is not downloaded. Open settings to download."
             pipeline.state = .idle
             return
@@ -140,12 +140,12 @@ final class PersonaPlexManager: ObservableObject {
 
                 // Generate conversational stream
                 var fullReply = ""
-                let stream = pipeline.llmManager.generateStreaming(prompt: trimmed)
+                let stream = pipeline.llmManager.generate(history: pipeline.conversationHistory)
 
                 var firstChunk = true
                 var sentenceAccumulator = ""
 
-                for try await token in stream {
+                for await token in stream {
                     if Task.isCancelled || gen != self.generationId { break }
 
                     fullReply += token

@@ -142,6 +142,22 @@ final class VoicePipeline: ObservableObject {
             await ttsManager.initialize(engine: .pocketTtsSmall, voice: PersonaPlexSpec.mimiVoice(for: personaVoice))
             guard gen == configureGeneration else { return }
 
+            if PersonaPlexSpec.isDownloaded {
+                loadingStatus = "Loading PersonaPlex 7B..."
+                do {
+                    try await llmManager.loadModel(path: PersonaPlexSpec.directory.path, displayName: PersonaPlexSpec.displayName)
+                } catch {
+                    logger.warning("PersonaPlex MLX load skipped: \(error.localizedDescription)")
+                }
+            } else if let path = llmModelPath {
+                loadingStatus = "Loading language model..."
+                do {
+                    try await llmManager.loadModel(path: path, displayName: displayName ?? URL(fileURLWithPath: path).lastPathComponent)
+                } catch {
+                    logger.warning("Fallback model load: \(error.localizedDescription)")
+                }
+            }
+
             loadingStatus = nil
             isReady = true
             return
