@@ -57,6 +57,8 @@ final class SharedAudioEngine: ObservableObject {
     /// True while STT wants buffers. The hardware tap stays installed for the session.
     private var inputCaptureActive = false
     private var micTapInstalled = false
+    /// Interruption and engine-configuration observers (calls, Siri, route changes).
+    private var sessionObservers: [NSObjectProtocol] = []
 
     /// Thread-safe bridge between MainActor and the real-time audio thread.
     let bridge = AudioBridge()
@@ -101,6 +103,7 @@ final class SharedAudioEngine: ObservableObject {
             self.engine = eng
             self.playerNode = player
             self.isRunning = true
+            observeAudioSession(engine: eng)
 
             logger.info("SharedAudioEngine started (TTS ready)")
         } catch {
@@ -110,6 +113,7 @@ final class SharedAudioEngine: ObservableObject {
     }
 
     func stop() {
+        removeSessionObservers()
         endInputCapture()
         if micTapInstalled, let eng = engine {
             var nsError: NSError?
@@ -127,6 +131,78 @@ final class SharedAudioEngine: ObservableObject {
         bridge.isSpeaking = false
         bridge.inputContinuation = nil
         logger.info("SharedAudioEngine stopped")
+    }
+
+    // MARK: - Interruptions and route changes
+
+    private func observeAudioSession(engine eng: AVAudioEngine) {
+        removeSessionObservers()
+        let center = NotificationCenter.default
+        sessionObservers.append(
+            center.addObserver(
+                forName: AVAudioSession.interruptionNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] note in
+                let typeRaw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+                Task { @MainActor in
+                    self?.handleInterruption(typeRaw: typeRaw)
+                }
+            }
+        )
+        sessionObservers.append(
+            center.addObserver(
+                forName: .AVAudioEngineConfigurationChange,
+                object: eng,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in
+                    self?.recoverEngine(reason: "configuration change")
+                }
+            }
+        )
+    }
+
+    private func removeSessionObservers() {
+        for observer in sessionObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        sessionObservers.removeAll()
+    }
+
+    private func handleInterruption(typeRaw: UInt?) {
+        guard let typeRaw, let type = AVAudioSession.InterruptionType(rawValue: typeRaw) else { return }
+        switch type {
+        case .began:
+            // A call, Siri or an alarm took the audio route. Drop queued speech.
+            stopPlayback()
+            logger.info("Audio session interrupted")
+        case .ended:
+            recoverEngine(reason: "interruption ended")
+        @unknown default:
+            break
+        }
+    }
+
+    /// Bring the engine back after an interruption or a route change (headphones,
+    /// Bluetooth). iOS stops the engine in both cases and does not restart it.
+    private func recoverEngine(reason: String) {
+        guard let eng = engine else { return }
+        // Buffers scheduled before the stop are gone; reset the bookkeeping.
+        stopPlayback()
+        do {
+            try AVAudioSession.sharedInstance().setActive(true)
+            if !eng.isRunning {
+                eng.prepare()
+                try eng.start()
+            }
+            playerNode?.play()
+            error = nil
+            logger.info("Audio engine recovered after \(reason, privacy: .public)")
+        } catch {
+            self.error = "Audio engine could not restart: \(error.localizedDescription)"
+            logger.error("Audio engine recovery failed: \(error.localizedDescription)")
+        }
     }
 
     // MARK: - STT (Input Capture)
@@ -208,8 +284,11 @@ final class SharedAudioEngine: ObservableObject {
             bridge.isSpeaking = true
 
             var nsError: NSError?
+            // .dataPlayedBack fires when the audio has actually been heard. .dataConsumed
+            // fires when the player merely took the buffer, so the turn ended early and the
+            // tail of the reply was treated as silence by the mic gate.
             let scheduled = VolocalCatchException({
-                node.scheduleBuffer(buffer, completionCallbackType: .dataConsumed) { [weak self] _ in
+                node.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
                     Task { @MainActor in
                         guard let self, epoch == self.playbackEpoch else { return }
                         self.queuedBuffers = max(self.queuedBuffers - 1, 0)

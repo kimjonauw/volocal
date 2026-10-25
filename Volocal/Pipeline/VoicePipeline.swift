@@ -139,6 +139,7 @@ final class VoicePipeline: ObservableObject {
             loadingStatus = "Loading \(tts.displayName)..."
             ttsManager.expressionsEnabled = expressions
             ttsManager.conversationalTone = true
+            ttsManager.metrics = metrics
             let voiceToLoad = PersonaPlexSpec.voice(for: personaVoice, engine: tts)
             await ttsManager.initialize(
                 engine: tts,
@@ -157,15 +158,31 @@ final class VoicePipeline: ObservableObject {
                 return
             }
 
+            if LLMLoadFence.shouldSkipLoad(path: path) {
+                currentError = LlamaContextError.crashedLastLaunch.localizedDescription
+                loadingStatus = nil
+                return
+            }
+
+            sentenceBuffer.mode = .streaming
+            setSuppressThinking(suppressThinking)
+            llmManager.contextSize = LLMContextWindow.clamp(contextSize)
+            LLMLoadFence.markStarting(path: path, contextSize: llmManager.contextSize)
+
             loadingStatus = "Loading language model..."
             do {
                 try await llmManager.loadModel(path: path, displayName: displayName ?? URL(fileURLWithPath: path).lastPathComponent)
             } catch {
+                LLMLoadFence.clear()
                 logger.error("LLM load failed: \(error.localizedDescription)")
                 currentError = "Model failed to load: \(error.localizedDescription)"
                 loadingStatus = nil
                 return
             }
+            // The load survived, so it did not crash the app. Nothing after this point
+            // should leave the fence set.
+            LLMLoadFence.clear()
+            guard gen == configureGeneration else { return }
 
             updatePromptForCurrentMode()
 
@@ -206,6 +223,9 @@ final class VoicePipeline: ObservableObject {
             loadingStatus = nil
             return
         }
+        // The load survived, so it did not crash the app. A later STT or TTS failure
+        // must not leave the fence set and block this model on the next launch.
+        LLMLoadFence.clear()
         guard gen == configureGeneration else { return }
         metrics?.endTracking("LLM (llama.cpp)")
 
@@ -233,7 +253,6 @@ final class VoicePipeline: ObservableObject {
 
         loadingStatus = nil
         isReady = true
-        LLMLoadFence.clear()
     }
 
     func setTTSVoice(_ name: String) {
@@ -298,6 +317,8 @@ final class VoicePipeline: ObservableObject {
                 stopListening()
             }
             pipelineMode = mode
+            // Keep the livelier persona sampling tied to the mode that is actually active.
+            ttsManager.conversationalTone = (mode == .personaplex)
             updatePromptForCurrentMode()
         }
     }

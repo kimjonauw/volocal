@@ -335,16 +335,21 @@ final class TTSManager: ObservableObject {
             }
         } else if let superonic {
             let style = try await superonicStyle(named: voice)
-            let samples: [Float] = try await withGPU {
+            // Synthesis holds the GPU lock. The resample does not need it, so it runs after
+            // the lock is released and off the main actor.
+            let rawPCM: [Float] = try await withGPU {
                 let result = try await superonic.synthesize(
                     text: text,
                     language: "en",
                     style: style
                 )
                 try Task.checkCancellation()
-                let pcm = whisper ? Self.applyWhisper(result.samples) : result.samples
-                return Self.resample(pcm, from: 44_100, to: 24_000)
+                return whisper ? Self.applyWhisper(result.samples) : result.samples
             }
+            let samples: [Float] = await Task.detached(priority: .userInitiated) {
+                TTSManager.resample(rawPCM, from: 44_100, to: 24_000)
+            }.value
+            try Task.checkCancellation()
             if !samples.isEmpty {
                 chunks = 1
                 markFirstInferenceIfNeeded()
@@ -613,6 +618,8 @@ final class TTSManager: ObservableObject {
     /// Windowed-sinc resampler. Linear interpolation folds everything above the new
     /// Nyquist back into the audible band, which is the harsh, tinny edge on 44.1 kHz
     /// Supertonic audio. This low-passes first, so the downsample stays clean.
+    /// The kernel is tabulated once per call and interpolated, so there is no sin/cos
+    /// per tap. Safe to run off the main actor.
     nonisolated private static func resample(
         _ samples: [Float],
         from srcRate: Double,
@@ -625,6 +632,17 @@ final class TTSManager: ObservableObject {
         let count = max(1, Int((Double(samples.count) / ratio).rounded(.down)))
         let cutoff = min(1.0, dstRate / srcRate) * 0.94
         let halfWidth = 12.0 / cutoff
+        let phases = 256.0
+        let tableCount = Int(2 * halfWidth * phases) + 3
+        var kernel = [Double](repeating: 0, count: tableCount)
+        for t in 0..<tableCount {
+            let d = Double(t) / phases - halfWidth
+            if abs(d) > halfWidth { continue }
+            let x = d * cutoff
+            let sinc = abs(x) < 1e-9 ? 1.0 : sin(Double.pi * x) / (Double.pi * x)
+            kernel[t] = sinc * 0.5 * (1 + cos(Double.pi * d / halfWidth))
+        }
+
         let n = samples.count
         var out = [Float](repeating: 0, count: count)
         samples.withUnsafeBufferPointer { src in
@@ -636,11 +654,10 @@ final class TTSManager: ObservableObject {
                 var acc = 0.0
                 var norm = 0.0
                 for j in lo...hi {
-                    let d = Double(j) - center
-                    let x = d * cutoff
-                    let sinc = abs(x) < 1e-9 ? 1.0 : sin(Double.pi * x) / (Double.pi * x)
-                    let window = 0.5 * (1 + cos(Double.pi * d / halfWidth))
-                    let w = sinc * window
+                    let pos = (Double(j) - center + halfWidth) * phases
+                    let k0 = max(0, Int(pos))
+                    let frac = pos - Double(k0)
+                    let w = kernel[k0] * (1 - frac) + kernel[k0 + 1] * frac
                     acc += Double(src[j]) * w
                     norm += w
                 }
