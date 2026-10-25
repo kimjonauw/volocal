@@ -45,7 +45,10 @@ enum NonverbalSynth {
             let white = nextNoise(&seed)
             let hp = Float(white) - prev
             prev = Float(white)
-            out[t] = hp * Float(env) * 1.8
+            // The high-passed noise can swing to +/-2. Keep the gasp near speech level
+            // and hard-limit it so it never clips.
+            let level = hp * Float(env) * 0.3
+            out[t] = max(-0.8, min(0.8, level))
         }
         return out
     }
