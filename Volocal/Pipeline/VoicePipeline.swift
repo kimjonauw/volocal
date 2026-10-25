@@ -26,7 +26,6 @@ final class VoicePipeline: ObservableObject {
     let llmManager = LLMManager()
     let ttsManager = TTSManager()
     let sharedAudio = SharedAudioEngine()
-    let personaPlexManager = PersonaPlexManager()
     @Published var pipelineMode: PipelineMode = .modular
     @Published var personaVoice: String = PersonaPlexSpec.defaultVoice
     @Published var personaId: String = PersonaPlexSpec.defaultPersonaId
@@ -79,7 +78,6 @@ final class VoicePipeline: ObservableObject {
         llmManager.gpuLock = gpuLock
         ttsManager.gpuLock = gpuLock
         llmManager.inferenceHold = ttsManager
-        personaPlexManager.attach(pipeline: self, sharedAudio: sharedAudio)
         setupCallbacks()
         sttManager.$partialResult
             .receive(on: DispatchQueue.main)
@@ -141,22 +139,29 @@ final class VoicePipeline: ObservableObject {
             loadingStatus = "Loading Mimi audio codec..."
             await ttsManager.initialize(engine: .pocketTtsSmall, voice: PersonaPlexSpec.mimiVoice(for: personaVoice))
             guard gen == configureGeneration else { return }
-
-            if PersonaPlexSpec.isDownloaded {
-                loadingStatus = "Loading PersonaPlex 7B..."
-                do {
-                    try await llmManager.loadModel(path: PersonaPlexSpec.directory.path, displayName: PersonaPlexSpec.displayName)
-                } catch {
-                    logger.warning("PersonaPlex MLX load skipped: \(error.localizedDescription)")
-                }
-            } else if let path = llmModelPath {
-                loadingStatus = "Loading language model..."
-                do {
-                    try await llmManager.loadModel(path: path, displayName: displayName ?? URL(fileURLWithPath: path).lastPathComponent)
-                } catch {
-                    logger.warning("Fallback model load: \(error.localizedDescription)")
-                }
+            if let ttsError = ttsManager.error {
+                currentError = ttsError
+                loadingStatus = nil
+                return
             }
+
+            guard let path = llmModelPath else {
+                currentError = "No language model available on this iPhone. Download a model first."
+                loadingStatus = nil
+                return
+            }
+
+            loadingStatus = "Loading language model..."
+            do {
+                try await llmManager.loadModel(path: path, displayName: displayName ?? URL(fileURLWithPath: path).lastPathComponent)
+            } catch {
+                logger.error("LLM load failed: \(error.localizedDescription)")
+                currentError = "Model failed to load: \(error.localizedDescription)"
+                loadingStatus = nil
+                return
+            }
+
+            updatePromptForCurrentMode()
 
             loadingStatus = nil
             isReady = true
@@ -283,9 +288,10 @@ final class VoicePipeline: ObservableObject {
     func setPipelineMode(_ mode: PipelineMode) {
         if pipelineMode != mode {
             if state != .idle {
-                toggleListening()
+                stopListening()
             }
             pipelineMode = mode
+            updatePromptForCurrentMode()
         }
     }
 
@@ -295,24 +301,28 @@ final class VoicePipeline: ObservableObject {
 
     func setPersonaId(_ id: String) {
         personaId = id
+        if pipelineMode == .personaplex {
+            updatePromptForCurrentMode()
+        }
+    }
+
+    private func updatePromptForCurrentMode() {
+        if pipelineMode == .personaplex {
+            let personaPrompt = PersonaPlexSpec.defaultPersonas.first { $0.id == personaId }?.systemPrompt
+                ?? PersonaPlexSpec.defaultPersonas[0].systemPrompt
+            llmManager.systemPrompt = LLMManager.systemPrompt(
+                from: personaPrompt,
+                expressions: ttsManager.expressionsEnabled
+            )
+        } else {
+            llmManager.systemPrompt = LLMManager.systemPrompt(
+                from: baseInstructions,
+                expressions: ttsManager.expressionsEnabled
+            )
+        }
     }
 
     func toggleListening() {
-        if pipelineMode == .personaplex {
-            switch state {
-            case .idle:
-                Task {
-                    await personaPlexManager.startSession(
-                        personaId: personaId,
-                        voicePresetId: personaVoice
-                    )
-                }
-            case .listening, .processing, .speaking:
-                personaPlexManager.stopSession()
-            }
-            return
-        }
-
         switch state {
         case .idle:
             startListening()
@@ -324,9 +334,6 @@ final class VoicePipeline: ObservableObject {
     }
 
     func resetChat() {
-        if pipelineMode == .personaplex {
-            personaPlexManager.stopSession()
-        }
         if state == .processing || state == .speaking {
             interrupt()
         }
@@ -376,10 +383,6 @@ final class VoicePipeline: ObservableObject {
     }
 
     private func interrupt() {
-        if pipelineMode == .personaplex {
-            personaPlexManager.interruptSpeaking()
-            return
-        }
         turnRevision += 1
         cancelDraft()
         ttsManager.stop()
@@ -443,6 +446,8 @@ final class VoicePipeline: ObservableObject {
             interrupt()
         }
         guard state == .listening else { return }
+
+        updatePromptForCurrentMode()
 
         turnRevision += 1
         let myRevision = turnRevision
@@ -622,10 +627,11 @@ final class VoicePipeline: ObservableObject {
         speakingEndedAt = nil
         let myRevision = turnRevision
         state = .speaking
+        let voiceOverride = pipelineMode == .personaplex ? PersonaPlexSpec.mimiVoice(for: personaVoice) : nil
         speakingTask = Task {
             // Returns when this clause is synthesized and queued — the next
             // clause can generate while this one is still playing.
-            await ttsManager.speak(sentence)
+            await ttsManager.speak(sentence, voiceOverride: voiceOverride)
             speakingEndedAt = Date()
             guard !Task.isCancelled, myRevision == turnRevision else { return }
             speakingTask = nil
