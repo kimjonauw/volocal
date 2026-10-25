@@ -53,6 +53,33 @@ private struct Exchange {
     var reply: String
 }
 
+/// Takes the first mic channel and downsamples it to 16 kHz by averaging blocks of samples.
+/// This does not depend on AVAudioConverter, which can refuse the Voice Processing format.
+private enum MonoResampler {
+    static func mono16k(from buffer: AVAudioPCMBuffer) -> [Float] {
+        guard let channel = buffer.floatChannelData?[0] else { return [] }
+        let n = Int(buffer.frameLength)
+        guard n > 0 else { return [] }
+        let rate = buffer.format.sampleRate
+        guard rate > 0 else { return [] }
+        if abs(rate - 16_000) < 1 {
+            return Array(UnsafeBufferPointer(start: channel, count: n))
+        }
+        let ratio = rate / 16_000
+        let m = Int(Double(n) / ratio)
+        guard m > 0 else { return [] }
+        var out = [Float](repeating: 0, count: m)
+        for j in 0..<m {
+            let start = min(n - 1, Int(Double(j) * ratio))
+            let end = min(n, max(start + 1, Int(Double(j + 1) * ratio)))
+            var sum: Float = 0
+            for i in start..<end { sum += channel[i] }
+            out[j] = sum / Float(end - start)
+        }
+        return out
+    }
+}
+
 /// Real speech-to-speech with Liquid AI's LFM2.5-Audio-1.5B (6-bit, ~1.3 GB) through the
 /// MLXAudioSTS library of mlx-audio-swift. One model hears your audio and answers in audio, so
 /// the recognizer, the language model and the TTS voice are not used in this mode.
@@ -88,6 +115,7 @@ final class SpeechToSpeechEngine: ObservableObject {
     private weak var sharedAudioRef: SharedAudioEngine?
     private var agentSpeakingCallback: (@Sendable (Bool) -> Void)?
     private var finishedCallback: (@Sendable (String?) -> Void)?
+    private var statusCallback: (@Sendable (String?) -> Void)?
 
     private static func setStage(_ stage: String?) {
         if let stage {
@@ -105,9 +133,9 @@ final class SpeechToSpeechEngine: ObservableObject {
             : "a US male voice"
     }
 
+    /// The library's documented speech-to-speech system prompt, plus the voice.
     private static func systemPrompt(for voiceId: String) -> String {
-        "Respond with interleaved text and speech audio. Use \(voiceDescription(for: voiceId)). "
-            + "Talk like a warm, natural friend on a phone call. Keep every reply to one or two short sentences."
+        "Respond with interleaved text and speech audio. Use \(voiceDescription(for: voiceId))."
     }
 
     // MARK: - Loading
@@ -183,13 +211,15 @@ final class SpeechToSpeechEngine: ObservableObject {
     // MARK: - Conversation
 
     /// Starts listening. Callbacks may be called from any thread. `onStepTime` is unused here
-    /// (kept so the pipeline code is the same for any speech-to-speech engine).
+    /// (kept so the pipeline code is the same for any speech-to-speech engine). `onStatus` is a
+    /// live one-line status for the screen.
     func start(
         sharedAudio: SharedAudioEngine,
         voiceId: String,
         onAgentSpeaking: @escaping @Sendable (Bool) -> Void,
         onStepTime: @escaping @Sendable (Double) -> Void,
-        onFinished: @escaping @Sendable (String?) -> Void
+        onFinished: @escaping @Sendable (String?) -> Void,
+        onStatus: (@Sendable (String?) -> Void)? = nil
     ) async throws {
         _ = onStepTime
         guard model != nil, processor != nil, detokenizer != nil else {
@@ -209,6 +239,7 @@ final class SpeechToSpeechEngine: ObservableObject {
         sharedAudioRef = sharedAudio
         agentSpeakingCallback = onAgentSpeaking
         finishedCallback = onFinished
+        statusCallback = onStatus
         history.removeAll()
         gate.set(false)
 
@@ -229,54 +260,26 @@ final class SpeechToSpeechEngine: ObservableObject {
         // Left set until a clean stop. If iOS kills the app mid-conversation, the next launch
         // reports it.
         Self.setStage("running the conversation")
+        onStatus?("Listening...")
 
         let gate = self.gate
         micTask = Task.detached(priority: .userInitiated) { [weak self] in
-            guard let target = AVAudioFormat(
-                commonFormat: .pcmFormatFloat32,
-                sampleRate: 16_000,
-                channels: 1,
-                interleaved: false
-            ) else { return }
-
             let detector = MicTurnDetector()
-            var converter: AVAudioConverter?
-            var converterInput: AVAudioFormat?
             var inTurn = false
             var turnAudio: [Float] = []
             var preroll: [[Float]] = []
             var loudSeconds = 0.0
             var wasActive = false
+            var lastStatusAt = CFAbsoluteTimeGetCurrent()
 
             for await buffer in stream {
                 if Task.isCancelled { break }
 
-                // Mic buffer (device rate) -> 16 kHz mono.
-                if converter == nil || converterInput != buffer.format {
-                    converter = AVAudioConverter(from: buffer.format, to: target)
-                    converterInput = buffer.format
-                }
-                guard let converter else { continue }
-                let ratio = 16_000 / buffer.format.sampleRate
-                let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 64
-                guard let out = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: capacity) else { continue }
-                var consumed = false
-                var convertError: NSError?
-                _ = converter.convert(to: out, error: &convertError) { _, inputStatus in
-                    if consumed {
-                        inputStatus.pointee = .noDataNow
-                        return nil
-                    }
-                    consumed = true
-                    inputStatus.pointee = .haveData
-                    return buffer
-                }
-                if convertError != nil { continue }
-                guard let data = out.floatChannelData?[0], out.frameLength > 0 else { continue }
-                let samples = Array(UnsafeBufferPointer(start: data, count: Int(out.frameLength)))
-
+                // The detector only needs the energy, so it runs before any resampling.
                 let rms = SharedAudioEngine.rmsEnergy(buffer)
-                let bufferSeconds = Double(buffer.frameLength) / buffer.format.sampleRate
+                let bufferSeconds = Double(buffer.frameLength) / max(buffer.format.sampleRate, 1)
+                let samples = MonoResampler.mono16k(from: buffer)
+                if samples.isEmpty { continue }
 
                 // While the model is thinking or talking, only watch for the user cutting in.
                 if gate.active {
@@ -316,6 +319,18 @@ final class SpeechToSpeechEngine: ObservableObject {
                     if preroll.count > 6 { preroll.removeFirst() }
                 }
 
+                // A live line so you can see what the app hears (about 4 times a second).
+                let now = CFAbsoluteTimeGetCurrent()
+                if now - lastStatusAt > 0.25 {
+                    lastStatusAt = now
+                    if inTurn {
+                        let seconds = Double(turnAudio.count) / 16_000
+                        onStatus?(String(format: "Hearing you... %.1f s (mic %.3f)", seconds, rms))
+                    } else {
+                        onStatus?(String(format: "Listening... mic level %.3f, needs more than 0.010 to count as speech", rms))
+                    }
+                }
+
                 let tooLong = turnAudio.count > 16_000 * 30
                 if inTurn, decision.endTurn || tooLong {
                     inTurn = false
@@ -324,6 +339,8 @@ final class SpeechToSpeechEngine: ObservableObject {
                     // Ignore coughs and clicks shorter than 0.6 s.
                     if audio.count >= 16_000 * 6 / 10 {
                         await self?.submit(audio: audio, session: currentSession)
+                    } else {
+                        onStatus?("That was too short to count (under 0.6 s). Listening...")
                     }
                 }
             }
@@ -352,10 +369,12 @@ final class SpeechToSpeechEngine: ObservableObject {
         gate.set(false)
         sharedAudioRef?.stopPlayback()
         agentSpeakingCallback?(false)
+        statusCallback?("Interrupted. Listening...")
     }
 
     private func submit(audio: [Float], session currentSession: Int) {
         guard currentSession == session, let sharedAudio = sharedAudioRef else { return }
+        statusCallback?(String(format: "Got %.1f s of speech. Thinking...", Double(audio.count) / 16_000))
         beginResponse(userAudio: audio, sharedAudio: sharedAudio, session: currentSession)
     }
 
@@ -369,6 +388,7 @@ final class SpeechToSpeechEngine: ObservableObject {
         let gate = self.gate
         let speaking = agentSpeakingCallback
         let finished = finishedCallback
+        let status = statusCallback
         let chunkFrames = 12
         let overlapFrames = 3
 
@@ -437,8 +457,13 @@ final class SpeechToSpeechEngine: ObservableObject {
                     eval(token)
                     if modality == .text {
                         replyTokens.append(token.item(Int.self))
+                        if replyTokens.count % 8 == 0 {
+                            status?("Replying: " + processor.decodeText(replyTokens))
+                        }
                     } else if modality == .audioOut {
-                        if token[0].item(Int.self) == lfmAudioEOSToken { break }
+                        // The library's own speech-to-speech example skips the end-of-audio
+                        // frame and keeps reading; only the stream's end ends the reply.
+                        if token[0].item(Int.self) == lfmAudioEOSToken { continue }
                         codes.append(token)
                         if codes.count - decodedFrames >= chunkFrames {
                             await play(decodeChunk(upTo: codes.count))
@@ -454,6 +479,15 @@ final class SpeechToSpeechEngine: ObservableObject {
 
             if Task.isCancelled { return }
 
+            let replyText = processor.decodeText(replyTokens)
+            if failure == nil {
+                if codes.isEmpty {
+                    status?("No audio came back (\(replyTokens.count) text tokens). Text: " + replyText)
+                } else {
+                    status?("Replied (\(codes.count) audio frames): " + replyText)
+                }
+            }
+
             // Let the reply finish playing, then listen again.
             await sharedAudio.waitForPlaybackCompletion()
             if announcedSpeaking { speaking?(false) }
@@ -467,8 +501,7 @@ final class SpeechToSpeechEngine: ObservableObject {
                     finished?(failure)
                     return
                 }
-                let reply = processor.decodeText(replyTokens)
-                self.history.append(Exchange(audio: userAudio, reply: reply))
+                self.history.append(Exchange(audio: userAudio, reply: replyText))
                 while self.history.count > 3 { self.history.removeFirst() }
                 var total = self.history.reduce(0) { $0 + $1.audio.count }
                 while total > 16_000 * 45, self.history.count > 1 {

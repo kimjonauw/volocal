@@ -10,7 +10,7 @@ private let logger = Logger(subsystem: "com.volocal.app", category: "pipeline")
 /// buffers into sentences, and sends to TTS for playback.
 /// Supports barge-in: user can speak while AI is talking to interrupt.
 ///
-/// `PipelineMode.personaplex` is different: it is real speech-to-speech (PersonaPlex 7B), so
+/// `PipelineMode.personaplex` is different: it is real speech-to-speech (LFM2.5-Audio), so
 /// none of the recognizer, language model or TTS run in that mode.
 @MainActor
 final class VoicePipeline: ObservableObject {
@@ -131,15 +131,14 @@ final class VoicePipeline: ObservableObject {
         ttsManager.stt = sttManager
 
         if mode == .personaplex {
-            // Real speech-to-speech. PersonaPlex replaces the recognizer, the language model
-            // and the TTS voice, so none of them load. The 4-bit weights are ~5 GB; free
-            // whatever the cascade was holding first.
+            // Real speech-to-speech. The model replaces the recognizer, the language model
+            // and the TTS voice, so none of them load. Free whatever the cascade was holding.
             sttManager.stopListening()
             ttsManager.stop()
             llmManager.unload()
             ttsManager.conversationalTone = false
 
-            loadingStatus = "Loading PersonaPlex speech-to-speech..."
+            loadingStatus = "Loading speech-to-speech..."
             do {
                 try await s2s.load { [weak self] text in
                     Task { @MainActor in
@@ -148,7 +147,7 @@ final class VoicePipeline: ObservableObject {
                 }
             } catch {
                 guard gen == configureGeneration else { return }
-                logger.error("PersonaPlex load failed: \(error.localizedDescription)")
+                logger.error("Speech-to-speech load failed: \(error.localizedDescription)")
                 currentError = error.localizedDescription
                 loadingStatus = nil
                 return
@@ -160,7 +159,7 @@ final class VoicePipeline: ObservableObject {
             return
         }
 
-        // Modular mode: release PersonaPlex so its ~5 GB is free for the cascade.
+        // Modular mode: release the speech-to-speech model so its memory is free for the cascade.
         s2s.stop(sharedAudio: sharedAudio)
         s2s.unload()
 
@@ -307,7 +306,7 @@ final class VoicePipeline: ObservableObject {
 
     private func updatePromptForCurrentMode() {
         if pipelineMode == .personaplex {
-            // Speech-to-speech takes pre-tokenized prompt ids, not text. Nothing to update.
+            // Speech-to-speech builds its own prompt. Nothing to update.
             return
         }
         llmManager.systemPrompt = LLMManager.systemPrompt(
@@ -361,11 +360,12 @@ final class VoicePipeline: ObservableObject {
         UIApplication.shared.isIdleTimerDisabled = sceneIsActive && state != .idle
     }
 
-    // MARK: - Speech-to-speech (PersonaPlex)
+    // MARK: - Speech-to-speech
 
     private func startSpeechToSpeech() {
         state = .listening
         currentError = nil
+        partialTranscript = ""
         let voice = personaVoice
         Task { @MainActor in
             do {
@@ -378,29 +378,25 @@ final class VoicePipeline: ObservableObject {
                             self.state = speaking ? .speaking : .listening
                         }
                     },
-                    onStepTime: { [weak self] milliseconds in
-                        Task { @MainActor in
-                            guard let self, self.pipelineMode == .personaplex, self.state != .idle else { return }
-                            if milliseconds > 100 {
-                                self.currentError = String(
-                                    format: "Running slower than real time: %.0f ms per step, needs 80 or less. Expect gaps and stutter.",
-                                    milliseconds
-                                )
-                            } else {
-                                self.currentError = nil
-                            }
-                        }
-                    },
+                    onStepTime: { _ in },
                     onFinished: { [weak self] message in
                         Task { @MainActor in
                             guard let self, self.pipelineMode == .personaplex else { return }
                             if let message { self.currentError = message }
                             self.stopSpeechToSpeech()
                         }
+                    },
+                    onStatus: { [weak self] text in
+                        // The blue line under "Listening" shows what the app hears and does.
+                        Task { @MainActor in
+                            guard let self, self.pipelineMode == .personaplex, self.state != .idle else { return }
+                            self.partialTranscript = text ?? ""
+                        }
                     }
                 )
             } catch {
                 currentError = error.localizedDescription
+                partialTranscript = ""
                 state = .idle
             }
         }
@@ -408,6 +404,7 @@ final class VoicePipeline: ObservableObject {
 
     private func stopSpeechToSpeech() {
         s2s.stop(sharedAudio: sharedAudio)
+        partialTranscript = ""
         state = .idle
     }
 
