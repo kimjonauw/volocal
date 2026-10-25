@@ -19,7 +19,9 @@ concurrency:
 jobs:
   ipa:
     name: SideStore IPA
-    runs-on: macos-15
+    # speech-swift (PersonaPlex speech-to-speech) uses AVAudioSession.allowBluetoothHFP, which
+    # only exists in the iOS 26 SDK. macos-15 defaults to Xcode 16.4 and cannot compile it.
+    runs-on: macos-26
     timeout-minutes: 90
     steps:
       - name: Checkout
