@@ -39,7 +39,7 @@ final class PersonaPlexManager: ObservableObject {
             return
         }
 
-        if !PersonaPlexSpec.isDownloaded && !pipeline.llmManager.isLoaded {
+        if !PersonaPlexSpec.isDownloaded && !pipeline.llmManager.isModelLoaded {
             pipeline.currentError = "PersonaPlex 7B (~3.8 GB) is not downloaded. Open settings to download."
             pipeline.state = .idle
             return
@@ -116,7 +116,7 @@ final class PersonaPlexManager: ObservableObject {
         mimiVoice: String
     ) async {
         let trimmed = userText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, let pipeline, let sharedAudio else { return }
+        guard !trimmed.isEmpty, let pipeline else { return }
 
         // Ignore short noise
         if trimmed.count < 2 { return }
