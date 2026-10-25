@@ -35,7 +35,7 @@ final class TTSManager: ObservableObject {
     private(set) var holdsInferenceGPU = false
     var metrics: SystemMetrics?
     var expressionsEnabled = true
-    /// Slightly higher PocketTTS temperature for persona / phone-call style speech.
+    /// Livelier PocketTTS sampling (higher temperature) for persona / phone-call style speech.
     var conversationalTone = false
 
     /// Shared audio engine — injected by VoicePipeline
@@ -251,9 +251,9 @@ final class TTSManager: ObservableObject {
         let voice = voiceOverride ?? selectedVoice
         let temperature: Float = {
             if whisper { return 0.2 }
-            // 0.40 provides stable acoustic token sampling with high vocal clarity
-            // and natural prosody, avoiding the slurring/rasping artifacts of higher temperatures.
-            return 0.4
+            // 0.40 is stable and clear but flattens pitch and rhythm. Persona mode trades a
+            // little stability for more natural variation. Tune 0.50-0.65 if it slurs.
+            return conversationalTone ? 0.58 : 0.4
         }()
         let applyWhisper = whisper
         let generation = speakGeneration
@@ -610,6 +610,9 @@ final class TTSManager: ObservableObject {
         return normalized
     }
 
+    /// Windowed-sinc resampler. Linear interpolation folds everything above the new
+    /// Nyquist back into the audible band, which is the harsh, tinny edge on 44.1 kHz
+    /// Supertonic audio. This low-passes first, so the downsample stays clean.
     nonisolated private static func resample(
         _ samples: [Float],
         from srcRate: Double,
@@ -620,14 +623,31 @@ final class TTSManager: ObservableObject {
         }
         let ratio = srcRate / dstRate
         let count = max(1, Int((Double(samples.count) / ratio).rounded(.down)))
+        let cutoff = min(1.0, dstRate / srcRate) * 0.94
+        let halfWidth = 12.0 / cutoff
+        let n = samples.count
         var out = [Float](repeating: 0, count: count)
-        let last = samples.count - 1
-        for i in 0..<count {
-            let src = Double(i) * ratio
-            let i0 = min(Int(src), last)
-            let i1 = min(i0 + 1, last)
-            let frac = Float(src - Double(i0))
-            out[i] = samples[i0] * (1 - frac) + samples[i1] * frac
+        samples.withUnsafeBufferPointer { src in
+            for i in 0..<count {
+                let center = Double(i) * ratio
+                let lo = max(0, Int((center - halfWidth).rounded(.up)))
+                let hi = min(n - 1, Int((center + halfWidth).rounded(.down)))
+                if lo > hi { continue }
+                var acc = 0.0
+                var norm = 0.0
+                for j in lo...hi {
+                    let d = Double(j) - center
+                    let x = d * cutoff
+                    let sinc = abs(x) < 1e-9 ? 1.0 : sin(Double.pi * x) / (Double.pi * x)
+                    let window = 0.5 * (1 + cos(Double.pi * d / halfWidth))
+                    let w = sinc * window
+                    acc += Double(src[j]) * w
+                    norm += w
+                }
+                if abs(norm) > 1e-9 {
+                    out[i] = Float(acc / norm)
+                }
+            }
         }
         return out
     }
