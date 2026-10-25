@@ -59,7 +59,7 @@ struct PipelineView: View {
                     }
 
                     if modelManager.pipelineMode == .personaplex {
-                        Text("\(PersonaPlexSpec.shortName) · Full-Duplex S2S")
+                        Text("\(PersonaPlexSpec.shortName) · PocketTTS 100M")
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
                             .lineLimit(1)
@@ -164,7 +164,10 @@ struct PipelineView: View {
             .sheet(isPresented: $showVoicePicker) {
                 VoiceEnginePickerView(
                     pipeline: pipeline,
-                    onEnginesChanged: { pipeline.invalidateForReload() },
+                    onEnginesChanged: {
+                        // Kick ModelLoadingView so persona mode can swap onto PocketTTS 100M.
+                        pipeline.invalidateForReload()
+                    },
                     onVoiceChanged: { pipeline.setTTSVoice($0) },
                     onExpressionsChanged: { pipeline.setExpressions($0) }
                 )
@@ -177,13 +180,13 @@ struct PipelineView: View {
         if modelManager.pipelineMode == .personaplex {
             switch pipeline.state {
             case .idle:
-                return "Tap to converse (PersonaPlex)"
+                return "Tap to converse"
             case .listening:
-                return "Listening (Full-Duplex)…"
+                return "Listening…"
             case .processing:
-                return "PersonaPlex: thinking…"
+                return "Thinking…"
             case .speaking:
-                return "PersonaPlex: speaking…"
+                return "Speaking…"
             }
         }
 

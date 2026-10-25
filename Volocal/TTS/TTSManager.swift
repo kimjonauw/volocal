@@ -35,6 +35,8 @@ final class TTSManager: ObservableObject {
     private(set) var holdsInferenceGPU = false
     var metrics: SystemMetrics?
     var expressionsEnabled = true
+    /// Slightly higher PocketTTS temperature for persona / phone-call style speech.
+    var conversationalTone = false
 
     /// Shared audio engine — injected by VoicePipeline
     weak var sharedAudio: SharedAudioEngine?
@@ -241,7 +243,12 @@ final class TTSManager: ObservableObject {
 
         var chunks = 0
         let voice = voiceOverride ?? selectedVoice
-        let temperature: Float = whisper ? 0.2 : 0.4
+        let temperature: Float = {
+            if whisper { return 0.2 }
+            // Conversational persona speech needs a little more variation than
+            // the flat 0.4 default — still below values that get noisy.
+            return conversationalTone ? 0.55 : 0.4
+        }()
         let applyWhisper = whisper
         let generation = speakGeneration
 

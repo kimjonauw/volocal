@@ -36,14 +36,14 @@ struct VoiceEnginePickerView: View {
                         }
                     )) {
                         Text("Modular (STT + TTS)").tag(PipelineMode.modular)
-                        Text("PersonaPlex (S2S)").tag(PipelineMode.personaplex)
+                        Text("Persona").tag(PipelineMode.personaplex)
                     }
                     .pickerStyle(.segmented)
                 } header: {
                     Text("Conversation Pipeline")
                 } footer: {
                     if modelManager.pipelineMode == .personaplex {
-                        Text("PersonaPlex-7B full-duplex Speech-to-Speech foundation model. Listens and responds simultaneously with vocal personality.")
+                        Text("Personality profile plus PocketTTS 100M over your language model. Speaks in short, natural turns.")
                     } else {
                         Text("Speech recognition (STT) and expressive voice synthesis (TTS) combined with your active LLM.")
                     }
@@ -74,7 +74,7 @@ struct VoiceEnginePickerView: View {
                     modularSections
                 }
             }
-            .navigationTitle(modelManager.pipelineMode == .personaplex ? "PersonaPlex S2S" : "Voice engines")
+            .navigationTitle(modelManager.pipelineMode == .personaplex ? "Persona conversation" : "Voice engines")
             .navigationBarTitleDisplayMode(.inline)
             .disabled(busyLabel != nil)
             .toolbar {
@@ -130,20 +130,16 @@ struct VoiceEnginePickerView: View {
     @ViewBuilder
     private var personaplexSections: some View {
         Section {
-            VStack(alignment: .leading, spacing: 6) {
-                Text(PersonaPlexSpec.detail)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+            Text(PersonaPlexSpec.detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
 
-            if PersonaPlexSpec.isDownloaded || modelManager.personaPlexState == .downloaded {
+            if PersonaPlexSpec.isDownloaded {
                 HStack {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("PersonaPlex 7B Ready")
-                            .font(.subheadline.bold())
-                        Text("3.8 GB 4-bit weights installed")
+                        Text("Unused Moshi weights on disk")
+                            .font(.subheadline)
+                        Text("An older download. This mode does not load them.")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -155,43 +151,14 @@ struct VoiceEnginePickerView: View {
                             .foregroundStyle(.red)
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel("Delete PersonaPlex weights")
-                }
-            } else if case .downloading(let progress) = modelManager.personaPlexState {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        ProgressView()
-                        Text("Downloading PersonaPlex 7B… \(Int(progress * 100))%")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        Button("Cancel") {
-                            modelManager.cancelPersonaPlexDownload()
-                        }
-                        .font(.caption)
-                    }
-                    ProgressView(value: progress)
-                }
-            } else {
-                VStack(alignment: .leading, spacing: 6) {
-                    Button {
-                        modelManager.downloadPersonaPlex()
-                    } label: {
-                        HStack {
-                            Image(systemName: "arrow.down.circle.fill")
-                            Text("Download PersonaPlex 7B (~3.8 GB)")
-                        }
-                    }
-                    Text("Fits inside GetMoreRAM 6.0 GB ceiling on iPhone 17 Pro.")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                    .accessibilityLabel("Delete unused PersonaPlex weights")
                 }
             }
         } header: {
-            Text("Foundation Model")
+            Text("About")
         }
 
-        Section("Persona Personality Profile") {
+        Section("Personality") {
             ForEach(PersonaPlexSpec.defaultPersonas) { profile in
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 4) {
@@ -254,13 +221,13 @@ struct VoiceEnginePickerView: View {
 
                     Button {
                         Task {
-                            let mimiVoice = PersonaPlexSpec.mimiVoice(for: preset.id)
+                            let voice = PersonaPlexSpec.pocketVoice(for: preset.id)
                             if previewingVoice == preset.id && pipeline?.ttsManager.isSpeaking == true {
                                 pipeline?.stopVoicePreview()
                                 previewingVoice = nil
                             } else {
                                 previewingVoice = preset.id
-                                await pipeline?.previewVoice(mimiVoice, displayName: preset.displayName)
+                                await pipeline?.previewVoice(voice, displayName: preset.displayName)
                                 previewingVoice = nil
                             }
                         }

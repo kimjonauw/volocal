@@ -34,7 +34,7 @@ MIT-licensed on-device iOS voice app: modular GGUF LLM, selectable STT/TTS, unsi
 
 - `project.yml` is source of truth; CI runs `xcodegen generate`. Keep `Volocal.xcodeproj` in sync.
 - `Volocal/LLM/` — GGUF load, HF search (`HuggingFaceHub`), native chat prompts (`ChatPrompt`: Gemma 4 / Gemma 3 / Qwen 3 / ChatML / Llama 3).
-- `Volocal/Models/` — downloads, onboarding, `LLMPickerView`, `VoiceEnginePickerView`, `VoiceEngines.swift`.
+- `Volocal/Models/` — downloads, onboarding, `LLMPickerView`, `VoiceEnginePickerView`, `VoiceEngines.swift`. Persona mode is personality + PocketTTS **100M** over the user's LLM — not NVIDIA Moshi S2S. Do not load `aufklarer/PersonaPlex-7B-MLX-*` as a chat model. Prefer valid PocketTTS voice ids only.
 - `Volocal/STT`, `TTS`, `Audio`, `Pipeline` — live loop. `VoicePresence` is a glowing orb: soft color fields inside a circle that swell with the mic and the speaker, the same idea as the ChatGPT and Gemini live spheres. Do not add a face. Hugging Face search rank is a mix of the chips the user turns on (likes, newest, updated, trending, downloads). Default is likes plus newest. Do not sort by downloads alone. Search must not list every repo's files; that burns the anonymous Hub quota and shows up as NSURLError -1011. Opening a repo still hides weights over `PhoneMemoryBudget` (6.5 GB). A quantized 4B stays listed.
 - `.github/workflows/ios-ipa.yml` + `scripts/package-unsigned-ipa.sh` — unsigned device IPA for SideStore.
 

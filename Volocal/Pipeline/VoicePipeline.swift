@@ -136,8 +136,14 @@ final class VoicePipeline: ObservableObject {
                 return
             }
 
-            loadingStatus = "Loading Mimi audio codec..."
-            await ttsManager.initialize(engine: .pocketTtsSmall, voice: PersonaPlexSpec.mimiVoice(for: personaVoice))
+            // 100M PocketTTS — the 18M model sounded thin and robotic for personas.
+            loadingStatus = "Loading PocketTTS 100M..."
+            ttsManager.expressionsEnabled = expressions
+            ttsManager.conversationalTone = true
+            await ttsManager.initialize(
+                engine: .pocketTts,
+                voice: PersonaPlexSpec.pocketVoice(for: personaVoice)
+            )
             guard gen == configureGeneration else { return }
             if let ttsError = ttsManager.error {
                 currentError = ttsError
@@ -181,6 +187,7 @@ final class VoicePipeline: ObservableObject {
         }
 
         ttsManager.expressionsEnabled = expressions
+        ttsManager.conversationalTone = false
         sentenceBuffer.mode = .streaming
         applyInstructions(instructions ?? LLMManager.defaultInstructions)
         setSuppressThinking(suppressThinking)
@@ -257,7 +264,7 @@ final class VoicePipeline: ObservableObject {
 
     func setExpressions(_ enabled: Bool) {
         ttsManager.expressionsEnabled = enabled
-        applyInstructions(baseInstructions)
+        updatePromptForCurrentMode()
     }
 
     func applyInstructions(_ text: String) {
@@ -627,7 +634,7 @@ final class VoicePipeline: ObservableObject {
         speakingEndedAt = nil
         let myRevision = turnRevision
         state = .speaking
-        let voiceOverride = pipelineMode == .personaplex ? PersonaPlexSpec.mimiVoice(for: personaVoice) : nil
+        let voiceOverride = pipelineMode == .personaplex ? PersonaPlexSpec.pocketVoice(for: personaVoice) : nil
         speakingTask = Task {
             // Returns when this clause is synthesized and queued — the next
             // clause can generate while this one is still playing.

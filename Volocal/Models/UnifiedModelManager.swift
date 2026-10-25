@@ -27,7 +27,7 @@ enum PipelineMode: String, CaseIterable, Codable, Identifiable {
     var displayName: String {
         switch self {
         case .modular: return "Modular (STT + TTS)"
-        case .personaplex: return "PersonaPlex 7B (S2S)"
+        case .personaplex: return "Persona conversation"
         }
     }
 }
