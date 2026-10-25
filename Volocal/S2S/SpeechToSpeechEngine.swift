@@ -97,6 +97,11 @@ final class SpeechToSpeechEngine: ObservableObject {
     private static let modelId = "mlx-community/LFM2.5-Audio-1.5B-6bit"
     /// 6-bit weights are ~1.3 GB; the decoder and working memory need headroom.
     private static let neededBytes = 2_200_000_000
+    /// Greedy audio sampling and no top-k sort for text. The library's default sampling sorts
+    /// the vocabulary and reads a value back to the CPU for each of the 8 codebooks of every
+    /// audio frame. Greedy audio skips all of that. Audio may sound a bit flatter; set this to
+    /// false to compare with the library's normal sampling.
+    private static let fastSampling = true
 
     @Published private(set) var isLoaded = false
 
@@ -130,11 +135,14 @@ final class SpeechToSpeechEngine: ObservableObject {
             : "a US male voice"
     }
 
-    /// The library's documented speech-to-speech system prompt, plus the voice and one short
-    /// instruction to answer the user instead of introducing itself.
+    /// The library's required opening for speech-to-speech, the voice, then a short persona:
+    /// a relaxed friend, not an assistant. No name is given so there is nothing to introduce.
     private static func systemPrompt(for voiceId: String) -> String {
         "Respond with interleaved text and speech audio. Use \(voiceDescription(for: voiceId)). "
-            + "Answer what the user just said in one or two short sentences. Do not introduce yourself."
+            + "You are a relaxed, curious friend having a casual chat. "
+            + "React to what the person just said the way a real friend would, in one or two short, "
+            + "natural sentences with contractions, and sometimes ask a quick question back. "
+            + "Do not introduce yourself and do not offer help."
     }
 
     // MARK: - Loading
@@ -391,6 +399,13 @@ final class SpeechToSpeechEngine: ObservableObject {
         let chunkFrames = 12
         let overlapFrames = 3
         let startedAt = CFAbsoluteTimeGetCurrent()
+        let fast = Self.fastSampling
+        let config: LFMGenerationConfig = fast
+            ? LFMGenerationConfig(
+                maxNewTokens: 400, temperature: 0.7, topK: 0, topP: 1.0,
+                audioTemperature: 0, audioTopK: 1
+            )
+            : LFMGenerationConfig(maxNewTokens: 400)
 
         responseTask = Task.detached(priority: .userInitiated) { [weak self] in
             await previous?.value
@@ -441,7 +456,6 @@ final class SpeechToSpeechEngine: ObservableObject {
             }
 
             do {
-                let config = LFMGenerationConfig(maxNewTokens: 400)
                 for try await (token, modality) in model.generateInterleaved(
                     textTokens: chat.getTextTokens(),
                     audioFeatures: chat.getAudioFeatures(),
@@ -484,11 +498,15 @@ final class SpeechToSpeechEngine: ObservableObject {
             let replyText = processor.decodeText(replyTokens)
             if failure == nil {
                 let total = CFAbsoluteTimeGetCurrent() - startedAt
+                let mode = fast ? "fast" : "normal"
                 if codes.isEmpty {
-                    status?(String(format: "No audio came back after %.1f s (%d text tokens). Text: ", total, replyTokens.count) + replyText)
+                    status?(String(format: "No audio came back after %.1f s (%d text tokens, %@ sampling). Text: ", total, replyTokens.count, mode) + replyText)
                 } else {
+                    // 8-code frames are 0.08 s of speech each.
+                    let audioSeconds = Double(codes.count) * 0.08
+                    let ratio = total / max(audioSeconds, 0.1)
                     let first = firstAudioAt.map { $0 - startedAt } ?? total
-                    status?(String(format: "Replied in %.1f s, first sound after %.1f s (%d frames): ", total, first, codes.count) + replyText)
+                    status?(String(format: "Replied in %.1f s for %.1f s of audio (%.1fx the audio length), first sound after %.1f s, %@ sampling: ", total, audioSeconds, ratio, first, mode) + replyText)
                 }
             }
 
