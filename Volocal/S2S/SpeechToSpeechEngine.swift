@@ -48,11 +48,6 @@ private final class AgentGate: @unchecked Sendable {
     }
 }
 
-private struct Exchange {
-    var audio: [Float]
-    var reply: String
-}
-
 /// Takes the first mic channel and downsamples it to 16 kHz by averaging blocks of samples.
 /// This does not depend on AVAudioConverter, which can refuse the Voice Processing format.
 private enum MonoResampler {
@@ -88,6 +83,9 @@ private enum MonoResampler {
 /// the model answers, streaming speech. Talking loudly over the reply for about 0.3 s cuts it off.
 /// It is not full-duplex, so it will not talk over you or backchannel.
 ///
+/// Every turn is stateless: the model gets only your latest recording. Re-feeding earlier
+/// recordings made each turn slower and taught the model to repeat its own greeting.
+///
 /// Mic audio comes from `SharedAudioEngine` (Voice Processing echo cancellation) and is converted
 /// to 16 kHz mono. The reply is decoded to 24 kHz and plays through the same engine.
 @MainActor
@@ -108,7 +106,6 @@ final class SpeechToSpeechEngine: ObservableObject {
     private var micTask: Task<Void, Never>?
     private var micContinuation: AsyncStream<AVAudioPCMBuffer>.Continuation?
     private var responseTask: Task<Void, Never>?
-    private var history: [Exchange] = []
     private let gate = AgentGate()
     private var session = 0
     private var voiceId = "NATM0"
@@ -133,9 +130,11 @@ final class SpeechToSpeechEngine: ObservableObject {
             : "a US male voice"
     }
 
-    /// The library's documented speech-to-speech system prompt, plus the voice.
+    /// The library's documented speech-to-speech system prompt, plus the voice and one short
+    /// instruction to answer the user instead of introducing itself.
     private static func systemPrompt(for voiceId: String) -> String {
-        "Respond with interleaved text and speech audio. Use \(voiceDescription(for: voiceId))."
+        "Respond with interleaved text and speech audio. Use \(voiceDescription(for: voiceId)). "
+            + "Answer what the user just said in one or two short sentences. Do not introduce yourself."
     }
 
     // MARK: - Loading
@@ -163,8 +162,9 @@ final class SpeechToSpeechEngine: ObservableObject {
             )
         }
 
-        // MLX keeps temporary Metal buffers unless capped.
-        Memory.cacheLimit = 64 * 1024 * 1024
+        // MLX keeps temporary Metal buffers unless capped. There is plenty of room for a
+        // larger cache with this small model, and a tiny cap makes every step re-allocate.
+        Memory.cacheLimit = 256 * 1024 * 1024
 
         LLMLoadFence.markStarting(path: Self.fenceKey, contextSize: 0)
         Self.setStage("loading the model weights")
@@ -203,7 +203,6 @@ final class SpeechToSpeechEngine: ObservableObject {
         model = nil
         processor = nil
         detokenizer = nil
-        history.removeAll()
         isLoaded = false
         Memory.clearCache()
     }
@@ -240,7 +239,6 @@ final class SpeechToSpeechEngine: ObservableObject {
         agentSpeakingCallback = onAgentSpeaking
         finishedCallback = onFinished
         statusCallback = onStatus
-        history.removeAll()
         gate.set(false)
 
         let (stream, continuation) = AsyncStream.makeStream(
@@ -300,13 +298,14 @@ final class SpeechToSpeechEngine: ObservableObject {
                         inTurn = true
                         turnAudio = preroll.flatMap { $0 }
                         preroll.removeAll()
-                        _ = detector.observe(rms: rms, eager: false)
+                        _ = detector.observe(rms: rms, eager: false, quietEnd: 0.55)
                     }
                     continue
                 }
                 wasActive = false
 
-                let decision = detector.observe(rms: rms, eager: false)
+                // No transcript to judge completeness from, so a fixed 0.55 s of quiet ends the turn.
+                let decision = detector.observe(rms: rms, eager: false, quietEnd: 0.55)
                 if decision.feedAsr {
                     if !inTurn {
                         inTurn = true
@@ -383,32 +382,25 @@ final class SpeechToSpeechEngine: ObservableObject {
         gate.set(true)
         responseTask?.cancel()
         let previous = responseTask
-        let exchanges = history
         let systemText = Self.systemPrompt(for: voiceId)
         let gate = self.gate
         let speaking = agentSpeakingCallback
         let finished = finishedCallback
         let status = statusCallback
+        let firstChunkFrames = 6
         let chunkFrames = 12
         let overlapFrames = 3
+        let startedAt = CFAbsoluteTimeGetCurrent()
 
         responseTask = Task.detached(priority: .userInitiated) { [weak self] in
             await previous?.value
             if Task.isCancelled { return }
 
-            // Build the conversation: system line, the last few exchanges, then this turn.
+            // Stateless: system line plus only this turn's recording.
             let chat = ChatState(processor: processor)
             chat.newTurn(role: "system")
             chat.addText(systemText)
             chat.endTurn()
-            for exchange in exchanges {
-                chat.newTurn(role: "user")
-                chat.addAudio(MLXArray(exchange.audio), sampleRate: 16_000)
-                chat.endTurn()
-                chat.newTurn(role: "assistant")
-                chat.addText(exchange.reply)
-                chat.endTurn()
-            }
             chat.newTurn(role: "user")
             chat.addAudio(MLXArray(userAudio), sampleRate: 16_000)
             chat.endTurn()
@@ -418,6 +410,8 @@ final class SpeechToSpeechEngine: ObservableObject {
             var replyTokens: [Int] = []
             var decodedFrames = 0
             var announcedSpeaking = false
+            var firstTokenAt: Double?
+            var firstAudioAt: Double?
             var failure: String?
 
             // Decode frames [decodedFrames ..< end). A few earlier frames are decoded again for
@@ -441,12 +435,13 @@ final class SpeechToSpeechEngine: ObservableObject {
                 }
                 if !announcedSpeaking {
                     announcedSpeaking = true
+                    firstAudioAt = CFAbsoluteTimeGetCurrent()
                     speaking?(true)
                 }
             }
 
             do {
-                let config = LFMGenerationConfig(maxNewTokens: 640)
+                let config = LFMGenerationConfig(maxNewTokens: 400)
                 for try await (token, modality) in model.generateInterleaved(
                     textTokens: chat.getTextTokens(),
                     audioFeatures: chat.getAudioFeatures(),
@@ -455,6 +450,11 @@ final class SpeechToSpeechEngine: ObservableObject {
                 ) {
                     if Task.isCancelled { break }
                     eval(token)
+                    if firstTokenAt == nil {
+                        let now = CFAbsoluteTimeGetCurrent()
+                        firstTokenAt = now
+                        status?(String(format: "Model started after %.1f s", now - startedAt))
+                    }
                     if modality == .text {
                         replyTokens.append(token.item(Int.self))
                         if replyTokens.count % 8 == 0 {
@@ -465,7 +465,9 @@ final class SpeechToSpeechEngine: ObservableObject {
                         // frame and keeps reading; only the stream's end ends the reply.
                         if token[0].item(Int.self) == lfmAudioEOSToken { continue }
                         codes.append(token)
-                        if codes.count - decodedFrames >= chunkFrames {
+                        // A short first chunk gets sound out quickly; later chunks are bigger.
+                        let target = decodedFrames == 0 ? firstChunkFrames : chunkFrames
+                        if codes.count - decodedFrames >= target {
                             await play(decodeChunk(upTo: codes.count))
                         }
                     }
@@ -481,10 +483,12 @@ final class SpeechToSpeechEngine: ObservableObject {
 
             let replyText = processor.decodeText(replyTokens)
             if failure == nil {
+                let total = CFAbsoluteTimeGetCurrent() - startedAt
                 if codes.isEmpty {
-                    status?("No audio came back (\(replyTokens.count) text tokens). Text: " + replyText)
+                    status?(String(format: "No audio came back after %.1f s (%d text tokens). Text: ", total, replyTokens.count) + replyText)
                 } else {
-                    status?("Replied (\(codes.count) audio frames): " + replyText)
+                    let first = firstAudioAt.map { $0 - startedAt } ?? total
+                    status?(String(format: "Replied in %.1f s, first sound after %.1f s (%d frames): ", total, first, codes.count) + replyText)
                 }
             }
 
@@ -493,21 +497,14 @@ final class SpeechToSpeechEngine: ObservableObject {
             if announcedSpeaking { speaking?(false) }
             try? await Task.sleep(for: .milliseconds(300))
             gate.set(false)
+            Memory.clearCache()
 
             let wasCancelled = Task.isCancelled
             await MainActor.run {
                 guard let self, self.session == currentSession, !wasCancelled else { return }
                 if let failure {
                     finished?(failure)
-                    return
                 }
-                self.history.append(Exchange(audio: userAudio, reply: replyText))
-                while self.history.count > 3 { self.history.removeFirst() }
-                var total = self.history.reduce(0) { $0 + $1.audio.count }
-                while total > 16_000 * 45, self.history.count > 1 {
-                    total -= self.history.removeFirst().audio.count
-                }
-                Memory.clearCache()
             }
         }
     }

@@ -14,7 +14,13 @@ final class MicTurnDetector: @unchecked Sendable {
     private var loudRunStart: CFAbsoluteTime = 0
 
     /// `eager` is true when the partial transcript already looks like a finished thought.
-    func observe(rms: Float, eager: Bool) -> (feedAsr: Bool, endTurn: Bool) {
+    /// `quietEnd` overrides how long the quiet must last before the turn ends (used by
+    /// speech-to-speech, which has no transcript to judge completeness from).
+    func observe(
+        rms: Float,
+        eager: Bool,
+        quietEnd: CFAbsoluteTime? = nil
+    ) -> (feedAsr: Bool, endTurn: Bool) {
         lock.lock()
         defer { lock.unlock() }
         let now = CFAbsoluteTimeGetCurrent()
@@ -35,8 +41,8 @@ final class MicTurnDetector: @unchecked Sendable {
         noiseFloor = min(Float(0.028), max(Float(0.0035), noiseFloor * 0.96 + rms * 0.04))
         let quietFor = now - lastSpeechAt
         let noisy = noiseFloor > 0.018
-        let endAfter: CFAbsoluteTime = (eager && !noisy) ? 0.28 : 0.80
-        let feedUntil: CFAbsoluteTime = (eager && !noisy) ? endAfter : 0.40
+        let endAfter: CFAbsoluteTime = quietEnd ?? ((eager && !noisy) ? 0.28 : 0.80)
+        let feedUntil: CFAbsoluteTime = min(endAfter, (eager && !noisy) ? endAfter : 0.40)
         if inUtterance && lastSpeechAt > 0 && quietFor < feedUntil {
             return (true, false)
         }
