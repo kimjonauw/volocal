@@ -96,6 +96,8 @@ actor LlamaContext {
     private var nCur: Int32 = 0
     private var nDecode: Int32 = 0
     private var isDone: Bool = false
+    /// Bytes of a UTF-8 character that a token split in half. Held until the rest arrives.
+    private var pendingBytes: [UInt8] = []
 
     /// Create a new LlamaContext by loading a GGUF model file.
     /// Blocking mmap/Metal work must not run on the main thread.
@@ -257,7 +259,10 @@ actor LlamaContext {
         llama_sampler_chain_add(self.sampling, llama_sampler_init_top_p(0.9, 1))
         llama_sampler_chain_add(self.sampling, llama_sampler_init_min_p(0.05, 1))
         llama_sampler_chain_add(self.sampling, llama_sampler_init_temp(0.7))
-        llama_sampler_chain_add(self.sampling, llama_sampler_init_dist(1234))
+        // UInt32.max is LLAMA_DEFAULT_SEED: a fresh random seed on creation and on every
+        // llama_sampler_reset. A fixed seed was re-applied each turn, so the same prompt
+        // always produced the same reply.
+        llama_sampler_chain_add(self.sampling, llama_sampler_init_dist(UInt32.max))
         logger.info("chat family=\(self.chatFamily.rawValue, privacy: .public) gemmaPrimer=\(self.gemmaThoughtPrimer ? "1" : "0", privacy: .public) hideThink=\(self.hidesThinkUntilClose ? "1" : "0", privacy: .public)")
     }
 
@@ -327,6 +332,7 @@ actor LlamaContext {
     /// Tokenize and evaluate the prompt, preparing for token generation.
     func completionInit(text: String) throws {
         stopTracker.reset()
+        pendingBytes.removeAll()
         let utf8 = text.utf8CString
         let addBos = llama_vocab_get_add_bos(vocab) && !ChatPrompt.startsWithBos(text)
 
@@ -429,6 +435,8 @@ actor LlamaContext {
 
     /// `llama_token_to_piece` does not NUL-terminate. `String(cString:)` walks off
     /// the stack when a piece fills the buffer — crash after a few turns, not OOM.
+    /// A token can also end in the middle of a multi-byte character, so bytes are
+    /// buffered until a whole UTF-8 character is present.
     private func decodeTokenPiece(_ token: llama_token) -> String? {
         var bufSize = 128
         for _ in 0..<4 {
@@ -439,10 +447,45 @@ actor LlamaContext {
                 continue
             }
             if nChars == 0 { return "" }
-            let bytes = buf.prefix(Int(nChars)).map { UInt8(bitPattern: $0) }
-            return String(decoding: bytes, as: UTF8.self)
+            pendingBytes.append(contentsOf: buf.prefix(Int(nChars)).map { UInt8(bitPattern: $0) })
+            return takeCompleteUTF8()
         }
         return nil
+    }
+
+    /// Returns the longest prefix of `pendingBytes` that ends on a whole character and
+    /// keeps any trailing partial character for the next token.
+    private func takeCompleteUTF8() -> String {
+        var end = pendingBytes.count
+        var i = pendingBytes.count - 1
+        var back = 0
+        while i >= 0 && back < 4 {
+            let b = pendingBytes[i]
+            if b & 0xC0 == 0x80 {
+                i -= 1
+                back += 1
+                continue
+            }
+            let needed: Int
+            if b & 0x80 == 0 {
+                needed = 1
+            } else if b & 0xE0 == 0xC0 {
+                needed = 2
+            } else if b & 0xF0 == 0xE0 {
+                needed = 3
+            } else if b & 0xF8 == 0xF0 {
+                needed = 4
+            } else {
+                needed = 1
+            }
+            if pendingBytes.count - i < needed {
+                end = i
+            }
+            break
+        }
+        let ready = Array(pendingBytes[0..<end])
+        pendingBytes = Array(pendingBytes[end...])
+        return String(decoding: ready, as: UTF8.self)
     }
 
     /// Check if generation is complete.
@@ -465,6 +508,7 @@ actor LlamaContext {
         nDecode = 0
         isDone = false
         stopTracker.reset()
+        pendingBytes.removeAll()
     }
 
     private func applyChatTemplate(tmpl: UnsafePointer<CChar>?, messages: [llama_chat_message]) -> String? {

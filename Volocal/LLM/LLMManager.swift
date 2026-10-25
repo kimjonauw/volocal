@@ -105,7 +105,7 @@ final class LLMManager: ObservableObject {
             self.generatePhase = .readingPrompt
         }
         var channelFilter = ThoughtChannelFilter()
-        var preambleFilter = ReasoningPreambleFilter(systemEcho: system)
+        var preambleFilter = SpokenPreambleFilter(systemEcho: system)
         do {
             let collect = { () async throws -> [String] in
                 var pieces: [String] = []
@@ -231,21 +231,38 @@ final class LLMManager: ObservableObject {
                 let startTime = CFAbsoluteTimeGetCurrent()
                 var tokenCount = 0
                 var channelFilter = ThoughtChannelFilter()
-                var preambleFilter = ReasoningPreambleFilter(
+                var preambleFilter = SpokenPreambleFilter(
                     systemEcho: Self.promptWithMemory(promptSystem, memory: memorySnapshot)
                 )
 
                 do {
-                    let fullPrompt = try await ctx.formatChat(
-                        system: Self.promptWithMemory(promptSystem, memory: memorySnapshot),
+                    let systemWithMemory = Self.promptWithMemory(promptSystem, memory: memorySnapshot)
+                    let startDecode: (String) async throws -> Void = { prompt in
+                        if let gpu {
+                            try await gpu.run { try await ctx.completionInit(text: prompt) }
+                        } else {
+                            try await ctx.completionInit(text: prompt)
+                        }
+                    }
+
+                    var fullPrompt = try await ctx.formatChat(
+                        system: systemWithMemory,
                         history: turns,
                         suppressThinking: skipThink
                     )
                     await ctx.clear()
-                    if let gpu {
-                        try await gpu.run { try await ctx.completionInit(text: fullPrompt) }
-                    } else {
-                        try await ctx.completionInit(text: fullPrompt)
+                    do {
+                        try await startDecode(fullPrompt)
+                    } catch LlamaContextError.promptTooLong {
+                        // History plus instructions overflowed the window. Retry with only
+                        // the latest user message instead of silently giving no reply.
+                        fullPrompt = try await ctx.formatChat(
+                            system: systemWithMemory,
+                            history: Array(turns.suffix(1)),
+                            suppressThinking: skipThink
+                        )
+                        await ctx.clear()
+                        try await startDecode(fullPrompt)
                     }
 
                     while !Task.isCancelled {
