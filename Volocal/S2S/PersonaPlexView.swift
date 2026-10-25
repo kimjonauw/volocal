@@ -37,6 +37,42 @@ struct PersonaPlexView: View {
                     }
                 }
 
+                // Live S2S Session Control
+                if manager.isDownloaded {
+                    Section {
+                        VStack(spacing: 12) {
+                            Button {
+                                if manager.isRunning {
+                                    manager.stopSession()
+                                } else {
+                                    Task { await manager.startSession() }
+                                }
+                            } label: {
+                                HStack(spacing: 12) {
+                                    Image(systemName: manager.isRunning ? "stop.fill" : "mic.fill")
+                                        .font(.title2)
+                                    Text(manager.isRunning ? "Stop Conversation" : "Start Live S2S Conversation")
+                                        .font(.headline)
+                                }
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 14)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(manager.isRunning ? .red : Color.accentColor)
+
+                            HStack {
+                                Circle()
+                                    .fill(manager.isRunning ? Color.green : Color.secondary)
+                                    .frame(width: 8, height: 8)
+                                Text(manager.statusText)
+                                    .font(.subheadline)
+                                    .foregroundStyle(manager.isRunning ? .primary : .secondary)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+
                 // Download / Status Section
                 Section("Model Status") {
                     if manager.isDownloading {

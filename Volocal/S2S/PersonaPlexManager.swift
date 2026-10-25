@@ -20,7 +20,7 @@ final class PersonaPlexManager: ObservableObject {
     @Published var currentError: String?
 
     private let runtime = PersonaPlexRuntime()
-    private weak var sharedAudio: SharedAudioEngine?
+    private var sharedAudio: SharedAudioEngine?
     private var sessionTask: Task<Void, Never>?
     private var downloadTask: Task<Void, Never>?
 
@@ -120,6 +120,13 @@ final class PersonaPlexManager: ObservableObject {
         statusText = "Starting PersonaPlex S2S…"
 
         do {
+            if sharedAudio == nil {
+                sharedAudio = SharedAudioEngine()
+            }
+            guard let sharedAudio else {
+                throw PersonaPlexError.inferenceFailed("No audio engine available")
+            }
+
             try await runtime.load(from: PersonaPlexSpec.directory)
 
             let persona = PersonaPlexSpec.defaultPersonas.first { $0.id == selectedPersonaId }?.systemPrompt ?? ""
@@ -127,10 +134,6 @@ final class PersonaPlexManager: ObservableObject {
 
             isRunning = true
             statusText = "Live Duplex Conversation"
-
-            guard let sharedAudio else {
-                throw PersonaPlexError.inferenceFailed("No audio engine attached")
-            }
 
             let (stream, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
             sharedAudio.bridge.inputContinuation = continuation
