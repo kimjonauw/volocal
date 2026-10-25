@@ -10,7 +10,7 @@ enum SpeechToSpeechError: LocalizedError {
     case notEnoughMemory(availableMB: Int, neededMB: Int)
     case notLoaded
     case micFailed(String)
-    case previousCrash
+    case previousCrash(stage: String?)
 
     var errorDescription: String? {
         switch self {
@@ -20,8 +20,9 @@ enum SpeechToSpeechError: LocalizedError {
             return "PersonaPlex is not loaded yet."
         case .micFailed(let message):
             return "Microphone could not start: \(message)"
-        case .previousCrash:
-            return "The last speech-to-speech load was killed by iOS, most likely because it ran out of memory. Make sure GetMoreRAM is on for the LiveContainer host, then tap Try again."
+        case .previousCrash(let stage):
+            let where_ = stage.map { " while \($0)" } ?? ""
+            return "The last speech-to-speech load was killed by iOS\(where_), most likely because it ran out of memory. Make sure GetMoreRAM is on for the LiveContainer host, then tap Try again."
         }
     }
 }
@@ -37,8 +38,15 @@ enum SpeechToSpeechError: LocalizedError {
 final class SpeechToSpeechEngine: ObservableObject {
     /// Same crash fence the language model uses. A jetsam kill during load must not crash-loop.
     static let fenceKey = "speech-to-speech:personaplex-7b-4bit"
+    /// Which stage was running. Left behind if iOS kills the app, so the next launch can say where.
+    private static let stageKey = "volocal.s2s.stage"
     /// The 4-bit weights alone are ~4.9 to 5.5 GB.
     private static let neededBytes = 5_000_000_000
+    /// The library's warm-up compiles the temporal transformer and runs a dummy pass. It is
+    /// optional (its own CLI only does it behind --compile) and costs extra memory while it
+    /// runs, which is the likeliest reason a 6 GB cap kills the app. Turn it on only when there
+    /// is memory to spare and steps are too slow.
+    private static let warmUpEnabled = false
 
     /// Pre-tokenized SentencePiece ids (the library takes ids, not text):
     /// "You are a helpful assistant. Answer questions clearly and concisely. Listen carefully to
@@ -60,13 +68,30 @@ final class SpeechToSpeechEngine: ObservableObject {
     private var micContinuation: AsyncStream<AVAudioPCMBuffer>.Continuation?
     private var session = 0
 
+    private static func setStage(_ stage: String?) {
+        if let stage {
+            UserDefaults.standard.set(stage, forKey: stageKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: stageKey)
+        }
+        UserDefaults.standard.synchronize()
+    }
+
     // MARK: - Loading
 
     func load(progress: @escaping @Sendable (String) -> Void) async throws {
         if model != nil { return }
 
+        let leftoverStage = UserDefaults.standard.string(forKey: Self.stageKey)
+
         if LLMLoadFence.shouldSkipLoad(path: Self.fenceKey) {
-            throw SpeechToSpeechError.previousCrash
+            throw SpeechToSpeechError.previousCrash(stage: leftoverStage)
+        }
+
+        var killNote: String?
+        if let leftoverStage {
+            killNote = "The last session was killed by iOS while \(leftoverStage)."
+            Self.setStage(nil)
         }
 
         let available = Int(os_proc_available_memory())
@@ -78,6 +103,7 @@ final class SpeechToSpeechEngine: ObservableObject {
         }
 
         LLMLoadFence.markStarting(path: Self.fenceKey, contextSize: 0)
+        Self.setStage("loading the model weights")
         do {
             let loaded = try await PersonaPlexModel.fromPretrained(
                 modelId: PersonaPlexModel.defaultModelId,
@@ -85,13 +111,28 @@ final class SpeechToSpeechEngine: ObservableObject {
             ) { fraction, status in
                 progress("\(status) (\(Int(fraction * 100))%)")
             }
-            progress("Warming up (compiling Metal kernels)...")
-            await Task.detached(priority: .userInitiated) { loaded.warmUp() }.value
+            Self.setStage(nil)
+
+            if Self.warmUpEnabled {
+                Self.setStage("compiling Metal kernels (warm-up)")
+                progress("Warming up (compiling Metal kernels)...")
+                await Task.detached(priority: .userInitiated) { loaded.warmUp() }.value
+                Self.setStage(nil)
+            }
+
             model = loaded
             isLoaded = true
             LLMLoadFence.clear()
             logger.info("PersonaPlex loaded")
+
+            // Show the number that decides whether 6 GB is enough.
+            let freeMB = Int(os_proc_available_memory()) / 1_000_000
+            var message = "Loaded. \(freeMB) MB still free."
+            if let killNote { message += " " + killNote }
+            progress(message)
+            try? await Task.sleep(for: .seconds(killNote == nil ? 2 : 4))
         } catch {
+            Self.setStage(nil)
             LLMLoadFence.clear()
             throw error
         }
@@ -142,6 +183,10 @@ final class SpeechToSpeechEngine: ObservableObject {
             micContinuation = nil
             throw SpeechToSpeechError.micFailed(captureError)
         }
+
+        // Left set until a clean stop. If iOS kills the app mid-conversation, the next launch
+        // reports it.
+        Self.setStage("running the conversation")
 
         // Mic buffers (device rate, from Voice Processing) -> 24 kHz mono -> ring buffer.
         micTask = Task.detached(priority: .userInitiated) {
@@ -270,5 +315,7 @@ final class SpeechToSpeechEngine: ObservableObject {
         micContinuation = nil
         sharedAudio.endInputCapture()
         sharedAudio.stopPlayback()
+        // A clean stop: nothing was killed.
+        Self.setStage(nil)
     }
 }
