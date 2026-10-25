@@ -26,6 +26,10 @@ final class VoicePipeline: ObservableObject {
     let llmManager = LLMManager()
     let ttsManager = TTSManager()
     let sharedAudio = SharedAudioEngine()
+    let personaPlexManager = PersonaPlexManager()
+    @Published var pipelineMode: PipelineMode = .modular
+    @Published var personaVoice: String = PersonaPlexSpec.defaultVoice
+    @Published var personaId: String = PersonaPlexSpec.defaultPersonaId
     private let gpuLock = GPUExclusive()
     private let sentenceBuffer = SentenceBuffer()
 
@@ -75,6 +79,7 @@ final class VoicePipeline: ObservableObject {
         llmManager.gpuLock = gpuLock
         ttsManager.gpuLock = gpuLock
         llmManager.inferenceHold = ttsManager
+        personaPlexManager.attach(pipeline: self, sharedAudio: sharedAudio)
         setupCallbacks()
         sttManager.$partialResult
             .receive(on: DispatchQueue.main)
@@ -106,16 +111,41 @@ final class VoicePipeline: ObservableObject {
         instructions: String? = nil,
         contextSize: UInt32 = LLMContextWindow.default,
         expressions: Bool = true,
-        suppressThinking: Bool = true
+        suppressThinking: Bool = true,
+        mode: PipelineMode = .modular,
+        personaVoice: String = PersonaPlexSpec.defaultVoice,
+        personaId: String = PersonaPlexSpec.defaultPersonaId
     ) async {
         configureGeneration += 1
         let gen = configureGeneration
+        self.pipelineMode = mode
+        self.personaVoice = personaVoice
+        self.personaId = personaId
         currentError = nil
         isReady = false
         sharedAudio.start()
         sttManager.sharedAudio = sharedAudio
         ttsManager.sharedAudio = sharedAudio
         ttsManager.stt = sttManager
+
+        if mode == .personaplex {
+            loadingStatus = "Loading speech recognition..."
+            await sttManager.initialize(engine: stt)
+            guard gen == configureGeneration else { return }
+            if let sttError = sttManager.error {
+                currentError = sttError
+                loadingStatus = nil
+                return
+            }
+
+            loadingStatus = "Loading Mimi audio codec..."
+            await ttsManager.initialize(engine: .pocketTtsSmall, voice: PersonaPlexSpec.mimiVoice(for: personaVoice))
+            guard gen == configureGeneration else { return }
+
+            loadingStatus = nil
+            isReady = true
+            return
+        }
 
         guard let path = llmModelPath else {
             currentError = "No GGUF on this iPhone. Pick a language model first."
@@ -234,7 +264,39 @@ final class VoicePipeline: ObservableObject {
         isReady = false
     }
 
+    func setPipelineMode(_ mode: PipelineMode) {
+        if pipelineMode != mode {
+            if state != .idle {
+                toggleListening()
+            }
+            pipelineMode = mode
+        }
+    }
+
+    func setPersonaVoice(_ voice: String) {
+        personaVoice = voice
+    }
+
+    func setPersonaId(_ id: String) {
+        personaId = id
+    }
+
     func toggleListening() {
+        if pipelineMode == .personaplex {
+            switch state {
+            case .idle:
+                Task {
+                    await personaPlexManager.startSession(
+                        personaId: personaId,
+                        voicePresetId: personaVoice
+                    )
+                }
+            case .listening, .processing, .speaking:
+                personaPlexManager.stopSession()
+            }
+            return
+        }
+
         switch state {
         case .idle:
             startListening()
@@ -246,6 +308,9 @@ final class VoicePipeline: ObservableObject {
     }
 
     func resetChat() {
+        if pipelineMode == .personaplex {
+            personaPlexManager.stopSession()
+        }
         if state == .processing || state == .speaking {
             interrupt()
         }
@@ -295,6 +360,10 @@ final class VoicePipeline: ObservableObject {
     }
 
     private func interrupt() {
+        if pipelineMode == .personaplex {
+            personaPlexManager.interruptSpeaking()
+            return
+        }
         turnRevision += 1
         cancelDraft()
         ttsManager.stop()

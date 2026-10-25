@@ -27,9 +27,26 @@ struct VoiceEnginePickerView: View {
         NavigationStack {
             List {
                 Section {
-                    Text("Speech recognition and voice stay on-device. Changing an engine downloads its weights from Hugging Face if they are not already here.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    Picker("Pipeline Mode", selection: Binding(
+                        get: { modelManager.pipelineMode },
+                        set: { newMode in
+                            modelManager.setPipelineMode(newMode)
+                            pipeline?.setPipelineMode(newMode)
+                            onEnginesChanged?()
+                        }
+                    )) {
+                        Text("Modular (STT + TTS)").tag(PipelineMode.modular)
+                        Text("PersonaPlex (S2S)").tag(PipelineMode.personaplex)
+                    }
+                    .pickerStyle(.segmented)
+                } header: {
+                    Text("Conversation Pipeline")
+                } footer: {
+                    if modelManager.pipelineMode == .personaplex {
+                        Text("PersonaPlex-7B full-duplex Speech-to-Speech foundation model. Listens and responds simultaneously with vocal personality.")
+                    } else {
+                        Text("Speech recognition (STT) and expressive voice synthesis (TTS) combined with your active LLM.")
+                    }
                 }
 
                 if let localError {
@@ -51,98 +68,13 @@ struct VoiceEnginePickerView: View {
                     }
                 }
 
-                Section("Speech recognition") {
-                    ForEach(STTEngine.allCases) { engine in
-                        engineRow(
-                            title: engine.displayName,
-                            detail: engine.detail,
-                            size: engine.sizeDescription,
-                            selected: modelManager.selectedSTT == engine,
-                            ready: engine.isDownloaded(in: FluidAudioCache.asrModelsRoot)
-                        ) {
-                            Task { await pickSTT(engine) }
-                        }
-                    }
+                if modelManager.pipelineMode == .personaplex {
+                    personaplexSections
+                } else {
+                    modularSections
                 }
-
-                Section("Text-to-speech engine") {
-                    ForEach(TTSEngine.allCases) { engine in
-                        engineRow(
-                            title: engine.displayName,
-                            detail: engine.detail,
-                            size: engine.sizeDescription,
-                            selected: modelManager.selectedTTS == engine,
-                            ready: engine.isDownloaded()
-                        ) {
-                            Task { await pickTTS(engine) }
-                        }
-                    }
-                }
-
-                Section {
-                    Toggle(isOn: Binding(
-                        get: { modelManager.ttsExpressionsEnabled },
-                        set: { newValue in
-                            modelManager.setTTSExpressions(newValue)
-                            onExpressionsChanged?(newValue)
-                        }
-                    )) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Laughs, gasps, whispers")
-                                .foregroundStyle(.primary)
-                            Text("[laugh] [gasp] [sigh] play as short cues. [whisper]…[/whisper] lowers the audio. PocketTTS streams; Supertonic-3 is the newer CoreML voice. Kokoro is gone — it crashed this iPhone.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
-
-                if modelManager.selectedTTS == .pocketTts {
-                    Section(
-                        header: Text("Voice cloning"),
-                        footer: Text("Record a 5–10s audio clip or import a WAV/M4A/MP3 file. Audio is encoded on-device using the Mimi Neural Audio Codec into conditioning weights for PocketTTS 100M.")
-                    ) {
-                        Button {
-                            showRecorderSheet = true
-                        } label: {
-                            Label("Record voice clip (5–10s)", systemImage: "mic.badge.plus")
-                        }
-
-                        Button {
-                            showFileImporter = true
-                        } label: {
-                            Label("Import audio file…", systemImage: "square.and.arrow.down")
-                        }
-                    }
-                }
-
-                let allVoices = modelManager.selectedTTS.voiceChoices
-                let clonedVoices = allVoices.filter { TTSManager.isClonedVoice($0.id) }
-                let presetVoices = allVoices.filter { !TTSManager.isClonedVoice($0.id) }
-
-                if !clonedVoices.isEmpty {
-                    Section("My Cloned Voices") {
-                        ForEach(clonedVoices) { voice in
-                            voiceRow(for: voice)
-                                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                                    Button(role: .destructive) {
-                                        deleteClonedVoice(voice.id)
-                                    } label: {
-                                        Label("Delete", systemImage: "trash")
-                                    }
-                                }
-                        }
-                    }
-                }
-
-                Section(clonedVoices.isEmpty ? "Speaker" : "Preset Voices") {
-                    ForEach(presetVoices) { voice in
-                        voiceRow(for: voice)
-                    }
-                }
-                .id(voiceListRefreshID)
             }
-            .navigationTitle("Voice engines")
+            .navigationTitle(modelManager.pipelineMode == .personaplex ? "PersonaPlex S2S" : "Voice engines")
             .navigationBarTitleDisplayMode(.inline)
             .disabled(busyLabel != nil)
             .toolbar {
@@ -193,6 +125,257 @@ struct VoiceEnginePickerView: View {
                 Text("Enter a unique name for this cloned voice.")
             }
         }
+    }
+
+    @ViewBuilder
+    private var personaplexSections: some View {
+        Section {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(PersonaPlexSpec.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if PersonaPlexSpec.isDownloaded || modelManager.personaPlexState == .downloaded {
+                HStack {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("PersonaPlex 7B Ready")
+                            .font(.subheadline.bold())
+                        Text("3.8 GB 4-bit weights installed")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button(role: .destructive) {
+                        modelManager.deletePersonaPlex()
+                    } label: {
+                        Image(systemName: "trash")
+                            .foregroundStyle(.red)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Delete PersonaPlex weights")
+                }
+            } else if case .downloading(let progress) = modelManager.personaPlexState {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        ProgressView()
+                        Text("Downloading PersonaPlex 7B… \(Int(progress * 100))%")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Cancel") {
+                            modelManager.cancelPersonaPlexDownload()
+                        }
+                        .font(.caption)
+                    }
+                    ProgressView(value: progress)
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 6) {
+                    Button {
+                        modelManager.downloadPersonaPlex()
+                    } label: {
+                        HStack {
+                            Image(systemName: "arrow.down.circle.fill")
+                            Text("Download PersonaPlex 7B (~3.8 GB)")
+                        }
+                    }
+                    Text("Fits inside GetMoreRAM 6.0 GB ceiling on iPhone 17 Pro.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        } header: {
+            Text("Foundation Model")
+        }
+
+        Section("Persona Personality Profile") {
+            ForEach(PersonaPlexSpec.defaultPersonas) { profile in
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(profile.title)
+                            .font(.body)
+                            .foregroundStyle(.primary)
+                        Text(profile.summary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if modelManager.personaId == profile.id {
+                        Image(systemName: "checkmark")
+                            .foregroundStyle(Color.accentColor)
+                            .bold()
+                    }
+                }
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    modelManager.setPersonaId(profile.id)
+                    pipeline?.setPersonaId(profile.id)
+                }
+            }
+        }
+
+        Section("Voice Presets") {
+            ForEach(PersonaPlexSpec.voicePresets) { preset in
+                HStack(spacing: 12) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 6) {
+                                Text(preset.displayName)
+                                    .font(.body)
+                                    .foregroundStyle(.primary)
+                                Text(preset.id)
+                                    .font(.caption2.monospaced())
+                                    .padding(.horizontal, 4)
+                                    .padding(.vertical, 1)
+                                    .background(Color.secondary.opacity(0.12))
+                                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                                Text(preset.gender)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Text(preset.description)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        if modelManager.personaVoice == preset.id {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundStyle(Color.accentColor)
+                        }
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        modelManager.setPersonaVoice(preset.id)
+                        pipeline?.setPersonaVoice(preset.id)
+                    }
+
+                    Button {
+                        Task {
+                            let mimiVoice = PersonaPlexSpec.mimiVoice(for: preset.id)
+                            if previewingVoice == preset.id && pipeline?.ttsManager.isSpeaking == true {
+                                pipeline?.stopVoicePreview()
+                                previewingVoice = nil
+                            } else {
+                                previewingVoice = preset.id
+                                await pipeline?.previewVoice(mimiVoice, displayName: preset.displayName)
+                                previewingVoice = nil
+                            }
+                        }
+                    } label: {
+                        Image(systemName: previewingVoice == preset.id && (pipeline?.ttsManager.isSpeaking == true) ? "stop.circle.fill" : "play.circle")
+                            .font(.title3)
+                            .foregroundStyle(Color.accentColor)
+                            .frame(width: 36, height: 36)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel("Preview \(preset.displayName) voice")
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var modularSections: some View {
+        Section {
+            Text("Speech recognition and voice stay on-device. Changing an engine downloads its weights from Hugging Face if they are not already here.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+
+        Section("Speech recognition") {
+            ForEach(STTEngine.allCases) { engine in
+                engineRow(
+                    title: engine.displayName,
+                    detail: engine.detail,
+                    size: engine.sizeDescription,
+                    selected: modelManager.selectedSTT == engine,
+                    ready: engine.isDownloaded(in: FluidAudioCache.asrModelsRoot)
+                ) {
+                    Task { await pickSTT(engine) }
+                }
+            }
+        }
+
+        Section("Text-to-speech engine") {
+            ForEach(TTSEngine.allCases) { engine in
+                engineRow(
+                    title: engine.displayName,
+                    detail: engine.detail,
+                    size: engine.sizeDescription,
+                    selected: modelManager.selectedTTS == engine,
+                    ready: engine.isDownloaded()
+                ) {
+                    Task { await pickTTS(engine) }
+                }
+            }
+        }
+
+        Section {
+            Toggle(isOn: Binding(
+                get: { modelManager.ttsExpressionsEnabled },
+                set: { newValue in
+                    modelManager.setTTSExpressions(newValue)
+                    onExpressionsChanged?(newValue)
+                }
+            )) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Laughs, gasps, whispers")
+                        .foregroundStyle(.primary)
+                    Text("[laugh] [gasp] [sigh] play as short cues. [whisper]…[/whisper] lowers the audio. PocketTTS streams; Supertonic-3 is the newer CoreML voice. Kokoro is gone — it crashed this iPhone.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+
+        if modelManager.selectedTTS == .pocketTts {
+            Section(
+                header: Text("Voice cloning"),
+                footer: Text("Record a 5–10s audio clip or import a WAV/M4A/MP3 file. Audio is encoded on-device using the Mimi Neural Audio Codec into conditioning weights for PocketTTS 100M.")
+            ) {
+                Button {
+                    showRecorderSheet = true
+                } label: {
+                    Label("Record voice clip (5–10s)", systemImage: "mic.badge.plus")
+                }
+
+                Button {
+                    showFileImporter = true
+                } label: {
+                    Label("Import audio file…", systemImage: "square.and.arrow.down")
+                }
+            }
+        }
+
+        let allVoices = modelManager.selectedTTS.voiceChoices
+        let clonedVoices = allVoices.filter { TTSManager.isClonedVoice($0.id) }
+        let presetVoices = allVoices.filter { !TTSManager.isClonedVoice($0.id) }
+
+        if !clonedVoices.isEmpty {
+            Section("My Cloned Voices") {
+                ForEach(clonedVoices) { voice in
+                    voiceRow(for: voice)
+                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                            Button(role: .destructive) {
+                                deleteClonedVoice(voice.id)
+                            } label: {
+                                Label("Delete", systemImage: "trash")
+                            }
+                        }
+                }
+            }
+        }
+
+        Section(clonedVoices.isEmpty ? "Speaker" : "Preset Voices") {
+            ForEach(presetVoices) { voice in
+                voiceRow(for: voice)
+            }
+        }
+        .id(voiceListRefreshID)
     }
 
     @ViewBuilder

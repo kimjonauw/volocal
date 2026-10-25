@@ -14,12 +14,33 @@ private let instructionsKey = "volocal.customInstructions"
 private let contextSizeKey = "volocal.contextSize"
 private let suppressThinkingKey = "volocal.suppressThinking"
 private let onboardedKey = "volocal.hasCompletedOnboarding"
+private let pipelineModeKey = "volocal.pipelineMode"
+private let personaVoiceKey = "volocal.personaPlex.voice"
+private let personaIdKey = "volocal.personaPlex.personaId"
+
+enum PipelineMode: String, CaseIterable, Codable, Identifiable {
+    case modular = "modular"
+    case personaplex = "personaplex"
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .modular: return "Modular (STT + TTS)"
+        case .personaplex: return "PersonaPlex 7B (S2S)"
+        }
+    }
+}
 
 /// Unified model manager tracking download state for STT, TTS, and the selected GGUF.
 @MainActor
 final class UnifiedModelManager: ObservableObject {
     @Published var modelStates: [ModelRegistry.ModelType: ModelState] = [:]
     @Published var error: String?
+    @Published var pipelineMode: PipelineMode = .modular
+    @Published var personaVoice: String = PersonaPlexSpec.defaultVoice
+    @Published var personaId: String = PersonaPlexSpec.defaultPersonaId
+    @Published var personaPlexState: ModelState = .notDownloaded
     @Published var selectedLLM: LLMModelSpec = .default
     @Published var selectedSTT: STTEngine = .parakeetEou320
     @Published var selectedTTS: TTSEngine = .pocketTts
@@ -32,6 +53,7 @@ final class UnifiedModelManager: ObservableObject {
     @Published var hasCompletedOnboarding: Bool = false
     private var llmDownloadGeneration = 0
     private var llmDownloadDelegate: LLMDownloadDelegate?
+    private var personaPlexDownloadGeneration = 0
 
     enum ModelState: Equatable {
         case notDownloaded
@@ -107,6 +129,24 @@ final class UnifiedModelManager: ObservableObject {
         } else {
             suppressThinking = true
         }
+        if let raw = UserDefaults.standard.string(forKey: pipelineModeKey),
+           let mode = PipelineMode(rawValue: raw) {
+            pipelineMode = mode
+        } else {
+            pipelineMode = .modular
+        }
+        if let voice = UserDefaults.standard.string(forKey: personaVoiceKey),
+           PersonaPlexSpec.voicePresets.contains(where: { $0.id == voice }) {
+            personaVoice = voice
+        } else {
+            personaVoice = PersonaPlexSpec.defaultVoice
+        }
+        if let pid = UserDefaults.standard.string(forKey: personaIdKey),
+           PersonaPlexSpec.defaultPersonas.contains(where: { $0.id == pid }) {
+            personaId = pid
+        } else {
+            personaId = PersonaPlexSpec.defaultPersonaId
+        }
         hasCompletedOnboarding = UserDefaults.standard.bool(forKey: onboardedKey)
         checkExistingModels()
     }
@@ -122,7 +162,119 @@ final class UnifiedModelManager: ObservableObject {
         UserDefaults.standard.set(customInstructions, forKey: instructionsKey)
         UserDefaults.standard.set(Int(contextSize), forKey: contextSizeKey)
         UserDefaults.standard.set(suppressThinking, forKey: suppressThinkingKey)
+        UserDefaults.standard.set(pipelineMode.rawValue, forKey: pipelineModeKey)
+        UserDefaults.standard.set(personaVoice, forKey: personaVoiceKey)
+        UserDefaults.standard.set(personaId, forKey: personaIdKey)
         checkExistingModels(preservingLLMDownload: true)
+    }
+
+    func setPipelineMode(_ mode: PipelineMode) {
+        pipelineMode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: pipelineModeKey)
+    }
+
+    func setPersonaVoice(_ voiceId: String) {
+        personaVoice = voiceId
+        UserDefaults.standard.set(voiceId, forKey: personaVoiceKey)
+    }
+
+    func setPersonaId(_ pid: String) {
+        personaId = pid
+        UserDefaults.standard.set(pid, forKey: personaIdKey)
+    }
+
+    func refreshPersonaPlexState() {
+        if PersonaPlexSpec.isDownloaded {
+            personaPlexState = .downloaded
+        } else if case .downloading = personaPlexState {
+            // retain progress
+        } else {
+            personaPlexState = .notDownloaded
+        }
+    }
+
+    func downloadPersonaPlex() {
+        if case .downloading = personaPlexState { return }
+        personaPlexDownloadGeneration += 1
+        let gen = personaPlexDownloadGeneration
+        personaPlexState = .downloading(progress: 0.01)
+        error = nil
+
+        Task {
+            do {
+                let destination = PersonaPlexSpec.directory
+                try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+
+                let files = try await HuggingFaceHub.listMLXFiles(repoId: PersonaPlexSpec.repoId)
+                let total = files.reduce(Int64(0)) { $0 + max($1.sizeBytes ?? 0, 1) }
+
+                var completed: Int64 = 0
+                for file in files {
+                    guard gen == self.personaPlexDownloadGeneration else { return }
+                    guard GGUFFile.isSafeHubPath(file.path) else { continue }
+                    let fileURL = destination.appendingPathComponent(file.path)
+
+                    if FileManager.default.fileExists(atPath: fileURL.path) {
+                        let size = (try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.size] as? Int64) ?? 0
+                        if size > 0 && (file.sizeBytes == nil || size >= (file.sizeBytes ?? 0)) {
+                            completed += size
+                            self.personaPlexState = .downloading(progress: min(Double(completed) / Double(max(total, 1)), 0.99))
+                            continue
+                        }
+                    }
+
+                    try FileManager.default.createDirectory(
+                        at: fileURL.deletingLastPathComponent(),
+                        withIntermediateDirectories: true
+                    )
+
+                    guard let remote = HuggingFaceHub.resolveURL(repoId: PersonaPlexSpec.repoId, path: file.path) else {
+                        throw URLError(.badURL)
+                    }
+
+                    let (tempURL, response) = try await URLSession.shared.download(from: remote)
+                    guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+                        throw URLError(.badServerResponse)
+                    }
+
+                    guard gen == self.personaPlexDownloadGeneration else {
+                        try? FileManager.default.removeItem(at: tempURL)
+                        return
+                    }
+
+                    if FileManager.default.fileExists(atPath: fileURL.path) {
+                        try FileManager.default.removeItem(at: fileURL)
+                    }
+                    try FileManager.default.moveItem(at: tempURL, to: fileURL)
+
+                    let bytes = (try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.size] as? Int64) ?? (file.sizeBytes ?? 0)
+                    completed += bytes
+                    self.personaPlexState = .downloading(progress: min(Double(completed) / Double(max(total, 1)), 0.99))
+                }
+
+                guard gen == self.personaPlexDownloadGeneration else { return }
+                self.personaPlexState = .downloaded
+                logger.info("PersonaPlex 7B downloaded successfully")
+            } catch {
+                if gen == self.personaPlexDownloadGeneration {
+                    self.personaPlexState = .error(error.localizedDescription)
+                    self.error = "PersonaPlex download error: \(error.localizedDescription)"
+                    logger.error("PersonaPlex download failed: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    func cancelPersonaPlexDownload() {
+        personaPlexDownloadGeneration += 1
+        personaPlexState = PersonaPlexSpec.isDownloaded ? .downloaded : .notDownloaded
+    }
+
+    func deletePersonaPlex() {
+        cancelPersonaPlexDownload()
+        try? FileManager.default.removeItem(at: PersonaPlexSpec.directory)
+        personaPlexState = .notDownloaded
+        logger.info("PersonaPlex 7B removed from disk")
     }
 
     func select(_ spec: LLMModelSpec) {
@@ -239,6 +391,7 @@ final class UnifiedModelManager: ObservableObject {
             modelStates[.tts] = .notDownloaded
         }
 
+        refreshPersonaPlexState()
         markOnboardedIfReady()
     }
 

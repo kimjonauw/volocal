@@ -143,7 +143,7 @@ final class TTSManager: ObservableObject {
     }
 
     /// Synthesize text and play through the shared audio engine.
-    func speak(_ text: String) async {
+    func speak(_ text: String, voiceOverride: String? = nil) async {
         let prepared = expressionsEnabled ? text : ExpressionParser.stripNeuralTags(text)
         let segments = ExpressionParser.parse(prepared).compactMap { segment -> SpeechSegment? in
             if case .effect = segment, !expressionsEnabled { return nil }
@@ -193,12 +193,14 @@ final class TTSManager: ObservableObject {
                         chunkCount += try await self.playSynthesized(
                             clause,
                             whisper: false,
+                            voiceOverride: voiceOverride,
                             audio: sharedAudio
                         )
                     case .whisper(let clause):
                         chunkCount += try await self.playSynthesized(
                             clause,
                             whisper: playEffects,
+                            voiceOverride: voiceOverride,
                             audio: sharedAudio
                         )
                     case .effect(let kind):

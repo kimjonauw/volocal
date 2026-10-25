@@ -101,7 +101,10 @@ struct ModelLoadingView: View {
             instructions: modelManager.customInstructions,
             contextSize: modelManager.contextSize,
             expressions: modelManager.ttsExpressionsEnabled,
-            suppressThinking: modelManager.suppressThinking
+            suppressThinking: modelManager.suppressThinking,
+            mode: modelManager.pipelineMode,
+            personaVoice: modelManager.personaVoice,
+            personaId: modelManager.personaId
         )
     }
 }

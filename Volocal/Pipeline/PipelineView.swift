@@ -58,15 +58,29 @@ struct PipelineView: View {
                             .multilineTextAlignment(.center)
                     }
 
-                    Text(modelManager.selectedLLM.displayName)
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(1)
+                    if modelManager.pipelineMode == .personaplex {
+                        Text("\(PersonaPlexSpec.shortName) · Full-Duplex S2S")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
 
-                    Text("\(modelManager.selectedSTT.displayName) · \(modelManager.selectedTTS.displayName) · \(modelManager.selectedTTS.voiceChoices.first { $0.id == modelManager.selectedTTSVoice }?.displayName ?? modelManager.selectedTTSVoice)")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(1)
+                        let personaTitle = PersonaPlexSpec.defaultPersonas.first { $0.id == modelManager.personaId }?.title ?? "Natural Companion"
+                        let voiceName = PersonaPlexSpec.voicePresets.first { $0.id == modelManager.personaVoice }?.displayName ?? modelManager.personaVoice
+                        Text("\(personaTitle) · \(voiceName)")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                    } else {
+                        Text(modelManager.selectedLLM.displayName)
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+
+                        Text("\(modelManager.selectedSTT.displayName) · \(modelManager.selectedTTS.displayName) · \(modelManager.selectedTTS.voiceChoices.first { $0.id == modelManager.selectedTTSVoice }?.displayName ?? modelManager.selectedTTSVoice)")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                    }
 
                     // Current transcript while listening (uses pipeline.partialTranscript)
                     if pipeline.state == .listening && !pipeline.partialTranscript.isEmpty {
@@ -160,6 +174,19 @@ struct PipelineView: View {
     }
 
     private var statusTitle: String {
+        if modelManager.pipelineMode == .personaplex {
+            switch pipeline.state {
+            case .idle:
+                return "Tap to converse (PersonaPlex)"
+            case .listening:
+                return "Listening (Full-Duplex)…"
+            case .processing:
+                return "PersonaPlex: thinking…"
+            case .speaking:
+                return "PersonaPlex: speaking…"
+            }
+        }
+
         switch pipeline.state {
         case .idle:
             return "Tap to start"
