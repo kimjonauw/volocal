@@ -9,6 +9,9 @@ private let logger = Logger(subsystem: "com.volocal.app", category: "pipeline")
 /// Listens for completed utterances from STT, generates LLM responses,
 /// buffers into sentences, and sends to TTS for playback.
 /// Supports barge-in: user can speak while AI is talking to interrupt.
+///
+/// `PipelineMode.personaplex` is different: it is real speech-to-speech (PersonaPlex 7B), so
+/// none of the recognizer, language model or TTS run in that mode.
 @MainActor
 final class VoicePipeline: ObservableObject {
     @Published var state: PipelineState = .idle {
@@ -26,6 +29,7 @@ final class VoicePipeline: ObservableObject {
     let llmManager = LLMManager()
     let ttsManager = TTSManager()
     let sharedAudio = SharedAudioEngine()
+    let s2s = SpeechToSpeechEngine()
     @Published var pipelineMode: PipelineMode = .modular
     @Published var personaVoice: String = PersonaPlexSpec.defaultVoice
     @Published var personaId: String = PersonaPlexSpec.defaultPersonaId
@@ -127,69 +131,38 @@ final class VoicePipeline: ObservableObject {
         ttsManager.stt = sttManager
 
         if mode == .personaplex {
-            loadingStatus = "Loading speech recognition..."
-            await sttManager.initialize(engine: stt)
-            guard gen == configureGeneration else { return }
-            if let sttError = sttManager.error {
-                currentError = sttError
-                loadingStatus = nil
-                return
-            }
+            // Real speech-to-speech. PersonaPlex replaces the recognizer, the language model
+            // and the TTS voice, so none of them load. The 4-bit weights are ~5 GB; free
+            // whatever the cascade was holding first.
+            sttManager.stopListening()
+            ttsManager.stop()
+            llmManager.unload()
+            ttsManager.conversationalTone = false
 
-            loadingStatus = "Loading \(tts.displayName)..."
-            ttsManager.expressionsEnabled = expressions
-            ttsManager.conversationalTone = true
-            ttsManager.metrics = metrics
-            let voiceToLoad = PersonaPlexSpec.voice(for: personaVoice, engine: tts)
-            await ttsManager.initialize(
-                engine: tts,
-                voice: voiceToLoad
-            )
-            guard gen == configureGeneration else { return }
-            if let ttsError = ttsManager.error {
-                currentError = ttsError
-                loadingStatus = nil
-                return
-            }
-
-            guard let path = llmModelPath else {
-                currentError = "No language model available on this iPhone. Download a model first."
-                loadingStatus = nil
-                return
-            }
-
-            if LLMLoadFence.shouldSkipLoad(path: path) {
-                currentError = LlamaContextError.crashedLastLaunch.localizedDescription
-                loadingStatus = nil
-                return
-            }
-
-            sentenceBuffer.mode = .streaming
-            setSuppressThinking(suppressThinking)
-            llmManager.contextSize = LLMContextWindow.clamp(contextSize)
-            LLMLoadFence.markStarting(path: path, contextSize: llmManager.contextSize)
-
-            loadingStatus = "Loading language model..."
+            loadingStatus = "Loading PersonaPlex speech-to-speech..."
             do {
-                try await llmManager.loadModel(path: path, displayName: displayName ?? URL(fileURLWithPath: path).lastPathComponent)
+                try await s2s.load { [weak self] text in
+                    Task { @MainActor in
+                        self?.loadingStatus = text
+                    }
+                }
             } catch {
-                LLMLoadFence.clear()
-                logger.error("LLM load failed: \(error.localizedDescription)")
-                currentError = "Model failed to load: \(error.localizedDescription)"
+                guard gen == configureGeneration else { return }
+                logger.error("PersonaPlex load failed: \(error.localizedDescription)")
+                currentError = error.localizedDescription
                 loadingStatus = nil
                 return
             }
-            // The load survived, so it did not crash the app. Nothing after this point
-            // should leave the fence set.
-            LLMLoadFence.clear()
             guard gen == configureGeneration else { return }
-
-            updatePromptForCurrentMode()
 
             loadingStatus = nil
             isReady = true
             return
         }
+
+        // Modular mode: release PersonaPlex so its ~5 GB is free for the cascade.
+        s2s.stop(sharedAudio: sharedAudio)
+        s2s.unload()
 
         guard let path = llmModelPath else {
             currentError = "No GGUF on this iPhone. Pick a language model first."
@@ -317,8 +290,6 @@ final class VoicePipeline: ObservableObject {
                 stopListening()
             }
             pipelineMode = mode
-            // Keep the livelier persona sampling tied to the mode that is actually active.
-            ttsManager.conversationalTone = (mode == .personaplex)
             updatePromptForCurrentMode()
         }
     }
@@ -336,21 +307,24 @@ final class VoicePipeline: ObservableObject {
 
     private func updatePromptForCurrentMode() {
         if pipelineMode == .personaplex {
-            let personaPrompt = PersonaPlexSpec.defaultPersonas.first { $0.id == personaId }?.systemPrompt
-                ?? PersonaPlexSpec.defaultPersonas[0].systemPrompt
-            llmManager.systemPrompt = LLMManager.systemPrompt(
-                from: personaPrompt,
-                expressions: ttsManager.expressionsEnabled
-            )
-        } else {
-            llmManager.systemPrompt = LLMManager.systemPrompt(
-                from: baseInstructions,
-                expressions: ttsManager.expressionsEnabled
-            )
+            // Speech-to-speech takes pre-tokenized prompt ids, not text. Nothing to update.
+            return
         }
+        llmManager.systemPrompt = LLMManager.systemPrompt(
+            from: baseInstructions,
+            expressions: ttsManager.expressionsEnabled
+        )
     }
 
     func toggleListening() {
+        if pipelineMode == .personaplex {
+            if state == .idle {
+                startSpeechToSpeech()
+            } else {
+                stopSpeechToSpeech()
+            }
+            return
+        }
         switch state {
         case .idle:
             startListening()
@@ -387,6 +361,56 @@ final class VoicePipeline: ObservableObject {
         UIApplication.shared.isIdleTimerDisabled = sceneIsActive && state != .idle
     }
 
+    // MARK: - Speech-to-speech (PersonaPlex)
+
+    private func startSpeechToSpeech() {
+        state = .listening
+        currentError = nil
+        let voice = personaVoice
+        Task { @MainActor in
+            do {
+                try await s2s.start(
+                    sharedAudio: sharedAudio,
+                    voiceId: voice,
+                    onAgentSpeaking: { [weak self] speaking in
+                        Task { @MainActor in
+                            guard let self, self.pipelineMode == .personaplex, self.state != .idle else { return }
+                            self.state = speaking ? .speaking : .listening
+                        }
+                    },
+                    onStepTime: { [weak self] milliseconds in
+                        Task { @MainActor in
+                            guard let self, self.pipelineMode == .personaplex, self.state != .idle else { return }
+                            if milliseconds > 100 {
+                                self.currentError = String(
+                                    format: "Running slower than real time: %.0f ms per step, needs 80 or less. Expect gaps and stutter.",
+                                    milliseconds
+                                )
+                            } else {
+                                self.currentError = nil
+                            }
+                        }
+                    },
+                    onFinished: { [weak self] message in
+                        Task { @MainActor in
+                            guard let self, self.pipelineMode == .personaplex else { return }
+                            if let message { self.currentError = message }
+                            self.stopSpeechToSpeech()
+                        }
+                    }
+                )
+            } catch {
+                currentError = error.localizedDescription
+                state = .idle
+            }
+        }
+    }
+
+    private func stopSpeechToSpeech() {
+        s2s.stop(sharedAudio: sharedAudio)
+        state = .idle
+    }
+
     // MARK: - Pipeline Control
 
     private func startListening() {
@@ -405,12 +429,20 @@ final class VoicePipeline: ObservableObject {
     }
 
     private func stopListening() {
+        if pipelineMode == .personaplex {
+            stopSpeechToSpeech()
+            return
+        }
         cancelDraft()
         sttManager.stopListening()
         state = .idle
     }
 
     private func interrupt() {
+        if pipelineMode == .personaplex {
+            stopSpeechToSpeech()
+            return
+        }
         turnRevision += 1
         cancelDraft()
         ttsManager.stop()
@@ -655,13 +687,10 @@ final class VoicePipeline: ObservableObject {
         speakingEndedAt = nil
         let myRevision = turnRevision
         state = .speaking
-        let voiceOverride = pipelineMode == .personaplex
-            ? PersonaPlexSpec.voice(for: personaVoice, engine: ttsManager.engineKind)
-            : nil
         speakingTask = Task {
             // Returns when this clause is synthesized and queued — the next
             // clause can generate while this one is still playing.
-            await ttsManager.speak(sentence, voiceOverride: voiceOverride)
+            await ttsManager.speak(sentence, voiceOverride: nil)
             speakingEndedAt = Date()
             guard !Task.isCancelled, myRevision == turnRevision else { return }
             speakingTask = nil
