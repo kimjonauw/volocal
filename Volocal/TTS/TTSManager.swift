@@ -139,7 +139,13 @@ final class TTSManager: ObservableObject {
     private func superonicStyle(named name: String) async throws -> Supertonic3VoiceStyle {
         if let cached = superonicStyles[name] { return cached }
         let voice = Supertonic3Voice(name: name) ?? .f1
-        let style = try await Supertonic3ResourceDownloader.loadVoiceStyle(voice)
+        let style: Supertonic3VoiceStyle
+        do {
+            style = try await Supertonic3ResourceDownloader.loadVoiceStyle(voice)
+        } catch {
+            _ = try await Supertonic3ResourceDownloader.downloadVoiceStyle(voice)
+            style = try await Supertonic3ResourceDownloader.loadVoiceStyle(voice)
+        }
         superonicStyles[voice.rawValue] = style
         return style
     }
@@ -245,9 +251,9 @@ final class TTSManager: ObservableObject {
         let voice = voiceOverride ?? selectedVoice
         let temperature: Float = {
             if whisper { return 0.2 }
-            // Conversational persona speech needs a little more variation than
-            // the flat 0.4 default — still below values that get noisy.
-            return conversationalTone ? 0.55 : 0.4
+            // 0.40 provides stable acoustic token sampling with high vocal clarity
+            // and natural prosody, avoiding the slurring/rasping artifacts of higher temperatures.
+            return 0.4
         }()
         let applyWhisper = whisper
         let generation = speakGeneration

@@ -43,7 +43,7 @@ struct VoiceEnginePickerView: View {
                     Text("Conversation Pipeline")
                 } footer: {
                     if modelManager.pipelineMode == .personaplex {
-                        Text("Personality profile plus PocketTTS 100M over your language model. Speaks in short, natural turns.")
+                        Text("Personality profile plus high-fidelity voice synthesis over your language model. Speaks in short, natural turns.")
                     } else {
                         Text("Speech recognition (STT) and expressive voice synthesis (TTS) combined with your active LLM.")
                     }
@@ -158,6 +158,30 @@ struct VoiceEnginePickerView: View {
             Text("About")
         }
 
+        Section {
+            Picker("Acoustic Engine", selection: Binding(
+                get: { modelManager.selectedTTS },
+                set: { newEngine in
+                    Task { await pickTTS(newEngine) }
+                }
+            )) {
+                ForEach(TTSEngine.allCases) { engine in
+                    Text(engine.displayName).tag(engine)
+                }
+            }
+            .pickerStyle(.menu)
+
+            Text(modelManager.selectedTTS == .supertonic3
+                ? "Studio-quality CoreML flow matching with rich human prosody and natural cadence."
+                : modelManager.selectedTTS.detail)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        } header: {
+            Text("Voice Synthesis Engine")
+        } footer: {
+            Text("Presets automatically adapt to whichever acoustic engine is selected.")
+        }
+
         Section("Personality") {
             ForEach(PersonaPlexSpec.defaultPersonas) { profile in
                 HStack(alignment: .top) {
@@ -221,7 +245,7 @@ struct VoiceEnginePickerView: View {
 
                     Button {
                         Task {
-                            let voice = PersonaPlexSpec.pocketVoice(for: preset.id)
+                            let voice = PersonaPlexSpec.voice(for: preset.id, engine: modelManager.selectedTTS)
                             if previewingVoice == preset.id && pipeline?.ttsManager.isSpeaking == true {
                                 pipeline?.stopVoicePreview()
                                 previewingVoice = nil

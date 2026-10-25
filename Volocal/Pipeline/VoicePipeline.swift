@@ -136,13 +136,13 @@ final class VoicePipeline: ObservableObject {
                 return
             }
 
-            // 100M PocketTTS — the 18M model sounded thin and robotic for personas.
-            loadingStatus = "Loading PocketTTS 100M..."
+            loadingStatus = "Loading \(tts.displayName)..."
             ttsManager.expressionsEnabled = expressions
             ttsManager.conversationalTone = true
+            let voiceToLoad = PersonaPlexSpec.voice(for: personaVoice, engine: tts)
             await ttsManager.initialize(
-                engine: .pocketTts,
-                voice: PersonaPlexSpec.pocketVoice(for: personaVoice)
+                engine: tts,
+                voice: voiceToLoad
             )
             guard gen == configureGeneration else { return }
             if let ttsError = ttsManager.error {
@@ -242,7 +242,7 @@ final class VoicePipeline: ObservableObject {
 
     func previewVoice(_ voiceId: String, displayName: String? = nil) async {
         let label = displayName ?? voiceId.capitalized
-        let text = "Hello! This is a preview of the \(label) voice in Volocal."
+        let text = "Hey there! This is what the \(label) voice sounds like in Volocal."
         await ttsManager.speakPreview(text, voice: voiceId)
     }
 
@@ -634,7 +634,9 @@ final class VoicePipeline: ObservableObject {
         speakingEndedAt = nil
         let myRevision = turnRevision
         state = .speaking
-        let voiceOverride = pipelineMode == .personaplex ? PersonaPlexSpec.pocketVoice(for: personaVoice) : nil
+        let voiceOverride = pipelineMode == .personaplex
+            ? PersonaPlexSpec.voice(for: personaVoice, engine: ttsManager.engineKind)
+            : nil
         speakingTask = Task {
             // Returns when this clause is synthesized and queued — the next
             // clause can generate while this one is still playing.

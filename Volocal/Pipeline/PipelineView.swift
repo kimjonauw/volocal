@@ -59,7 +59,7 @@ struct PipelineView: View {
                     }
 
                     if modelManager.pipelineMode == .personaplex {
-                        Text("\(PersonaPlexSpec.shortName) · PocketTTS 100M")
+                        Text("\(PersonaPlexSpec.shortName) · \(modelManager.selectedTTS.displayName)")
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
                             .lineLimit(1)

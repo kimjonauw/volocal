@@ -1,12 +1,11 @@
 import Foundation
 
-/// Persona conversation mode: personality profiles plus PocketTTS 100M voices.
-/// Real NVIDIA PersonaPlex is audio-to-audio Moshi and is not available on this
-/// iPhone path — these presets are the natural spoken stand-in.
+/// Persona conversation mode: personality profiles paired with high-fidelity voices
+/// (Supertonic-3 CoreML flow matching or PocketTTS 100M) over your language model.
 struct PersonaPlexSpec {
     static let displayName = "Persona conversation"
     static let shortName = "Persona"
-    static let detail = "Personality profile plus a natural PocketTTS 100M voice over your language model. True PersonaPlex Moshi speech-to-speech is not available on this iPhone."
+    static let detail = "Personality profile paired with natural voice synthesis (Supertonic-3 CoreML or PocketTTS 100M) over your local language model."
 
     /// Kept so old downloads can still be deleted from disk.
     static let repoId = "aufklarer/PersonaPlex-7B-MLX-4bit"
@@ -35,32 +34,51 @@ struct PersonaPlexSpec {
         let displayName: String
         let description: String
         let gender: String
-        /// PocketTTS 100M speaker id. Must exist in TTSEngine.pocketTts.voiceNames.
+        /// PocketTTS speaker id.
         let pocketVoice: String
+        /// Supertonic-3 speaker id (F1..F5, M1..M5).
+        let supertonicVoice: String
     }
 
     static let voicePresets: [VoicePreset] = [
-        VoicePreset(id: "NATF0", displayName: "Warm Woman", description: "Soft, conversational", gender: "Female", pocketVoice: "fantine"),
-        VoicePreset(id: "NATF1", displayName: "Clear Woman", description: "Bright and direct", gender: "Female", pocketVoice: "cosette"),
-        VoicePreset(id: "NATF2", displayName: "Gentle Woman", description: "Quiet, unhurried", gender: "Female", pocketVoice: "alba"),
-        VoicePreset(id: "NATF3", displayName: "Expressive Woman", description: "Animated and lively", gender: "Female", pocketVoice: "eponine"),
-        VoicePreset(id: "NATM0", displayName: "Warm Man", description: "Friendly, mid tone", gender: "Male", pocketVoice: "marius"),
-        VoicePreset(id: "NATM1", displayName: "Casual Man", description: "Easy and open", gender: "Male", pocketVoice: "jean"),
-        VoicePreset(id: "NATM2", displayName: "Steady Man", description: "Calm, grounded", gender: "Male", pocketVoice: "javert"),
-        VoicePreset(id: "NATM3", displayName: "Bright Man", description: "Crisp pace", gender: "Male", pocketVoice: "jean"),
-        VoicePreset(id: "VARF0", displayName: "Soft Woman", description: "Light and airy", gender: "Female", pocketVoice: "azelma"),
-        VoicePreset(id: "VARM0", displayName: "Deep Man", description: "Lower, deliberate", gender: "Male", pocketVoice: "javert"),
+        VoicePreset(id: "NATF0", displayName: "Warm Woman", description: "Soft, conversational & engaging", gender: "Female", pocketVoice: "fantine", supertonicVoice: "F1"),
+        VoicePreset(id: "NATF1", displayName: "Clear Woman", description: "Bright, direct & articulate", gender: "Female", pocketVoice: "cosette", supertonicVoice: "F2"),
+        VoicePreset(id: "NATF2", displayName: "Gentle Woman", description: "Quiet, calm & unhurried", gender: "Female", pocketVoice: "alba", supertonicVoice: "F3"),
+        VoicePreset(id: "NATF3", displayName: "Expressive Woman", description: "Animated, lively & upbeat", gender: "Female", pocketVoice: "eponine", supertonicVoice: "F4"),
+        VoicePreset(id: "VARF0", displayName: "Soft Woman", description: "Light, airy & delicate", gender: "Female", pocketVoice: "azelma", supertonicVoice: "F5"),
+        VoicePreset(id: "NATM0", displayName: "Warm Man", description: "Friendly, natural & mid-tone", gender: "Male", pocketVoice: "marius", supertonicVoice: "M1"),
+        VoicePreset(id: "NATM1", displayName: "Casual Man", description: "Easygoing, open & relaxed", gender: "Male", pocketVoice: "jean", supertonicVoice: "M2"),
+        VoicePreset(id: "NATM2", displayName: "Steady Man", description: "Calm, grounded & reassuring", gender: "Male", pocketVoice: "javert", supertonicVoice: "M3"),
+        VoicePreset(id: "NATM3", displayName: "Bright Man", description: "Crisp, dynamic & confident", gender: "Male", pocketVoice: "marius", supertonicVoice: "M5"),
+        VoicePreset(id: "VARM0", displayName: "Deep Man", description: "Low, deliberate & resonant", gender: "Male", pocketVoice: "javert", supertonicVoice: "M4"),
     ]
 
     static let defaultVoice = "NATF0"
 
-    /// PocketTTS speaker for a persona preset. Always a real 100M voice name.
-    static func pocketVoice(for presetId: String) -> String {
-        voicePresets.first { $0.id == presetId }?.pocketVoice
-            ?? TTSEngine.pocketTts.defaultVoice
+    /// Resolve voice for preset and active engine.
+    static func voice(for presetId: String, engine: TTSEngine) -> String {
+        guard let preset = voicePresets.first(where: { $0.id == presetId }) else {
+            return engine.defaultVoice
+        }
+        switch engine {
+        case .supertonic3:
+            return preset.supertonicVoice
+        case .pocketTts, .pocketTtsSmall:
+            return preset.pocketVoice
+        }
     }
 
-    /// Older call sites used this name for the PocketTTS mapping.
+    /// PocketTTS speaker for a persona preset. Always a real 100M voice name.
+    static func pocketVoice(for presetId: String) -> String {
+        voice(for: presetId, engine: .pocketTts)
+    }
+
+    /// Supertonic-3 speaker for a persona preset.
+    static func supertonicVoice(for presetId: String) -> String {
+        voice(for: presetId, engine: .supertonic3)
+    }
+
+    /// Backward compatibility for older call sites.
     static func mimiVoice(for presetId: String) -> String {
         pocketVoice(for: presetId)
     }
@@ -72,9 +90,14 @@ struct PersonaPlexSpec {
         let systemPrompt: String
     }
 
-    /// Spoken-first prompts: short turns, natural cadence, no essay answers.
+    /// Spoken-first rules: brief turns, natural cadence, phone-call realism, contractions, no robotic markdown.
     private static let spokenRules = """
-    Reply as spoken conversation, not as written text. Keep answers to one or two short sentences unless the user asks for more. Use everyday words. Do not list steps, use markdown, or narrate your reasoning. Prefer contractions. Sound like a person on a phone call.
+    CRITICAL SPOKEN CONVERSATION RULES:
+    1. You are speaking out loud on a phone call. Reply in genuine, natural conversational English.
+    2. Keep responses brief and punchy — 1 to 2 spoken sentences per turn. Let the conversation flow back and forth.
+    3. Always use contractions ("I'm", "it's", "you're", "don't", "can't", "that's") to sound like a real person.
+    4. NEVER use markdown, formatting, asterisks (*sigh*, *laughs*), bullet points, numbered lists, emojis, or hashtags. Speak only words meant to be heard aloud.
+    5. Avoid robotic clichés like "As an AI", "Certainly!", "Sure thing!", or "How can I assist you today?". Be human and grounded.
     """
 
     static let defaultPersonas: [PersonaProfile] = [
@@ -83,34 +106,43 @@ struct PersonaPlexSpec {
             title: "Natural Companion",
             summary: "Warm friend on a call — curious, brief, human.",
             systemPrompt: """
-            You are a warm conversational partner on a voice call. Match the user's energy. Ask a short follow-up when it feels natural.
+            You are a warm, genuine conversational partner on a voice call. You listen closely, share natural reactions ("Oh really?", "That makes a lot of sense", "Yeah, totally"), and ask engaging, curious follow-up questions when fitting. Keep your tone relaxed, friendly, and human.
             \(spokenRules)
             """
         ),
         PersonaProfile(
             id: "direct",
             title: "Direct Assistant",
-            summary: "Crisp answers with no filler.",
+            summary: "Crisp answers with zero filler.",
             systemPrompt: """
-            You are a sharp personal assistant on a voice call. Lead with the answer. Skip pleasantries.
+            You are a sharp, concise, and articulate assistant on a voice call. Give the answer immediately without pleasantries, preamble, or filler. Clear, direct, and completely natural.
             \(spokenRules)
             """
         ),
         PersonaProfile(
             id: "witty",
             title: "Witty & Playful",
-            summary: "Light banter without overdoing it.",
+            summary: "Quick-witted banter and light humor.",
             systemPrompt: """
-            You are a playful conversationalist on a voice call. One light joke or aside is enough — then be helpful.
+            You are a clever, quick-witted conversationalist on a voice call. You enjoy playful banter, light sarcasm, and sharp humor, but always remain helpful and friendly.
             \(spokenRules)
             """
         ),
         PersonaProfile(
             id: "calm",
             title: "Calm & Grounded",
-            summary: "Slow, steady, reassuring tone.",
+            summary: "Slow, steady, reassuring presence.",
             systemPrompt: """
-            You are a calm presence on a voice call. Speak slowly and reassuringly. Leave space; do not rush.
+            You are a calm, soothing presence on a voice call. Speak with an unhurried, peaceful cadence. Reassuring, thoughtful, and steady.
+            \(spokenRules)
+            """
+        ),
+        PersonaProfile(
+            id: "storyteller",
+            title: "Expressive Storyteller",
+            summary: "Rich, vivid spoken rhythm and imagery.",
+            systemPrompt: """
+            You are an expressive, imaginative companion on a voice call. Use vivid, rhythmic spoken language with natural cadence and colorful phrasing.
             \(spokenRules)
             """
         ),

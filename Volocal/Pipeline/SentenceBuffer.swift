@@ -70,37 +70,39 @@ final class SentenceBuffer {
     private func findSentenceBoundary() -> Range<String.Index>? {
         for i in buffer.indices {
             let char = buffer[i]
-            let nextIndex = buffer.index(after: i)
-            guard nextIndex < buffer.endIndex else { continue }
+            guard char == "." || char == "!" || char == "?" else { continue }
             if isInsideExpression(at: i) { continue }
-            let nextChar = buffer[nextIndex]
+            if char == "." && isLikelyAbbreviation(before: i) { continue }
 
-            if char == "!" || char == "?" {
-                if nextChar == " " || nextChar == "\n" || nextChar == "\"" || nextChar == "\u{201D}" {
-                    return i..<nextIndex
+            var boundary = buffer.index(after: i)
+            // Consume trailing closing quotes or parens: ." !" ?" .) !] etc.
+            while boundary < buffer.endIndex {
+                let ch = buffer[boundary]
+                if ch == "\"" || ch == "\u{201D}" || ch == "'" || ch == "\u{2019}" || ch == ")" || ch == "]" {
+                    boundary = buffer.index(after: boundary)
+                } else {
+                    break
                 }
             }
 
-            if char == "." {
-                if isLikelyAbbreviation(before: i) { continue }
-                if nextChar == " " || nextChar == "\n" {
-                    return i..<nextIndex
-                }
-                if nextChar == "\"" || nextChar == "\u{201D}" {
-                    return i..<nextIndex
+            // Must be followed by whitespace
+            if boundary < buffer.endIndex {
+                if buffer[boundary].isWhitespace {
+                    return i..<boundary
                 }
             }
         }
         return nil
     }
 
-    /// Index just past the first speakable chunk. Nil until a comma clause of
-    /// 4+ words, or an 11th word proves the first 10 are complete.
+    /// Index just past the first speakable chunk.
+    /// Emits on a natural major clause boundary (semicolon, colon, em-dash,
+    /// or a substantive comma clause of 8+ words) so speech starts without
+    /// waiting for long run-on sentences, while avoiding mid-phrase crumbs.
     private func earlyClauseEnd() -> String.Index? {
         guard !hasIncompleteExpression(buffer) else { return nil }
         var words = 0
         var inWord = false
-        var tenthWordEnd: String.Index?
         for i in buffer.indices {
             if isInsideExpression(at: i) { return nil }
             let ch = buffer[i]
@@ -112,16 +114,27 @@ final class SentenceBuffer {
                 words += 1
                 inWord = true
             }
-            if (ch == "," || ch == ";") && words >= 4 {
+
+            // Semicolon or colon with at least 4 preceding words
+            if (ch == ";" || ch == ":") && words >= 4 {
                 let next = buffer.index(after: i)
                 if next < buffer.endIndex, buffer[next].isWhitespace {
                     return next
                 }
             }
-            if words == 10 {
-                tenthWordEnd = buffer.index(after: i)
-            } else if words > 10, let end = tenthWordEnd {
-                return end
+
+            // Em-dash (—) with at least 4 preceding words
+            if ch == "—" && words >= 4 {
+                let next = buffer.index(after: i)
+                return next
+            }
+
+            // Substantive introductory clause with a comma (at least 8 words)
+            if ch == "," && words >= 8 {
+                let next = buffer.index(after: i)
+                if next < buffer.endIndex, buffer[next].isWhitespace {
+                    return next
+                }
             }
         }
         return nil
@@ -149,19 +162,34 @@ final class SentenceBuffer {
 
     private func isLikelyAbbreviation(before period: String.Index) -> Bool {
         var start = period
-        var letters = 0
+        var letters: [Character] = []
         while start > buffer.startIndex {
             let prev = buffer.index(before: start)
             let ch = buffer[prev]
             if ch.isLetter {
-                letters += 1
+                letters.append(ch)
                 start = prev
-                if letters > 3 { return false }
+                if letters.count > 6 { break }
             } else {
                 break
             }
         }
-        return letters == 1 || letters == 2
+        guard !letters.isEmpty else { return false }
+        let word = String(letters.reversed()).lowercased()
+
+        // Single uppercase letter initial (e.g. "John F. Kennedy")
+        if word.count == 1 {
+            let originalChar = buffer[start]
+            return originalChar.isUppercase
+        }
+
+        // Standard abbreviations ending in period
+        let knownAbbreviations: Set<String> = [
+            "mr", "mrs", "ms", "dr", "prof", "sr", "jr",
+            "vs", "etc", "eg", "ie", "st", "ave", "rd",
+            "blvd", "dept", "approx", "gen", "gov", "sgt", "cpt", "col"
+        ]
+        return knownAbbreviations.contains(word)
     }
 
     private func hasIncompleteExpression(_ s: String) -> Bool {
