@@ -14,20 +14,21 @@ enum NonverbalSynth {
     }
 
     private static func laugh() -> [Float] {
-        let pitches: [Double] = [310, 390, 280, 360, 300]
+        // Soft breathy chuckle pulses instead of synthetic sine tones
         var out: [Float] = []
         var seed: UInt64 = 0xC0FFEE
-        for (i, pitch) in pitches.enumerated() {
-            let n = Int(sampleRate * 0.085)
+        let pulses = 3
+        for i in 0..<pulses {
+            let n = Int(sampleRate * 0.08)
+            var lp: Double = 0
             for t in 0..<n {
                 let env = sin(Double.pi * Double(t) / Double(max(n, 1)))
-                let phase = 2 * Double.pi * pitch * Double(t) / sampleRate
-                let buzz = sin(phase) * 0.62 + sin(2 * phase) * 0.16
-                let air = nextNoise(&seed) * 0.07
-                out.append(Float((buzz + air) * env * 0.42))
+                let white = nextNoise(&seed)
+                lp = lp * 0.85 + white * 0.15
+                out.append(Float(lp * env * 0.18))
             }
-            if i < pitches.count - 1 {
-                out.append(contentsOf: [Float](repeating: 0, count: Int(sampleRate * 0.038)))
+            if i < pulses - 1 {
+                out.append(contentsOf: [Float](repeating: 0, count: Int(sampleRate * 0.04)))
             }
         }
         return out
