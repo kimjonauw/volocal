@@ -23,16 +23,16 @@ packages:
     revision: "c79c4106b954f81205113c3343e5a7e59a1089b5"
   mlx-swift-lm:
     url: https://github.com/ml-explore/mlx-swift-lm
-    exactVersion: "3.31.4"
+    exactVersion: "3.32.3"
   swift-huggingface:
     url: https://github.com/huggingface/swift-huggingface
     from: "0.9.0"
   swift-transformers:
     url: https://github.com/huggingface/swift-transformers
     from: "1.3.0"
-  speech-swift:
-    url: https://github.com/soniqo/speech-swift.git
-    revision: "cbad3be29480825707890490f446b19d7288be2d"
+  mlx-audio-swift:
+    url: https://github.com/Blaizzy/mlx-audio-swift.git
+    revision: "6fd938669e45412f5c35e011e7086ecd20397dbd"
 
 targets:
   Volocal:
@@ -70,10 +70,8 @@ targets:
         product: HuggingFace
       - package: swift-transformers
         product: Tokenizers
-      - package: speech-swift
-        product: PersonaPlex
-      - package: speech-swift
-        product: AudioCommon
+      - package: mlx-audio-swift
+        product: MLXAudioSTS
     info:
       path: Volocal/Info.plist
       properties:

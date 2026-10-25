@@ -1,8 +1,8 @@
 import Foundation
 import AVFoundation
 import os
-import PersonaPlex
-import AudioCommon
+import MLX
+import MLXAudioSTS
 
 private let logger = Logger(subsystem: "com.volocal.app", category: "s2s")
 
@@ -11,62 +11,83 @@ enum SpeechToSpeechError: LocalizedError {
     case notLoaded
     case micFailed(String)
     case previousCrash(stage: String?)
+    case incompleteModel
 
     var errorDescription: String? {
         switch self {
         case .notEnoughMemory(let available, let needed):
-            return "Only \(available) MB is free for Volocal and PersonaPlex needs about \(needed) MB. Turn on GetMoreRAM for the LiveContainer host, then force-quit and reopen Volocal so the speech, language and voice models release their memory."
+            return "Only \(available) MB is free for Volocal and the speech model needs about \(needed) MB. Force-quit and reopen Volocal so the other models release their memory, and make sure GetMoreRAM is on for the LiveContainer host."
         case .notLoaded:
-            return "PersonaPlex is not loaded yet."
+            return "The speech-to-speech model is not loaded yet."
         case .micFailed(let message):
             return "Microphone could not start: \(message)"
         case .previousCrash(let stage):
             let where_ = stage.map { " while \($0)" } ?? ""
-            return "The last speech-to-speech load was killed by iOS\(where_), most likely because it ran out of memory. Make sure GetMoreRAM is on for the LiveContainer host, then tap Try again."
+            return "The last speech-to-speech session was killed by iOS\(where_), most likely because it ran out of memory. Tap Try again."
+        case .incompleteModel:
+            return "The speech model downloaded without its tokenizer or audio decoder. Delete it and try again."
         }
     }
 }
 
-/// Real speech-to-speech: NVIDIA PersonaPlex 7B (4-bit) through the `PersonaPlex` library of
-/// soniqo/speech-swift. It listens and speaks at the same time (`respondRealtime`), one audio
-/// frame per 80 ms step. It replaces the recognizer, the language model and the TTS voice.
+/// True while the model is thinking or its reply is playing. Read from the mic thread.
+private final class AgentGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+
+    var active: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func set(_ newValue: Bool) {
+        lock.lock()
+        value = newValue
+        lock.unlock()
+    }
+}
+
+private struct Exchange {
+    var audio: [Float]
+    var reply: String
+}
+
+/// Real speech-to-speech with Liquid AI's LFM2.5-Audio-1.5B (6-bit, ~1.3 GB) through the
+/// MLXAudioSTS library of mlx-audio-swift. One model hears your audio and answers in audio, so
+/// the recognizer, the language model and the TTS voice are not used in this mode.
 ///
-/// Mic audio comes from `SharedAudioEngine` (Voice Processing echo cancellation), is converted to
-/// 24 kHz mono, and goes into a ring buffer the model reads every step. Agent audio comes back as
-/// 24 kHz frames and plays through the same engine.
+/// It is turn-based, like a voice-assistant call: when you stop talking (energy turn detector)
+/// the model answers, streaming speech. Talking loudly over the reply for about 0.3 s cuts it off.
+/// It is not full-duplex, so it will not talk over you or backchannel.
+///
+/// Mic audio comes from `SharedAudioEngine` (Voice Processing echo cancellation) and is converted
+/// to 16 kHz mono. The reply is decoded to 24 kHz and plays through the same engine.
 @MainActor
 final class SpeechToSpeechEngine: ObservableObject {
     /// Same crash fence the language model uses. A jetsam kill during load must not crash-loop.
-    static let fenceKey = "speech-to-speech:personaplex-7b-4bit"
+    static let fenceKey = "speech-to-speech:lfm2.5-audio-1.5b-6bit"
     /// Which stage was running. Left behind if iOS kills the app, so the next launch can say where.
     private static let stageKey = "volocal.s2s.stage"
-    /// The 4-bit weights alone are ~4.9 to 5.5 GB.
-    private static let neededBytes = 5_000_000_000
-    /// The library's warm-up compiles the temporal transformer and runs a dummy pass. It is
-    /// optional (its own CLI only does it behind --compile) and costs extra memory while it
-    /// runs, which is the likeliest reason a 6 GB cap kills the app. Turn it on only when there
-    /// is memory to spare and steps are too slow.
-    private static let warmUpEnabled = false
-
-    /// Pre-tokenized SentencePiece ids (the library takes ids, not text):
-    /// "You are a helpful assistant. Answer questions clearly and concisely. Listen carefully to
-    /// what the user says, then respond directly to their question or request. Stay on topic.
-    /// Be concise." Taken from the speech-swift PersonaPlexDemo.
-    private static let systemPromptTokens: [Int32] = [
-        607, 4831, 578, 493, 298, 272, 3850, 5019, 263,
-        506, 1292, 2366, 267, 22876, 362, 263,
-        17453, 6716, 269, 419, 262, 819, 1182, 261, 409,
-        4816, 1312, 269, 347, 560, 307, 2498, 263, 17308,
-        291, 3398, 263, 1451, 22876, 263, 607, 4831, 578,
-    ]
+    private static let modelId = "mlx-community/LFM2.5-Audio-1.5B-6bit"
+    /// 6-bit weights are ~1.3 GB; the decoder and working memory need headroom.
+    private static let neededBytes = 2_200_000_000
 
     @Published private(set) var isLoaded = false
 
-    private var model: PersonaPlexModel?
-    private var inferenceTask: Task<Void, Never>?
+    private var model: LFM2AudioModel?
+    private var processor: LFM2AudioProcessor?
+    private var detokenizer: LFM2AudioDetokenizer?
     private var micTask: Task<Void, Never>?
     private var micContinuation: AsyncStream<AVAudioPCMBuffer>.Continuation?
+    private var responseTask: Task<Void, Never>?
+    private var history: [Exchange] = []
+    private let gate = AgentGate()
     private var session = 0
+    private var voiceId = "NATM0"
+    private weak var sharedAudioRef: SharedAudioEngine?
+    private var agentSpeakingCallback: (@Sendable (Bool) -> Void)?
+    private var finishedCallback: (@Sendable (String?) -> Void)?
 
     private static func setStage(_ stage: String?) {
         if let stage {
@@ -75,6 +96,18 @@ final class SpeechToSpeechEngine: ObservableObject {
             UserDefaults.standard.removeObject(forKey: stageKey)
         }
         UserDefaults.standard.synchronize()
+    }
+
+    /// "US female" or "US male" from the preset id (NATF0..VARM4).
+    private static func voiceDescription(for voiceId: String) -> String {
+        voiceId.contains("F") && !voiceId.hasPrefix("NATM") && !voiceId.hasPrefix("VARM")
+            ? "a US female voice"
+            : "a US male voice"
+    }
+
+    private static func systemPrompt(for voiceId: String) -> String {
+        "Respond with interleaved text and speech audio. Use \(voiceDescription(for: voiceId)). "
+            + "Talk like a warm, natural friend on a phone call. Keep every reply to one or two short sentences."
     }
 
     // MARK: - Loading
@@ -102,30 +135,28 @@ final class SpeechToSpeechEngine: ObservableObject {
             )
         }
 
+        // MLX keeps temporary Metal buffers unless capped.
+        Memory.cacheLimit = 64 * 1024 * 1024
+
         LLMLoadFence.markStarting(path: Self.fenceKey, contextSize: 0)
         Self.setStage("loading the model weights")
         do {
-            let loaded = try await PersonaPlexModel.fromPretrained(
-                modelId: PersonaPlexModel.defaultModelId,
-                offlineMode: false
-            ) { fraction, status in
-                progress("\(status) (\(Int(fraction * 100))%)")
+            progress("Loading LFM2.5-Audio (about 1.3 GB, downloads the first time)...")
+            let loaded = try await LFM2AudioModel.fromPretrained(Self.modelId)
+            guard let loadedProcessor = loaded.processor, let directory = loaded.modelDirectory else {
+                throw SpeechToSpeechError.incompleteModel
             }
-            Self.setStage(nil)
-
-            if Self.warmUpEnabled {
-                Self.setStage("compiling Metal kernels (warm-up)")
-                progress("Warming up (compiling Metal kernels)...")
-                await Task.detached(priority: .userInitiated) { loaded.warmUp() }.value
-                Self.setStage(nil)
-            }
+            progress("Loading the audio decoder...")
+            let loadedDetokenizer = try LFM2AudioDetokenizer.fromPretrained(modelPath: directory)
 
             model = loaded
+            processor = loadedProcessor
+            detokenizer = loadedDetokenizer
             isLoaded = true
+            Self.setStage(nil)
             LLMLoadFence.clear()
-            logger.info("PersonaPlex loaded")
+            logger.info("LFM2.5-Audio loaded")
 
-            // Show the number that decides whether 6 GB is enough.
             let freeMB = Int(os_proc_available_memory()) / 1_000_000
             var message = "Loaded. \(freeMB) MB still free."
             if let killNote { message += " " + killNote }
@@ -139,15 +170,20 @@ final class SpeechToSpeechEngine: ObservableObject {
     }
 
     func unload() {
-        inferenceTask?.cancel()
-        inferenceTask = nil
+        responseTask?.cancel()
+        responseTask = nil
         model = nil
+        processor = nil
+        detokenizer = nil
+        history.removeAll()
         isLoaded = false
+        Memory.clearCache()
     }
 
     // MARK: - Conversation
 
-    /// Starts the full-duplex loop. Callbacks may be called from any thread.
+    /// Starts listening. Callbacks may be called from any thread. `onStepTime` is unused here
+    /// (kept so the pipeline code is the same for any speech-to-speech engine).
     func start(
         sharedAudio: SharedAudioEngine,
         voiceId: String,
@@ -155,20 +191,26 @@ final class SpeechToSpeechEngine: ObservableObject {
         onStepTime: @escaping @Sendable (Double) -> Void,
         onFinished: @escaping @Sendable (String?) -> Void
     ) async throws {
-        guard let model else { throw SpeechToSpeechError.notLoaded }
+        _ = onStepTime
+        guard model != nil, processor != nil, detokenizer != nil else {
+            throw SpeechToSpeechError.notLoaded
+        }
 
-        // The model is not thread-safe. Let any previous loop finish before starting another.
+        // The model is not thread-safe. Let any previous reply finish before starting again.
         micTask?.cancel()
-        inferenceTask?.cancel()
         micContinuation?.finish()
-        let previous = inferenceTask
+        responseTask?.cancel()
+        let previous = responseTask
         await previous?.value
 
         session += 1
         let currentSession = session
-        let voice = PersonaPlexVoice(rawValue: voiceId) ?? .NATM0
-        let promptTokens = Self.systemPromptTokens
-        let ring = AudioRingBuffer(capacity: 24_000 * 5)
+        self.voiceId = voiceId
+        sharedAudioRef = sharedAudio
+        agentSpeakingCallback = onAgentSpeaking
+        finishedCallback = onFinished
+        history.removeAll()
+        gate.set(false)
 
         let (stream, continuation) = AsyncStream.makeStream(
             of: AVAudioPCMBuffer.self,
@@ -188,24 +230,34 @@ final class SpeechToSpeechEngine: ObservableObject {
         // reports it.
         Self.setStage("running the conversation")
 
-        // Mic buffers (device rate, from Voice Processing) -> 24 kHz mono -> ring buffer.
-        micTask = Task.detached(priority: .userInitiated) {
+        let gate = self.gate
+        micTask = Task.detached(priority: .userInitiated) { [weak self] in
             guard let target = AVAudioFormat(
                 commonFormat: .pcmFormatFloat32,
-                sampleRate: 24_000,
+                sampleRate: 16_000,
                 channels: 1,
                 interleaved: false
             ) else { return }
+
+            let detector = MicTurnDetector()
             var converter: AVAudioConverter?
             var converterInput: AVAudioFormat?
+            var inTurn = false
+            var turnAudio: [Float] = []
+            var preroll: [[Float]] = []
+            var loudSeconds = 0.0
+            var wasActive = false
+
             for await buffer in stream {
                 if Task.isCancelled { break }
+
+                // Mic buffer (device rate) -> 16 kHz mono.
                 if converter == nil || converterInput != buffer.format {
                     converter = AVAudioConverter(from: buffer.format, to: target)
                     converterInput = buffer.format
                 }
                 guard let converter else { continue }
-                let ratio = 24_000 / buffer.format.sampleRate
+                let ratio = 16_000 / buffer.format.sampleRate
                 let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 64
                 guard let out = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: capacity) else { continue }
                 var consumed = false
@@ -220,102 +272,210 @@ final class SpeechToSpeechEngine: ObservableObject {
                     return buffer
                 }
                 if convertError != nil { continue }
-                if let data = out.floatChannelData?[0], out.frameLength > 0 {
-                    ring.write(from: UnsafePointer(data), count: Int(out.frameLength))
+                guard let data = out.floatChannelData?[0], out.frameLength > 0 else { continue }
+                let samples = Array(UnsafeBufferPointer(start: data, count: Int(out.frameLength)))
+
+                let rms = SharedAudioEngine.rmsEnergy(buffer)
+                let bufferSeconds = Double(buffer.frameLength) / buffer.format.sampleRate
+
+                // While the model is thinking or talking, only watch for the user cutting in.
+                if gate.active {
+                    if !wasActive {
+                        wasActive = true
+                        detector.resetUtterance()
+                        inTurn = false
+                        turnAudio = []
+                        loudSeconds = 0
+                    }
+                    preroll.append(samples)
+                    if preroll.count > 6 { preroll.removeFirst() }
+                    loudSeconds = rms >= 0.05 ? loudSeconds + bufferSeconds : 0
+                    if loudSeconds >= 0.3 {
+                        loudSeconds = 0
+                        await self?.interruptResponse(session: currentSession)
+                        wasActive = false
+                        inTurn = true
+                        turnAudio = preroll.flatMap { $0 }
+                        preroll.removeAll()
+                        _ = detector.observe(rms: rms, eager: false)
+                    }
+                    continue
                 }
-            }
-        }
+                wasActive = false
 
-        // All model work stays on this one task (MLX is not thread-safe).
-        inferenceTask = Task.detached(priority: .userInitiated) { [weak self] in
-            let frames = model.respondRealtime(
-                voice: voice,
-                systemPromptTokens: promptTokens,
-                userAudioBuffer: ring,
-                verbose: false
-            )
-
-            let prebufferCount = 3
-            var prebuffer: [[Float]] = []
-            var started = false
-            var lastFrameAt = CFAbsoluteTimeGetCurrent()
-            var intervals: [Double] = []
-            var quietRun = 0
-            var agentSpeaking = false
-            var failure: String?
-
-            do {
-                for try await frame in frames {
-                    if Task.isCancelled { break }
-
-                    let now = CFAbsoluteTimeGetCurrent()
-                    intervals.append(now - lastFrameAt)
-                    lastFrameAt = now
-                    if intervals.count >= 25 {
-                        let average = intervals.reduce(0, +) / Double(intervals.count) * 1000
-                        intervals.removeAll(keepingCapacity: true)
-                        onStepTime(average)
+                let decision = detector.observe(rms: rms, eager: false)
+                if decision.feedAsr {
+                    if !inTurn {
+                        inTurn = true
+                        turnAudio = preroll.flatMap { $0 }
+                        preroll.removeAll()
                     }
+                    turnAudio.append(contentsOf: samples)
+                } else if !inTurn {
+                    preroll.append(samples)
+                    if preroll.count > 6 { preroll.removeFirst() }
+                }
 
-                    var sum: Float = 0
-                    for sample in frame { sum += sample * sample }
-                    let rms = sqrtf(sum / Float(max(frame.count, 1)))
-                    if rms > 0.01 {
-                        quietRun = 0
-                        if !agentSpeaking {
-                            agentSpeaking = true
-                            onAgentSpeaking(true)
-                        }
-                    } else {
-                        quietRun += 1
-                        if quietRun >= 6, agentSpeaking {
-                            agentSpeaking = false
-                            onAgentSpeaking(false)
-                        }
-                    }
-
-                    if !started {
-                        prebuffer.append(frame)
-                        if prebuffer.count >= prebufferCount {
-                            started = true
-                            let batch = prebuffer
-                            prebuffer = []
-                            await MainActor.run {
-                                for item in batch { sharedAudio.scheduleTTSBuffer(item) }
-                                // The model must hear the mic even while it talks. The quiet-mic
-                                // gate used for the TTS pipeline would deafen it.
-                                sharedAudio.bridge.isSpeaking = false
-                            }
-                        }
-                    } else {
-                        await MainActor.run {
-                            sharedAudio.scheduleTTSBuffer(frame)
-                            sharedAudio.bridge.isSpeaking = false
-                        }
+                let tooLong = turnAudio.count > 16_000 * 30
+                if inTurn, decision.endTurn || tooLong {
+                    inTurn = false
+                    let audio = turnAudio
+                    turnAudio = []
+                    // Ignore coughs and clicks shorter than 0.6 s.
+                    if audio.count >= 16_000 * 6 / 10 {
+                        await self?.submit(audio: audio, session: currentSession)
                     }
                 }
-            } catch {
-                failure = "Speech-to-speech stopped: \(error.localizedDescription)"
-            }
-
-            let wasCancelled = Task.isCancelled
-            await MainActor.run {
-                guard let self, self.session == currentSession else { return }
-                if !wasCancelled { onFinished(failure) }
             }
         }
     }
 
     func stop(sharedAudio: SharedAudioEngine) {
         session += 1
-        inferenceTask?.cancel()
         micTask?.cancel()
         micTask = nil
         micContinuation?.finish()
         micContinuation = nil
+        responseTask?.cancel()
+        gate.set(false)
         sharedAudio.endInputCapture()
         sharedAudio.stopPlayback()
         // A clean stop: nothing was killed.
         Self.setStage(nil)
+    }
+
+    // MARK: - Replies
+
+    private func interruptResponse(session currentSession: Int) {
+        guard currentSession == session else { return }
+        responseTask?.cancel()
+        gate.set(false)
+        sharedAudioRef?.stopPlayback()
+        agentSpeakingCallback?(false)
+    }
+
+    private func submit(audio: [Float], session currentSession: Int) {
+        guard currentSession == session, let sharedAudio = sharedAudioRef else { return }
+        beginResponse(userAudio: audio, sharedAudio: sharedAudio, session: currentSession)
+    }
+
+    private func beginResponse(userAudio: [Float], sharedAudio: SharedAudioEngine, session currentSession: Int) {
+        guard let model, let processor, let detokenizer else { return }
+        gate.set(true)
+        responseTask?.cancel()
+        let previous = responseTask
+        let exchanges = history
+        let systemText = Self.systemPrompt(for: voiceId)
+        let gate = self.gate
+        let speaking = agentSpeakingCallback
+        let finished = finishedCallback
+        let chunkFrames = 12
+        let overlapFrames = 3
+
+        responseTask = Task.detached(priority: .userInitiated) { [weak self] in
+            await previous?.value
+            if Task.isCancelled { return }
+
+            // Build the conversation: system line, the last few exchanges, then this turn.
+            let chat = ChatState(processor: processor)
+            chat.newTurn(role: "system")
+            chat.addText(systemText)
+            chat.endTurn()
+            for exchange in exchanges {
+                chat.newTurn(role: "user")
+                chat.addAudio(MLXArray(exchange.audio), sampleRate: 16_000)
+                chat.endTurn()
+                chat.newTurn(role: "assistant")
+                chat.addText(exchange.reply)
+                chat.endTurn()
+            }
+            chat.newTurn(role: "user")
+            chat.addAudio(MLXArray(userAudio), sampleRate: 16_000)
+            chat.endTurn()
+            chat.newTurn(role: "assistant")
+
+            var codes: [MLXArray] = []
+            var replyTokens: [Int] = []
+            var decodedFrames = 0
+            var announcedSpeaking = false
+            var failure: String?
+
+            // Decode frames [decodedFrames ..< end). A few earlier frames are decoded again for
+            // context and their audio is dropped, so chunk seams do not click.
+            func decodeChunk(upTo end: Int) -> [Float] {
+                let overlap = min(overlapFrames, decodedFrames)
+                let slice = Array(codes[(decodedFrames - overlap)..<end])
+                let stacked = MLX.stacked(slice, axis: 0)
+                let input = stacked.transposed(1, 0).expandedDimensions(axis: 0)
+                let wave = detokenizer(input)
+                let all = wave.asType(.float32).asArray(Float.self)
+                let perFrame = all.count / max(slice.count, 1)
+                decodedFrames = end
+                return Array(all.dropFirst(overlap * perFrame))
+            }
+
+            func play(_ samples: [Float]) async {
+                guard !samples.isEmpty, !Task.isCancelled else { return }
+                await MainActor.run {
+                    sharedAudio.scheduleTTSBuffer(samples)
+                }
+                if !announcedSpeaking {
+                    announcedSpeaking = true
+                    speaking?(true)
+                }
+            }
+
+            do {
+                let config = LFMGenerationConfig(maxNewTokens: 640)
+                for try await (token, modality) in model.generateInterleaved(
+                    textTokens: chat.getTextTokens(),
+                    audioFeatures: chat.getAudioFeatures(),
+                    modalities: chat.getModalities(),
+                    config: config
+                ) {
+                    if Task.isCancelled { break }
+                    eval(token)
+                    if modality == .text {
+                        replyTokens.append(token.item(Int.self))
+                    } else if modality == .audioOut {
+                        if token[0].item(Int.self) == lfmAudioEOSToken { break }
+                        codes.append(token)
+                        if codes.count - decodedFrames >= chunkFrames {
+                            await play(decodeChunk(upTo: codes.count))
+                        }
+                    }
+                }
+                if !Task.isCancelled, codes.count > decodedFrames {
+                    await play(decodeChunk(upTo: codes.count))
+                }
+            } catch {
+                failure = "Speech-to-speech stopped: \(error.localizedDescription)"
+            }
+
+            if Task.isCancelled { return }
+
+            // Let the reply finish playing, then listen again.
+            await sharedAudio.waitForPlaybackCompletion()
+            if announcedSpeaking { speaking?(false) }
+            try? await Task.sleep(for: .milliseconds(300))
+            gate.set(false)
+
+            let wasCancelled = Task.isCancelled
+            await MainActor.run {
+                guard let self, self.session == currentSession, !wasCancelled else { return }
+                if let failure {
+                    finished?(failure)
+                    return
+                }
+                let reply = processor.decodeText(replyTokens)
+                self.history.append(Exchange(audio: userAudio, reply: reply))
+                while self.history.count > 3 { self.history.removeFirst() }
+                var total = self.history.reduce(0) { $0 + $1.audio.count }
+                while total > 16_000 * 45, self.history.count > 1 {
+                    total -= self.history.removeFirst().audio.count
+                }
+                Memory.clearCache()
+            }
+        }
     }
 }
