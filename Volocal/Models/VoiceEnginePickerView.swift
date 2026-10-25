@@ -23,6 +23,10 @@ struct VoiceEnginePickerView: View {
     @State private var pendingImportURL: URL?
     @State private var pendingVoiceName: String = ""
 
+    // PersonaPlex S2S state
+    @StateObject private var personaPlexManager = PersonaPlexManager()
+    @State private var showPersonaPlexSheet = false
+
     var body: some View {
         NavigationStack {
             List {
@@ -49,6 +53,35 @@ struct VoiceEnginePickerView: View {
                                 .foregroundStyle(.secondary)
                         }
                     }
+                }
+
+                Section(header: Text("Native Speech-to-Speech")) {
+                    Button {
+                        showPersonaPlexSheet = true
+                    } label: {
+                        HStack(alignment: .top, spacing: 12) {
+                            Image(systemName: "waveform.badge.sparkles")
+                                .font(.title2)
+                                .foregroundStyle(Color.accentColor)
+                                .padding(.top, 2)
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack {
+                                    Text("NVIDIA PersonaPlex 7B (MLX)")
+                                        .font(.subheadline.bold())
+                                        .foregroundStyle(.primary)
+                                    Spacer()
+                                    Text(PersonaPlexSpec.isDownloaded ? "Ready" : PersonaPlexSpec.sizeDescription)
+                                        .font(.caption)
+                                        .foregroundStyle(PersonaPlexSpec.isDownloaded ? .green : .secondary)
+                                }
+                                Text("Full-duplex Speech-to-Speech foundation model. Understands emotional tone and speaks simultaneously via Mimi audio tokens.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
                 }
 
                 Section("Speech recognition") {
@@ -155,6 +188,14 @@ struct VoiceEnginePickerView: View {
             }
             .onDisappear {
                 pipeline?.stopVoicePreview()
+            }
+            .onAppear {
+                if let audio = pipeline?.sharedAudio {
+                    personaPlexManager.attachSharedAudio(audio)
+                }
+            }
+            .sheet(isPresented: $showPersonaPlexSheet) {
+                PersonaPlexView(manager: personaPlexManager)
             }
             .sheet(isPresented: $showRecorderSheet) {
                 VoiceClipRecorderSheet(pipeline: pipeline) { newVoice in
