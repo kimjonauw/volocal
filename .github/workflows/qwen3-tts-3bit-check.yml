@@ -18,13 +18,13 @@ jobs:
     env:
       HF_HUB_DISABLE_TELEMETRY: "1"
       DO_NOT_TRACK: "1"
-      HF_HOME: ${{ runner.temp }}/qwen-hf-cache
-      QWEN_OUTPUT: ${{ runner.temp }}/qwen3-tts-1.7b-customvoice-3bit
     steps:
       - name: Verify standard Apple Silicon runner
         shell: bash
         run: |
           set -euo pipefail
+          echo "HF_HOME=$RUNNER_TEMP/qwen-hf-cache" >> "$GITHUB_ENV"
+          echo "QWEN_OUTPUT=$RUNNER_TEMP/qwen3-tts-1.7b-customvoice-3bit" >> "$GITHUB_ENV"
           test "$(uname -s)" = Darwin
           test "$(uname -m)" = arm64
           sw_vers
