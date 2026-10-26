@@ -12,50 +12,40 @@ enum SpeechToSpeechError: LocalizedError {
     case micFailed(String)
     case previousCrash(stage: String?)
     case incompleteModel
-
     var errorDescription: String? {
         switch self {
-        case .notEnoughMemory(let available, let needed):
-            return "Only \(available) MB is free for Volocal and the speech model needs about \(needed) MB. Force-quit and reopen Volocal so the other models release their memory, and make sure GetMoreRAM is on for the LiveContainer host."
-        case .notLoaded:
-            return "The speech-to-speech model is not loaded yet."
-        case .micFailed(let message):
-            return "Microphone could not start: \(message)"
-        case .previousCrash(let stage):
-            let where_ = stage.map { " while \($0)" } ?? ""
-            return "The last speech-to-speech session was killed by iOS\(where_), most likely because it ran out of memory. Tap Try again."
-        case .incompleteModel:
-            return "The speech model downloaded without its tokenizer or audio decoder. Delete it and try again."
+        case .notEnoughMemory(let a, let n): return "Only \(a) MB free; speech model needs about \(n) MB. Reopen Volocal with GetMoreRAM enabled on the host."
+        case .notLoaded: return "Speech-to-speech model is not loaded."
+        case .micFailed(let s): return "Microphone could not start: \(s)"
+        case .previousCrash(let s): return "Previous session ended unexpectedly while \(s ?? "loading"). Tap Try again."
+        case .incompleteModel: return "Speech model is missing its processor or decoder."
         }
     }
+}
+
+/// Owned cancellation state. Never retain an UnsafeCurrentTask outside its closure.
+private final class SpeechRun: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+    var active: Bool {
+        lock.lock(); defer { lock.unlock() }; return !cancelled
+    }
+    func cancel() { lock.lock(); cancelled = true; lock.unlock() }
 }
 
 private final class AgentGate: @unchecked Sendable {
     private let lock = NSLock()
     private var value = false
-    var active: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return value
-    }
-    func set(_ newValue: Bool) {
-        lock.lock()
-        value = newValue
-        lock.unlock()
-    }
+    var active: Bool { lock.lock(); defer { lock.unlock() }; return value }
+    func set(_ v: Bool) { lock.lock(); value = v; lock.unlock() }
 }
 
 private enum MonoResampler {
     static func mono16k(from buffer: AVAudioPCMBuffer) -> [Float] {
-        guard let channel = buffer.floatChannelData?[0] else { return [] }
+        guard let channel = buffer.floatChannelData?[0], buffer.frameLength > 0,
+              buffer.format.sampleRate > 0 else { return [] }
         let n = Int(buffer.frameLength)
-        guard n > 0 else { return [] }
-        let rate = buffer.format.sampleRate
-        guard rate > 0 else { return [] }
-        if abs(rate - 16_000) < 1 {
-            return Array(UnsafeBufferPointer(start: channel, count: n))
-        }
-        let ratio = rate / 16_000
+        let ratio = buffer.format.sampleRate / 16_000
         let m = Int(Double(n) / ratio)
         guard m > 0 else { return [] }
         var out = [Float](repeating: 0, count: m)
@@ -70,385 +60,284 @@ private enum MonoResampler {
     }
 }
 
-/// Turn-based LFM2.5-Audio with inline generation callbacks. Decode and enqueue each chunk
-/// immediately: no expected-reply-length estimate and no adaptive playback prebuffer.
-/// Generation can under-run playback on slower devices; low onset latency takes priority.
+/// Turn-based S2S. Immediate chunk playback, bounded generation, no adaptive prebuffer.
+/// Interim decoder path recomputes the causal prefix, emitting only previously unplayed PCM.
+/// This preserves past context but costs more compute than a true stateful decoder.
 @MainActor
 final class SpeechToSpeechEngine: ObservableObject {
     static let fenceKey = "speech-to-speech:lfm2.5-audio-1.5b-6bit"
     private static let stageKey = "volocal.s2s.stage"
     private static let modelId = "mlx-community/LFM2.5-Audio-1.5B-6bit"
-    private static let neededBytes = 2_200_000_000
-    private static let fastSampling = true
-
     @Published private(set) var isLoaded = false
     private var model: LFM2AudioModel?
     private var processor: LFM2AudioProcessor?
     private var detokenizer: LFM2AudioDetokenizer?
+    private var decoderTailSamples = 1280
     private var micTask: Task<Void, Never>?
     private var micContinuation: AsyncStream<AVAudioPCMBuffer>.Continuation?
     private var responseTask: Task<Void, Never>?
+    private var watchdog: Task<Void, Never>?
+    private var run: SpeechRun?
     private let gate = AgentGate()
     private var session = 0
+    private var responseRevision = 0
     private var voiceId = "NATM0"
     private weak var sharedAudioRef: SharedAudioEngine?
-    private var agentSpeakingCallback: (@Sendable (Bool) -> Void)?
-    private var finishedCallback: (@Sendable (String?) -> Void)?
+    private var speakingCallback: (@Sendable (Bool) -> Void)?
     private var statusCallback: (@Sendable (String?) -> Void)?
 
-    private static func setStage(_ stage: String?) {
-        if let stage {
-            UserDefaults.standard.set(stage, forKey: stageKey)
-        } else {
-            UserDefaults.standard.removeObject(forKey: stageKey)
-        }
+    private static func setStage(_ s: String?) {
+        if let s { UserDefaults.standard.set(s, forKey: stageKey) }
+        else { UserDefaults.standard.removeObject(forKey: stageKey) }
         UserDefaults.standard.synchronize()
-    }
-
-    private static func voiceDescription(for voiceId: String) -> String {
-        voiceId.contains("F") && !voiceId.hasPrefix("NATM") && !voiceId.hasPrefix("VARM")
-            ? "a US female voice" : "a US male voice"
-    }
-
-    private static func systemPrompt(for voiceId: String) -> String {
-        "Respond with interleaved text and speech audio. Use \(voiceDescription(for: voiceId)). "
-            + "You are a relaxed, curious friend having a casual chat. "
-            + "React to what the person just said the way a real friend would, in one or two short, "
-            + "natural sentences with contractions, and sometimes ask a quick question back. "
-            + "Do not introduce yourself and do not offer help."
     }
 
     func load(progress: @escaping @Sendable (String) -> Void) async throws {
         if model != nil { return }
-        let leftoverStage = UserDefaults.standard.string(forKey: Self.stageKey)
+        let old = UserDefaults.standard.string(forKey: Self.stageKey)
         if LLMLoadFence.shouldSkipLoad(path: Self.fenceKey) {
-            throw SpeechToSpeechError.previousCrash(stage: leftoverStage)
-        }
-        var killNote: String?
-        if let leftoverStage {
-            killNote = "The last session was killed by iOS while \(leftoverStage)."
-            Self.setStage(nil)
+            throw SpeechToSpeechError.previousCrash(stage: old)
         }
         let available = Int(os_proc_available_memory())
-        if available > 0, available < Self.neededBytes {
-            throw SpeechToSpeechError.notEnoughMemory(
-                availableMB: available / 1_000_000, neededMB: Self.neededBytes / 1_000_000
-            )
+        if available > 0, available < 2_200_000_000 {
+            throw SpeechToSpeechError.notEnoughMemory(availableMB: available / 1_000_000, neededMB: 2200)
         }
         Memory.cacheLimit = 256 * 1024 * 1024
         LLMLoadFence.markStarting(path: Self.fenceKey, contextSize: 0)
-        Self.setStage("loading the model weights")
+        Self.setStage("loading model")
         do {
-            progress("Loading LFM2.5-Audio (about 1.3 GB, downloads the first time)...")
+            progress("Loading LFM2.5-Audio...")
             let loaded = try await LFM2AudioModel.fromPretrained(Self.modelId)
-            guard let loadedProcessor = loaded.processor, let directory = loaded.modelDirectory else {
+            guard let p = loaded.processor, let dir = loaded.modelDirectory else {
                 throw SpeechToSpeechError.incompleteModel
             }
-            progress("Loading the audio decoder...")
-            let loadedDetokenizer = try LFM2AudioDetokenizer.fromPretrained(modelPath: directory)
-            model = loaded
-            processor = loadedProcessor
-            detokenizer = loadedDetokenizer
-            isLoaded = true
-            Self.setStage(nil)
-            LLMLoadFence.clear()
-            logger.info("LFM2.5-Audio loaded")
-            let freeMB = Int(os_proc_available_memory()) / 1_000_000
-            var message = "Loaded. \(freeMB) MB still free."
-            if let killNote { message += " " + killNote }
-            progress(message)
-            try? await Task.sleep(for: .seconds(killNote == nil ? 2 : 4))
+            progress("Loading audio decoder...")
+            let decoder = try LFM2AudioDetokenizer.fromPretrained(modelPath: dir)
+            if let data = try? Data(contentsOf: dir.appendingPathComponent("audio_detokenizer/config.json")),
+               let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+               let n = json["n_fft"] as? Int, n > 0 {
+                decoderTailSamples = n
+            }
+            model = loaded; processor = p; detokenizer = decoder; isLoaded = true
+            LLMLoadFence.clear(); Self.setStage(nil)
+            progress("Loaded. \(Int(os_proc_available_memory()) / 1_000_000) MB free.")
+            try? await Task.sleep(for: .seconds(2))
         } catch {
-            Self.setStage(nil)
-            LLMLoadFence.clear()
-            throw error
+            Self.setStage(nil); LLMLoadFence.clear(); throw error
         }
     }
 
     func unload() {
-        responseTask?.cancel()
-        responseTask = nil
-        model = nil
-        processor = nil
-        detokenizer = nil
-        isLoaded = false
-        Memory.clearCache()
+        if let audio = sharedAudioRef { stop(sharedAudio: audio) }
+        else { run?.cancel(); responseTask?.cancel(); watchdog?.cancel(); micTask?.cancel() }
+        // The response task owns its model references until it exits. A subsequent load waits.
+        model = nil; processor = nil; detokenizer = nil; isLoaded = false
     }
 
     func start(
-        sharedAudio: SharedAudioEngine,
-        voiceId: String,
+        sharedAudio: SharedAudioEngine, voiceId: String,
         onAgentSpeaking: @escaping @Sendable (Bool) -> Void,
         onStepTime: @escaping @Sendable (Double) -> Void,
         onFinished: @escaping @Sendable (String?) -> Void,
         onStatus: (@Sendable (String?) -> Void)? = nil
     ) async throws {
-        _ = onStepTime
-        guard model != nil, processor != nil, detokenizer != nil else {
-            throw SpeechToSpeechError.notLoaded
-        }
-        micTask?.cancel()
-        micContinuation?.finish()
-        responseTask?.cancel()
-        let previous = responseTask
-        await previous?.value
-        session += 1
-        let currentSession = session
-        self.voiceId = voiceId
-        sharedAudioRef = sharedAudio
-        agentSpeakingCallback = onAgentSpeaking
-        finishedCallback = onFinished
-        statusCallback = onStatus
-        gate.set(false)
+        _ = onStepTime; _ = onFinished
+        guard model != nil, processor != nil, detokenizer != nil else { throw SpeechToSpeechError.notLoaded }
+        stop(sharedAudio: sharedAudio)
+        let ticket = session
+        await responseTask?.value
+        guard ticket == session else { return }
+        self.voiceId = voiceId; sharedAudioRef = sharedAudio
+        speakingCallback = onAgentSpeaking; statusCallback = onStatus
         let (stream, continuation) = AsyncStream.makeStream(
             of: AVAudioPCMBuffer.self, bufferingPolicy: .bufferingNewest(16)
         )
         micContinuation = continuation
         sharedAudio.bridge.inputContinuation = continuation
         await sharedAudio.beginInputCapture()
-        if let captureError = sharedAudio.error {
-            continuation.finish()
-            sharedAudio.bridge.inputContinuation = nil
-            micContinuation = nil
-            throw SpeechToSpeechError.micFailed(captureError)
+        guard ticket == session else { continuation.finish(); return }
+        if let e = sharedAudio.error {
+            sharedAudio.endInputCapture(); continuation.finish(); throw SpeechToSpeechError.micFailed(e)
         }
-        Self.setStage("running the conversation")
-        onStatus?("Listening...")
+        Self.setStage("listening")
+        onStatus?("Listening. Mic button stops the session.")
         let gate = self.gate
         micTask = Task.detached(priority: .userInitiated) { [weak self] in
             let detector = MicTurnDetector()
-            var inTurn = false
-            var turnAudio: [Float] = []
+            var audio: [Float] = []
             var preroll: [[Float]] = []
-            var loudSeconds = 0.0
-            var wasActive = false
-            var lastStatusAt = CFAbsoluteTimeGetCurrent()
+            var inTurn = false
+            var wasBusy = false
+            var lastStatus = CFAbsoluteTimeGetCurrent()
             for await buffer in stream {
                 if Task.isCancelled { break }
-                let rms = SharedAudioEngine.rmsEnergy(buffer)
-                let bufferSeconds = Double(buffer.frameLength) / max(buffer.format.sampleRate, 1)
-                let samples = MonoResampler.mono16k(from: buffer)
-                if samples.isEmpty { continue }
+                // Diagnostic isolation: do not turn speaker leakage into a new user turn.
+                // The mic remains installed; automatic acoustic barge-in is temporarily off.
                 if gate.active {
-                    if !wasActive {
-                        wasActive = true
-                        detector.resetUtterance()
-                        inTurn = false
-                        turnAudio = []
-                        loudSeconds = 0
-                    }
-                    preroll.append(samples)
-                    if preroll.count > 6 { preroll.removeFirst() }
-                    loudSeconds = rms >= 0.05 ? loudSeconds + bufferSeconds : 0
-                    if loudSeconds >= 0.3 {
-                        loudSeconds = 0
-                        await self?.interruptResponse(session: currentSession)
-                        wasActive = false
-                        inTurn = true
-                        turnAudio = preroll.flatMap { $0 }
-                        preroll.removeAll()
-                        _ = detector.observe(rms: rms, eager: false, quietEnd: 0.55)
-                    }
-                    continue
+                    wasBusy = true; audio.removeAll(); preroll.removeAll(); inTurn = false
+                    detector.resetUtterance(); continue
                 }
-                wasActive = false
+                if wasBusy { detector.resetUtterance(); wasBusy = false }
+                let samples = MonoResampler.mono16k(from: buffer)
+                guard !samples.isEmpty else { continue }
+                let rms = SharedAudioEngine.rmsEnergy(buffer)
                 let decision = detector.observe(rms: rms, eager: false, quietEnd: 0.55)
-                if decision.feedAsr {
-                    if !inTurn {
-                        inTurn = true
-                        turnAudio = preroll.flatMap { $0 }
-                        preroll.removeAll()
-                    }
-                    turnAudio.append(contentsOf: samples)
-                } else if !inTurn {
+                if !inTurn {
                     preroll.append(samples)
                     if preroll.count > 6 { preroll.removeFirst() }
+                    if decision.feedAsr {
+                        inTurn = true; audio = preroll.flatMap { $0 }; preroll.removeAll()
+                    }
+                } else {
+                    // Preserve intra-utterance silence rather than stitching words together.
+                    audio.append(contentsOf: samples)
+                }
+                if inTurn, decision.endTurn || audio.count >= 16_000 * 20 {
+                    let turn = audio; audio = []; inTurn = false; detector.resetUtterance()
+                    if turn.count >= 9600 { await self?.submit(turn, session: ticket) }
                 }
                 let now = CFAbsoluteTimeGetCurrent()
-                if now - lastStatusAt > 0.25 {
-                    lastStatusAt = now
-                    if inTurn {
-                        let seconds = Double(turnAudio.count) / 16_000
-                        onStatus?(String(format: "Hearing you... %.1f s (mic %.3f)", seconds, rms))
-                    } else {
-                        onStatus?(String(format: "Listening... mic level %.3f, needs more than 0.010 to count as speech", rms))
-                    }
-                }
-                let tooLong = turnAudio.count > 16_000 * 30
-                if inTurn, decision.endTurn || tooLong {
-                    inTurn = false
-                    let audio = turnAudio
-                    turnAudio = []
-                    if audio.count >= 16_000 * 6 / 10 {
-                        await self?.submit(audio: audio, session: currentSession)
-                    } else {
-                        onStatus?("That was too short to count (under 0.6 s). Listening...")
-                    }
+                if !gate.active, now - lastStatus > 0.3 {
+                    lastStatus = now
+                    onStatus?(String(format: inTurn ? "Hearing you (mic %.3f)..." : "Listening (mic %.3f)...", rms))
                 }
             }
         }
     }
 
     func stop(sharedAudio: SharedAudioEngine) {
-        session += 1
-        micTask?.cancel()
-        micTask = nil
-        micContinuation?.finish()
-        micContinuation = nil
-        responseTask?.cancel()
-        gate.set(false)
-        sharedAudio.endInputCapture()
-        sharedAudio.stopPlayback()
-        Self.setStage(nil)
+        session += 1; responseRevision += 1
+        run?.cancel(); watchdog?.cancel(); watchdog = nil
+        responseTask?.cancel(); micTask?.cancel(); micTask = nil
+        micContinuation?.finish(); micContinuation = nil
+        sharedAudio.endInputCapture(); sharedAudio.stopPlayback()
+        gate.set(false); Self.setStage(nil)
     }
 
-    private func interruptResponse(session currentSession: Int) {
-        guard currentSession == session else { return }
-        responseTask?.cancel()
-        gate.set(false)
-        sharedAudioRef?.stopPlayback()
-        agentSpeakingCallback?(false)
-        statusCallback?("Interrupted. Listening...")
-    }
-
-    private func submit(audio: [Float], session currentSession: Int) {
-        guard currentSession == session, let sharedAudio = sharedAudioRef else { return }
-        statusCallback?(String(format: "Got %.1f s of speech. Thinking...", Double(audio.count) / 16_000))
-        beginResponse(userAudio: audio, sharedAudio: sharedAudio, session: currentSession)
-    }
-
-    private func beginResponse(userAudio: [Float], sharedAudio: SharedAudioEngine, session currentSession: Int) {
-        guard let model, let processor, let detokenizer else { return }
-        gate.set(true)
-        responseTask?.cancel()
+    private func submit(_ audio: [Float], session ticket: Int) {
+        guard session == ticket, !gate.active,
+              let model, let processor, let detokenizer, let sharedAudio = sharedAudioRef else { return }
+        run?.cancel(); responseTask?.cancel(); watchdog?.cancel()
         let previous = responseTask
-        let systemText = Self.systemPrompt(for: voiceId)
-        let gate = self.gate
-        let speaking = agentSpeakingCallback
-        let status = statusCallback
-        let firstChunkFrames = 6
-        let chunkFrames = 12
-        let overlapFrames = 3
-        let startedAt = CFAbsoluteTimeGetCurrent()
-        let fast = Self.fastSampling
-        let config: LFMGenerationConfig = fast
-            ? LFMGenerationConfig(
-                maxNewTokens: 400, temperature: 0.7, topK: 0, topP: 1.0,
-                audioTemperature: 0, audioTopK: 1
-            )
-            : LFMGenerationConfig(maxNewTokens: 400)
-
+        responseRevision += 1
+        let revision = responseRevision
+        let token = SpeechRun(); run = token; gate.set(true)
+        let female = voiceId.contains("F")
+        let system = "Respond with interleaved text and speech audio. Use a US \(female ? "female" : "male") voice. Chat casually and respond directly in one short sentence. Do not introduce yourself."
+        let tailGuard = decoderTailSamples
+        statusCallback?("Processing your speech...")
+        Self.setStage("generating reply")
+        // Covers generation and playback, including a missing playback callback. This cannot
+        // preempt a GPU kernel, but it invalidates queued audio and resets the interface.
+        watchdog = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(30))
+            guard !Task.isCancelled else { return }
+            self?.finishResponse(token, revision: revision, session: ticket, forced: true,
+                                 message: "Response stopped at the 30-second safety limit. Listening again.")
+        }
         responseTask = Task.detached(priority: .userInitiated) { [weak self] in
             await previous?.value
-            if Task.isCancelled { return }
+            guard token.active, !Task.isCancelled else { return }
+            let started = CFAbsoluteTimeGetCurrent()
             let chat = ChatState(processor: processor)
-            chat.newTurn(role: "system")
-            chat.addText(systemText)
-            chat.endTurn()
-            chat.newTurn(role: "user")
-            chat.addAudio(MLXArray(userAudio), sampleRate: 16_000)
-            chat.endTurn()
+            chat.newTurn(role: "system"); chat.addText(system); chat.endTurn()
+            chat.newTurn(role: "user"); chat.addAudio(MLXArray(audio), sampleRate: 16_000); chat.endTurn()
             chat.newTurn(role: "assistant")
-
             var codes: [MLXArray] = []
-            var replyTokens: [Int] = []
-            var decodedFrames = 0
-            var playbackStarted = false
-            var firstQueuedAt: Double?
-            var prefillDoneAt: Double?
-            var outputSamples = 0
+            var text: [Int] = []
+            var recent: [[Int32]] = []
+            var emitted = 0
+            var lastDecoded = 0
+            var firstQueue: Double?
+            var reason: String?
+            let config = LFMGenerationConfig(maxNewTokens: 180, temperature: 0.7, topK: 50,
+                                             topP: 1, audioTemperature: 0.8, audioTopK: 4)
 
-            func decodeChunk(upTo end: Int) -> [Float] {
-                let overlap = min(overlapFrames, decodedFrames)
-                let slice = Array(codes[(decodedFrames - overlap)..<end])
-                let stacked = MLX.stacked(slice, axis: 0)
-                let input = stacked.transposed(1, 0).expandedDimensions(axis: 0)
-                let wave = detokenizer(input)
-                let all = wave.asType(.float32).asArray(Float.self)
-                let perFrame = all.count / max(slice.count, 1)
-                decodedFrames = end
-                return Array(all.dropFirst(overlap * perFrame))
-            }
-
-            // Enqueue every decoded chunk immediately, in FIFO order. The task and session
-            // checks discard hand-offs that were queued before an interruption or restart.
-            let responseTaskHandle = withUnsafeCurrentTask { $0 }
-            func schedule(_ samples: [Float]) {
-                guard !samples.isEmpty, !Task.isCancelled else { return }
-                let first = !playbackStarted
-                playbackStarted = true
-                outputSamples += samples.count
-                if first { firstQueuedAt = CFAbsoluteTimeGetCurrent() }
+            func emit(final: Bool) {
+                guard token.active, !Task.isCancelled, !codes.isEmpty else { return }
+                // Recompute the complete causal prefix so attention and convolutions see their
+                // real history. Never replay old PCM; withhold an FFT-sized unstable end only.
+                let input = MLX.stacked(codes, axis: 0).transposed(1, 0).expandedDimensions(axis: 0)
+                let waveform = detokenizer(input).asType(.float32).asArray(Float.self)
+                lastDecoded = codes.count
+                let end = final ? waveform.count : max(0, waveform.count - tailGuard)
+                guard end > emitted else { return }
+                let pcm = Array(waveform[emitted..<end])
+                guard pcm.allSatisfy({ $0.isFinite }) else { reason = "Invalid decoder output"; return }
+                let safe = pcm.map { max(Float(-1), min(Float(1), $0)) }
+                emitted = end
+                let first = firstQueue == nil
+                if first { firstQueue = CFAbsoluteTimeGetCurrent() - started }
                 DispatchQueue.main.async { [weak self] in
                     MainActor.assumeIsolated {
-                        guard let self, self.session == currentSession,
-                              responseTaskHandle?.isCancelled != true else { return }
-                        sharedAudio.scheduleTTSBuffer(samples)
-                        if first { speaking?(true) }
+                        guard let self, self.session == ticket, self.responseRevision == revision, token.active else { return }
+                        sharedAudio.scheduleTTSBuffer(safe)
+                        if first { self.speakingCallback?(true) }
                     }
                 }
             }
 
             model.generateInterleavedInline(
-                textTokens: chat.getTextTokens(),
-                audioFeatures: chat.getAudioFeatures(),
-                modalities: chat.getModalities(),
-                config: config,
-                onPrefillDone: {
-                    let now = CFAbsoluteTimeGetCurrent()
-                    prefillDoneAt = now
-                    status?(String(format: "Recording processed in %.1f s. Playing each chunk as soon as decoded.", now - startedAt))
-                },
-                onToken: { token, modality in
-                    if Task.isCancelled { return false }
-                    eval(token)
+                textTokens: chat.getTextTokens(), audioFeatures: chat.getAudioFeatures(),
+                modalities: chat.getModalities(), config: config,
+                onToken: { value, modality in
+                    guard token.active, !Task.isCancelled else { return false }
+                    if CFAbsoluteTimeGetCurrent() - started > 20 { reason = "Generation time limit"; return false }
+                    eval(value)
                     if modality == .text {
-                        replyTokens.append(token.item(Int.self))
+                        text.append(value.item(Int.self))
+                        if text.count >= 80 { reason = "Text length limit"; return false }
                     } else if modality == .audioOut {
-                        if token[0].item(Int.self) == lfmAudioEOSToken { return true }
-                        codes.append(token)
-                        let target = decodedFrames == 0 ? firstChunkFrames : chunkFrames
-                        if codes.count - decodedFrames >= target {
-                            schedule(decodeChunk(upTo: codes.count))
+                        let frame = value.asArray(Int32.self)
+                        guard frame.count == 8 else { reason = "Unexpected audio frame shape"; return false }
+                        if frame[0] == Int32(lfmAudioEOSToken) { return true }
+                        guard frame.allSatisfy({ $0 >= 0 && $0 < Int32(lfmAudioEOSToken) }) else {
+                            reason = "Invalid audio codes"; return false
                         }
+                        recent.append(frame)
+                        if recent.count > 20 { recent.removeFirst() }
+                        if recent.count >= 10, recent.suffix(10).allSatisfy({ $0 == frame }) {
+                            reason = "Repeated identical audio frames"; return false
+                        }
+                        if recent.count == 20, Array(recent.prefix(10)) == Array(recent.suffix(10)) {
+                            reason = "Repeated audio-code sequence"; return false
+                        }
+                        codes.append(value)
+                        if codes.count - lastDecoded >= (lastDecoded == 0 ? 6 : 12) { emit(final: false) }
+                        if reason != nil { return false }
+                        if codes.count >= 100 { reason = "Audio length limit"; return false }
                     }
                     return true
                 }
             )
-            if Task.isCancelled { return }
-            if codes.count > decodedFrames {
-                schedule(decodeChunk(upTo: codes.count))
+            guard token.active, !Task.isCancelled else { return }
+            if reason == nil { emit(final: true) }
+            let reply = processor.decodeText(text)
+            let summary = reason.map { "Stopped: \($0)." }
+                ?? String(format: "Reply %.1f s; first chunk queued %.1f s. ",
+                          CFAbsoluteTimeGetCurrent() - started, firstQueue ?? -1) + reply
+            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+                DispatchQueue.main.async { c.resume() }
             }
-
-            let replyText = processor.decodeText(replyTokens)
-            let doneAt = CFAbsoluteTimeGetCurrent()
-            let total = doneAt - startedAt
-            let mode = fast ? "fast" : "normal"
-            if outputSamples == 0 {
-                status?(String(format: "No audio came back after %.1f s (%d text tokens, %@ sampling). Text: ", total, replyTokens.count, mode) + replyText)
-            } else {
-                let audioSeconds = Double(outputSamples) / 24_000
-                let prepared = (prefillDoneAt ?? doneAt) - startedAt
-                let fps = Double(codes.count) / max(total - prepared, 0.01)
-                let first = firstQueuedAt.map { $0 - startedAt } ?? total
-                status?(String(
-                    format: "Generated in %.1f s for %.1f s of PCM. Input processing %.1f s, then %.1f frames/s. First chunk queued after %.1f s, no prebuffer, %@ sampling: ",
-                    total, audioSeconds, prepared, fps, first, mode
-                ) + replyText)
+            guard token.active, !Task.isCancelled else { return }
+            if reason != nil {
+                await self?.finishResponse(token, revision: revision, session: ticket, forced: true, message: summary)
+                return
             }
-
-            // Drain earlier FIFO audio hand-offs before checking playback completion.
-            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                DispatchQueue.main.async { continuation.resume() }
-            }
-            if Task.isCancelled { return }
             await sharedAudio.waitForPlaybackCompletion()
-            if Task.isCancelled { return }
-            if playbackStarted { speaking?(false) }
-            try? await Task.sleep(for: .milliseconds(300))
-            if Task.isCancelled { return }
-            gate.set(false)
-            Memory.clearCache()
+            guard token.active, !Task.isCancelled else { return }
+            // Let the AEC tail settle before allowing a new turn from the mic.
+            try? await Task.sleep(for: .milliseconds(350))
+            await self?.finishResponse(token, revision: revision, session: ticket, forced: false, message: summary)
         }
+    }
+
+    private func finishResponse(_ token: SpeechRun, revision: Int, session ticket: Int,
+                                forced: Bool, message: String) {
+        guard session == ticket, responseRevision == revision, token.active else { return }
+        token.cancel(); watchdog?.cancel(); watchdog = nil
+        if forced { responseTask?.cancel(); sharedAudioRef?.stopPlayback() }
+        speakingCallback?(false); gate.set(false); Self.setStage("listening")
+        statusCallback?(message)
     }
 }
