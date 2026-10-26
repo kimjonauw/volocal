@@ -1,0 +1,112 @@
+name: Qwen3-TTS 3-bit conversion check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qwen3-tts-conversion-check
+  cancel-in-progress: false
+
+jobs:
+  convert:
+    if: github.event.repository.private == false
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      DO_NOT_TRACK: "1"
+      HF_HOME: ${{ runner.temp }}/qwen-hf-cache
+      QWEN_OUTPUT: ${{ runner.temp }}/qwen3-tts-1.7b-customvoice-3bit
+    steps:
+      - name: Verify standard Apple Silicon runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          sw_vers
+          sysctl hw.memsize
+          df -h "$RUNNER_TEMP"
+          echo 'Manual conversion check only. No model uploads, Actions artifacts, caches, paid-runner fallback, or automatic retries.' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install conversion tools without persistent caches
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --no-cache-dir mlx-audio huggingface-hub
+          python -m pip freeze
+      - name: Convert original BF16 weights and inspect output
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -u - <<'PY'
+          import inspect
+          import json
+          import os
+          import time
+          from pathlib import Path
+          import mlx.core as mx
+          from huggingface_hub import HfApi
+          from mlx_audio.convert import convert
+          from safetensors import safe_open
+
+          source = 'mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16'
+          output = Path(os.environ['QWEN_OUTPUT'])
+          revision = HfApi().model_info(source).sha
+          required = {'hf_path', 'mlx_path', 'quantize', 'q_bits', 'q_group_size', 'revision'}
+          if not required.issubset(inspect.signature(convert).parameters):
+              raise RuntimeError('Installed converter API differs; refusing to guess arguments.')
+          # Hosted macOS virtualization may not expose Metal. This is a CPU
+          # weight-conversion test, not a GPU speech-speed benchmark.
+          mx.set_default_device(mx.cpu)
+          start = time.monotonic()
+          print(f'Source: {source}@{revision}', flush=True)
+          kwargs = dict(hf_path=source, mlx_path=str(output), quantize=True,
+                        q_bits=3, q_group_size=64, revision=revision)
+          if 'model_domain' in inspect.signature(convert).parameters:
+              kwargs['model_domain'] = 'tts'
+          convert(**kwargs)
+          config = json.loads((output / 'config.json').read_text())
+          quant = config.get('quantization') or config.get('quantization_config') or {}
+          if quant.get('bits') != 3:
+              raise RuntimeError(f'Output does not declare 3-bit quantization: {quant}')
+          if config.get('tts_model_type') != 'custom_voice':
+              raise RuntimeError('Output is not a CustomVoice checkpoint.')
+          scales = 0
+          for path in output.glob('*.safetensors'):
+              with safe_open(str(path), framework='numpy') as handle:
+                  scales += sum(key.endswith('.scales') for key in handle.keys())
+          if scales == 0:
+              raise RuntimeError('No quantized scale tensors found in root weights.')
+          if not (output / 'tokenizer.json').is_file():
+              raise RuntimeError('Text tokenizer is missing from converted pack.')
+          codec_weights = list((output / 'speech_tokenizer').rglob('*.safetensors'))
+          if not codec_weights:
+              raise RuntimeError('Speech codec weights are missing from converted pack.')
+          total = sum(p.stat().st_size for p in output.rglob('*') if p.is_file())
+          seconds = time.monotonic() - start
+          report = (f'## Conversion completed\n'
+                    f'- Source: `{source}`\n'
+                    f'- Source revision: `{revision}`\n'
+                    f'- Quantization: 3-bit, group size 64\n'
+                    f'- Quantized scale tensors: {scales}\n'
+                    f'- Output pack: {total / 1e9:.3f} GB ({total} bytes)\n'
+                    f'- Download + conversion: {seconds:.1f} seconds\n'
+                    '- Structural checks only: Swift compatibility, sound quality, and phone RAM are NOT verified.\n'
+                    '- No weights were uploaded or retained. The temporary output is deleted at job end.\n'
+                    '- The app still uses its working 4-bit checkpoint.\n')
+          print(report, flush=True)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as handle:
+              handle.write(report)
+          PY
+      - name: Remove temporary model files
+        if: always()
+        shell: bash
+        run: |
+          rm -rf -- "$HF_HOME" "$QWEN_OUTPUT"
+          echo 'Temporary model cache and output removed. No artifact upload or app change was requested.' >> "$GITHUB_STEP_SUMMARY"
