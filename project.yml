@@ -30,11 +30,7 @@ packages:
   swift-transformers:
     url: https://github.com/huggingface/swift-transformers
     from: "1.3.0"
-  # Fork of Blaizzy/mlx-audio-swift at upstream commit 6fd9386 plus ONE new file,
-  # LFMAudioModel+Streaming.swift, which adds generateInterleavedInline. The upstream
-  # generateInterleaved generates the whole reply inside the stream's initializer, so the app
-  # gets nothing until the reply is finished. The app calls the new function, so do NOT point
-  # this back at upstream.
+  # Keep the fork's inline LFM streaming implementation.
   mlx-audio-swift:
     url: https://github.com/kimjonauw/mlx-audio-swift.git
     revision: "1d0239f6e7664ab9aa2cee77aaa10ebf768bb661"
@@ -77,6 +73,10 @@ targets:
         product: Tokenizers
       - package: mlx-audio-swift
         product: MLXAudioSTS
+      - package: mlx-audio-swift
+        product: MLXAudioTTS
+      - package: mlx-audio-swift
+        product: MLXAudioCore
     info:
       path: Volocal/Info.plist
       properties:
