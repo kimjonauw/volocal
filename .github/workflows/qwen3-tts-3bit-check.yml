@@ -85,7 +85,12 @@ jobs:
           convert(**kwargs)
           total = inventory('Converted pack before packaging', output)
           summary(f'## Weight conversion returned\nPack before tokenizer packaging: {total / 1e9:.3f} GB ({total} bytes).\nDownload + conversion: {time.monotonic() - start:.1f} seconds.\nPackaging validation is not complete yet.')
-          source_path = Path(snapshot_download(source, revision=revision, local_files_only=True))
+          source_path = Path(snapshot_download(
+              source, revision=revision, local_files_only=True,
+              allow_patterns=['*.json', '*.safetensors', '*.py', '*.model',
+                              '*.tiktoken', '*.txt', '*.jinja', '*.jsonl',
+                              '*.yaml', '*.wav', '*.pth'],
+          ))
           inventory('Pinned source files', source_path)
           config = json.loads((output / 'config.json').read_text())
           quant = config.get('quantization') or config.get('quantization_config') or {}
