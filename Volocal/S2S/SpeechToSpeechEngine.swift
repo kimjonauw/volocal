@@ -23,13 +23,10 @@ enum SpeechToSpeechError: LocalizedError {
     }
 }
 
-/// Owned cancellation state. Never retain an UnsafeCurrentTask outside its closure.
 private final class SpeechRun: @unchecked Sendable {
     private let lock = NSLock()
     private var cancelled = false
-    var active: Bool {
-        lock.lock(); defer { lock.unlock() }; return !cancelled
-    }
+    var active: Bool { lock.lock(); defer { lock.unlock() }; return !cancelled }
     func cancel() { lock.lock(); cancelled = true; lock.unlock() }
 }
 
@@ -60,9 +57,8 @@ private enum MonoResampler {
     }
 }
 
-/// Turn-based S2S. Immediate chunk playback, bounded generation, no adaptive prebuffer.
-/// Interim decoder path recomputes the causal prefix, emitting only previously unplayed PCM.
-/// This preserves past context but costs more compute than a true stateful decoder.
+/// Immediate chunk playback with bounded generation. Prefix decoding retains context; it is
+/// an interim, more expensive alternative to a stateful decoder, not a full-reply prebuffer.
 @MainActor
 final class SpeechToSpeechEngine: ObservableObject {
     static let fenceKey = "speech-to-speech:lfm2.5-audio-1.5b-6bit"
@@ -82,6 +78,7 @@ final class SpeechToSpeechEngine: ObservableObject {
     private var session = 0
     private var responseRevision = 0
     private var voiceId = "NATM0"
+    private var lastReplyStatus = ""
     private weak var sharedAudioRef: SharedAudioEngine?
     private var speakingCallback: (@Sendable (Bool) -> Void)?
     private var statusCallback: (@Sendable (String?) -> Void)?
@@ -90,6 +87,13 @@ final class SpeechToSpeechEngine: ObservableObject {
         if let s { UserDefaults.standard.set(s, forKey: stageKey) }
         else { UserDefaults.standard.removeObject(forKey: stageKey) }
         UserDefaults.standard.synchronize()
+    }
+
+    private func recordStop(_ message: String) {
+        lastReplyStatus = message
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        UserDefaults.standard.set(stamp + " — " + message, forKey: PersonaConversationSettings.stopKey)
+        statusCallback?(message)
     }
 
     func load(progress: @escaping @Sendable (String) -> Void) async throws {
@@ -115,22 +119,17 @@ final class SpeechToSpeechEngine: ObservableObject {
             let decoder = try LFM2AudioDetokenizer.fromPretrained(modelPath: dir)
             if let data = try? Data(contentsOf: dir.appendingPathComponent("audio_detokenizer/config.json")),
                let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-               let n = json["n_fft"] as? Int, n > 0 {
-                decoderTailSamples = n
-            }
+               let n = json["n_fft"] as? Int, n > 0 { decoderTailSamples = n }
             model = loaded; processor = p; detokenizer = decoder; isLoaded = true
             LLMLoadFence.clear(); Self.setStage(nil)
             progress("Loaded. \(Int(os_proc_available_memory()) / 1_000_000) MB free.")
             try? await Task.sleep(for: .seconds(2))
-        } catch {
-            Self.setStage(nil); LLMLoadFence.clear(); throw error
-        }
+        } catch { Self.setStage(nil); LLMLoadFence.clear(); throw error }
     }
 
     func unload() {
         if let audio = sharedAudioRef { stop(sharedAudio: audio) }
         else { run?.cancel(); responseTask?.cancel(); watchdog?.cancel(); micTask?.cancel() }
-        // The response task owns its model references until it exits. A subsequent load waits.
         model = nil; processor = nil; detokenizer = nil; isLoaded = false
     }
 
@@ -149,6 +148,7 @@ final class SpeechToSpeechEngine: ObservableObject {
         guard ticket == session else { return }
         self.voiceId = voiceId; sharedAudioRef = sharedAudio
         speakingCallback = onAgentSpeaking; statusCallback = onStatus
+        lastReplyStatus = ""
         let (stream, continuation) = AsyncStream.makeStream(
             of: AVAudioPCMBuffer.self, bufferingPolicy: .bufferingNewest(16)
         )
@@ -160,7 +160,7 @@ final class SpeechToSpeechEngine: ObservableObject {
             sharedAudio.endInputCapture(); continuation.finish(); throw SpeechToSpeechError.micFailed(e)
         }
         Self.setStage("listening")
-        onStatus?("Listening. Mic button stops the session.")
+        onStatus?("Listening. Persona prompt & status opens the editor and last stop reason.")
         let gate = self.gate
         micTask = Task.detached(priority: .userInitiated) { [weak self] in
             let detector = MicTurnDetector()
@@ -171,8 +171,7 @@ final class SpeechToSpeechEngine: ObservableObject {
             var lastStatus = CFAbsoluteTimeGetCurrent()
             for await buffer in stream {
                 if Task.isCancelled { break }
-                // Diagnostic isolation: do not turn speaker leakage into a new user turn.
-                // The mic remains installed; automatic acoustic barge-in is temporarily off.
+                // No automatic sound-triggered interruption in this diagnostic build.
                 if gate.active {
                     wasBusy = true; audio.removeAll(); preroll.removeAll(); inTurn = false
                     detector.resetUtterance(); continue
@@ -188,10 +187,7 @@ final class SpeechToSpeechEngine: ObservableObject {
                     if decision.feedAsr {
                         inTurn = true; audio = preroll.flatMap { $0 }; preroll.removeAll()
                     }
-                } else {
-                    // Preserve intra-utterance silence rather than stitching words together.
-                    audio.append(contentsOf: samples)
-                }
+                } else { audio.append(contentsOf: samples) }
                 if inTurn, decision.endTurn || audio.count >= 16_000 * 20 {
                     let turn = audio; audio = []; inTurn = false; detector.resetUtterance()
                     if turn.count >= 9600 { await self?.submit(turn, session: ticket) }
@@ -199,13 +195,21 @@ final class SpeechToSpeechEngine: ObservableObject {
                 let now = CFAbsoluteTimeGetCurrent()
                 if !gate.active, now - lastStatus > 0.3 {
                     lastStatus = now
-                    onStatus?(String(format: inTurn ? "Hearing you (mic %.3f)..." : "Listening (mic %.3f)...", rms))
+                    await self?.showMicStatus(inTurn: inTurn, rms: rms, session: ticket)
                 }
             }
         }
     }
 
+    private func showMicStatus(inTurn: Bool, rms: Float, session ticket: Int) {
+        guard ticket == session, !gate.active else { return }
+        // A stop reason stays on screen until the next captured turn is submitted.
+        guard lastReplyStatus.isEmpty else { return }
+        statusCallback?(String(format: inTurn ? "Hearing you (mic %.3f)..." : "Listening (mic %.3f)...", rms))
+    }
+
     func stop(sharedAudio: SharedAudioEngine) {
+        if run?.active == true { recordStop("Session stopped externally (button, mode change, or pipeline callback); not an S2S mic-triggered interrupt.") }
         session += 1; responseRevision += 1
         run?.cancel(); watchdog?.cancel(); watchdog = nil
         responseTask?.cancel(); micTask?.cancel(); micTask = nil
@@ -222,18 +226,20 @@ final class SpeechToSpeechEngine: ObservableObject {
         responseRevision += 1
         let revision = responseRevision
         let token = SpeechRun(); run = token; gate.set(true)
+        lastReplyStatus = ""
         let female = voiceId.contains("F")
-        let system = "Respond with interleaved text and speech audio. Use a US \(female ? "female" : "male") voice. Chat casually and respond directly in one short sentence. Do not introduce yourself."
+        let saved = (UserDefaults.standard.string(forKey: PersonaConversationSettings.promptKey) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let personality = saved.isEmpty ? PersonaConversationSettings.defaultPrompt : saved
+        let system = "Respond with interleaved text and speech audio. Use a US \(female ? "female" : "male") voice. " + personality
         let tailGuard = decoderTailSamples
         statusCallback?("Processing your speech...")
         Self.setStage("generating reply")
-        // Covers generation and playback, including a missing playback callback. This cannot
-        // preempt a GPU kernel, but it invalidates queued audio and resets the interface.
         watchdog = Task { [weak self] in
             try? await Task.sleep(for: .seconds(30))
             guard !Task.isCancelled else { return }
             self?.finishResponse(token, revision: revision, session: ticket, forced: true,
-                                 message: "Response stopped at the 30-second safety limit. Listening again.")
+                                 message: "Safety cutoff: 30-second response/playback deadline.")
         }
         responseTask = Task.detached(priority: .userInitiated) { [weak self] in
             await previous?.value
@@ -250,13 +256,12 @@ final class SpeechToSpeechEngine: ObservableObject {
             var lastDecoded = 0
             var firstQueue: Double?
             var reason: String?
+            var deliveredTokens = 0
             let config = LFMGenerationConfig(maxNewTokens: 180, temperature: 0.7, topK: 50,
                                              topP: 1, audioTemperature: 0.8, audioTopK: 4)
 
             func emit(final: Bool) {
                 guard token.active, !Task.isCancelled, !codes.isEmpty else { return }
-                // Recompute the complete causal prefix so attention and convolutions see their
-                // real history. Never replay old PCM; withhold an FFT-sized unstable end only.
                 let input = MLX.stacked(codes, axis: 0).transposed(1, 0).expandedDimensions(axis: 0)
                 let waveform = detokenizer(input).asType(.float32).asArray(Float.self)
                 lastDecoded = codes.count
@@ -282,43 +287,40 @@ final class SpeechToSpeechEngine: ObservableObject {
                 modalities: chat.getModalities(), config: config,
                 onToken: { value, modality in
                     guard token.active, !Task.isCancelled else { return false }
-                    if CFAbsoluteTimeGetCurrent() - started > 20 { reason = "Generation time limit"; return false }
+                    deliveredTokens += 1
+                    if CFAbsoluteTimeGetCurrent() - started > 20 { reason = "Generation time limit (20 seconds)"; return false }
                     eval(value)
                     if modality == .text {
                         text.append(value.item(Int.self))
-                        if text.count >= 80 { reason = "Text length limit"; return false }
+                        if text.count >= 80 { reason = "Text length limit (80 tokens)"; return false }
                     } else if modality == .audioOut {
                         let frame = value.asArray(Int32.self)
                         guard frame.count == 8 else { reason = "Unexpected audio frame shape"; return false }
                         if frame[0] == Int32(lfmAudioEOSToken) { return true }
-                        guard frame.allSatisfy({ $0 >= 0 && $0 < Int32(lfmAudioEOSToken) }) else {
-                            reason = "Invalid audio codes"; return false
-                        }
+                        guard frame.allSatisfy({ $0 >= 0 && $0 < Int32(lfmAudioEOSToken) }) else { reason = "Invalid audio codes"; return false }
                         recent.append(frame)
                         if recent.count > 20 { recent.removeFirst() }
-                        if recent.count >= 10, recent.suffix(10).allSatisfy({ $0 == frame }) {
-                            reason = "Repeated identical audio frames"; return false
-                        }
-                        if recent.count == 20, Array(recent.prefix(10)) == Array(recent.suffix(10)) {
-                            reason = "Repeated audio-code sequence"; return false
-                        }
+                        if recent.count >= 10, recent.suffix(10).allSatisfy({ $0 == frame }) { reason = "Repeated identical audio frames"; return false }
+                        if recent.count == 20, Array(recent.prefix(10)) == Array(recent.suffix(10)) { reason = "Repeated audio-code sequence"; return false }
                         codes.append(value)
                         if codes.count - lastDecoded >= (lastDecoded == 0 ? 6 : 12) { emit(final: false) }
                         if reason != nil { return false }
-                        if codes.count >= 100 { reason = "Audio length limit"; return false }
+                        if codes.count >= 100 { reason = "Audio length limit (100 frames)"; return false }
                     }
                     return true
                 }
             )
             guard token.active, !Task.isCancelled else { return }
+            if reason == nil, deliveredTokens >= 180 { reason = "Generation token budget (180 tokens)" }
             if reason == nil { emit(final: true) }
-            let reply = processor.decodeText(text)
-            let summary = reason.map { "Stopped: \($0)." }
-                ?? String(format: "Reply %.1f s; first chunk queued %.1f s. ",
-                          CFAbsoluteTimeGetCurrent() - started, firstQueue ?? -1) + reply
-            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
-                DispatchQueue.main.async { c.resume() }
+            let summary: String
+            if let reason { summary = "Safety cutoff: " + reason + "." }
+            else if emitted == 0 { summary = "Model generation ended without playable audio." }
+            else {
+                summary = String(format: "Model generation ended; %.1f s, first chunk queued %.1f s, %d audio frames.",
+                                 CFAbsoluteTimeGetCurrent() - started, firstQueue ?? -1, codes.count)
             }
+            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in DispatchQueue.main.async { c.resume() } }
             guard token.active, !Task.isCancelled else { return }
             if reason != nil {
                 await self?.finishResponse(token, revision: revision, session: ticket, forced: true, message: summary)
@@ -326,18 +328,16 @@ final class SpeechToSpeechEngine: ObservableObject {
             }
             await sharedAudio.waitForPlaybackCompletion()
             guard token.active, !Task.isCancelled else { return }
-            // Let the AEC tail settle before allowing a new turn from the mic.
             try? await Task.sleep(for: .milliseconds(350))
             await self?.finishResponse(token, revision: revision, session: ticket, forced: false, message: summary)
         }
     }
 
-    private func finishResponse(_ token: SpeechRun, revision: Int, session ticket: Int,
-                                forced: Bool, message: String) {
+    private func finishResponse(_ token: SpeechRun, revision: Int, session ticket: Int, forced: Bool, message: String) {
         guard session == ticket, responseRevision == revision, token.active else { return }
         token.cancel(); watchdog?.cancel(); watchdog = nil
         if forced { responseTask?.cancel(); sharedAudioRef?.stopPlayback() }
         speakingCallback?(false); gate.set(false); Self.setStage("listening")
-        statusCallback?(message)
+        recordStop(message)
     }
 }
