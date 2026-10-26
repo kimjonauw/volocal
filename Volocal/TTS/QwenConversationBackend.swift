@@ -74,11 +74,6 @@ actor QwenConversationBackend {
     func load() async throws {
         if model != nil { return }
         try await Self.prepareFiles()
-        // Conservative guesses until phone memory readings are available.
-        let free = os_proc_available_memory()
-        guard free == 0 || free >= 1_500_000_000 else {
-            throw Self.failure("Not enough memory to load Qwen 0.6B alongside this LLM. Choose a smaller LLM or switch back to PocketTTS.")
-        }
         let path = Self.directory.path
         let task = Task.detached(priority: .userInitiated) { () throws -> Qwen3TTSModel in
             let limit = Memory.cacheLimit; Memory.cacheLimit = 32 * 1024 * 1024
@@ -97,11 +92,6 @@ actor QwenConversationBackend {
     func synthesize(_ text: String, speaker: String, whisper: Bool) async throws -> [Float] {
         try Task.checkCancellation()
         guard let model else { throw Self.failure("Qwen is not loaded.") }
-        // Refuse a clause rather than let iOS terminate the app. Threshold is a guess.
-        let free = os_proc_available_memory()
-        guard free == 0 || free >= 600_000_000 else {
-            throw Self.failure("Low memory (\(Int(free) / 1_000_000) MB free); skipped Qwen speech to avoid a crash.")
-        }
         let supported = ["Serena", "Vivian", "Ryan", "Aiden"]
         let voice = supported.contains(speaker) ? speaker : "Serena"
         let delivery = whisper ? "Speak softly in a gentle whisper without shouting." : "Warm and gently playful. Speak naturally and conversationally without shouting."
