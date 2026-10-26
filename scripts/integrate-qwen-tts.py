@@ -1,8 +1,10 @@
 """Guarded build-time source overlay. Run before XcodeGen; never edits dependencies.
 
-Keeps the existing long pipeline/model-manager implementations intact. Every edit
-requires a unique inspected anchor, and all files are checked before any write.
-Qwen is optional, 4-bit only, and uses fixed delivery in this first integration.
+Keeps long existing files intact. Every edit requires a unique inspected anchor, and all
+files are checked before any write. Qwen is optional, uses the 0.6B 4-bit CustomVoice
+model, and has fixed warm/playful delivery in this first integration.
+This script also hides the removed Persona mode in the voice picker and ignores any saved
+Persona pipeline-mode value.
 """
 from pathlib import Path
 
@@ -17,9 +19,9 @@ def replace(path, old, new):
 
 engines = 'Volocal/Models/VoiceEngines.swift'
 replace(engines, '    case supertonic3\n', '    case supertonic3\n    case qwen3Tts\n')
-replace(engines, 'case .supertonic3: return "Supertonic-3"', 'case .supertonic3: return "Supertonic-3"\n        case .qwen3Tts: return "Qwen3-TTS 1.7B (4-bit)"')
-replace(engines, '        case .supertonic3:\n            return "Newer CoreML', '        case .qwen3Tts:\n            return "Experimental expressive local voice. Uses your selected LLM with fixed warm/playful delivery, shared playback, and GPU serialization. More memory than PocketTTS. Audio is buffered per short clause; LLM-generated delivery is not wired yet."\n        case .supertonic3:\n            return "Newer CoreML')
-replace(engines, 'case .supertonic3: return "~200 MB"', 'case .supertonic3: return "~200 MB"\n        case .qwen3Tts: return "Multi-GB download; high RAM use"')
+replace(engines, 'case .supertonic3: return "Supertonic-3"', 'case .supertonic3: return "Supertonic-3"\n        case .qwen3Tts: return "Qwen3-TTS 0.6B (4-bit)"')
+replace(engines, '        case .supertonic3:\n            return "Newer CoreML', '        case .qwen3Tts:\n            return "Experimental expressive local voice (Qwen3-TTS 0.6B, 4-bit). Uses your selected LLM with fixed warm/playful delivery, shared playback, and GPU serialization. Needs more memory than PocketTTS; audio is buffered per short clause."\n        case .supertonic3:\n            return "Newer CoreML')
+replace(engines, 'case .supertonic3: return "~200 MB"', 'case .supertonic3: return "~200 MB"\n        case .qwen3Tts: return "Large download; extra RAM"')
 replace(engines, 'case .supertonic3: return "F1"', 'case .supertonic3: return "F1"\n        case .qwen3Tts: return "Serena"')
 replace(engines, '    var voiceChoices: [TTSVoiceChoice] {\n        switch self {', '    var voiceChoices: [TTSVoiceChoice] {\n        switch self {\n        case .qwen3Tts:\n            return ["Serena", "Vivian", "Ryan", "Aiden"].map { TTSVoiceChoice(id: $0, displayName: $0, detail: "Qwen preset") }')
 replace(engines, '        case .supertonic3:\n            let repoDir', '        case .qwen3Tts:\n            return QwenConversationBackend.isDownloaded\n        case .supertonic3:\n            let repoDir')
@@ -46,7 +48,7 @@ replace(manager, '        if let pocketSmall {\n            chunks = try await w
         } else if let pocketSmall {
             chunks = try await withGPU {''')
 replace(manager, '        speakTask?.cancel()\n        holdsInferenceGPU = false\n', '        speakTask?.cancel()\n        // withGPU clears this only after the worker actually drains.\n')
-replace(manager, '    // MARK: - Cloned Voices\n', '''    /// Called after stopAndWait, including when switching to speech-to-speech.
+replace(manager, '    // MARK: - Cloned Voices\n', '''    /// Called after stopAndWait when the TTS engine changes.
     func releaseQwen() async {
         guard let backend = qwen else { return }
         _ = try? await withGPU { await backend.unload() }
@@ -58,12 +60,16 @@ replace(manager, '    // MARK: - Cloned Voices\n', '''    /// Called after stopA
 
 models = 'Volocal/Models/UnifiedModelManager.swift'
 replace(models, '            case .supertonic3:\n                _ = try await Supertonic3ResourceDownloader.ensureModels(', '            case .qwen3Tts:\n                try await QwenConversationBackend.prepareFiles()\n            case .supertonic3:\n                _ = try await Supertonic3ResourceDownloader.ensureModels(')
+# Ignore a saved Persona mode. Modular is the only pipeline.
+replace(models, '            pipelineMode = mode\n        } else {', '            _ = mode\n            pipelineMode = .modular\n        } else {')
 
 persona = 'Volocal/Models/PersonaPlexSpec.swift'
 replace(persona, '        switch engine {\n        case .supertonic3:', '        switch engine {\n        case .qwen3Tts:\n            return preset.gender == "Female" ? "Serena" : "Ryan"\n        case .supertonic3:')
 
-pipeline = 'Volocal/Pipeline/VoicePipeline.swift'
-replace(pipeline, '            ttsManager.stop()\n            llmManager.unload()', '            await ttsManager.stopAndWait()\n            await ttsManager.releaseQwen()\n            llmManager.unload()')
+picker = 'Volocal/Models/VoiceEnginePickerView.swift'
+replace(picker, '                        Text("Persona").tag(PipelineMode.personaplex)\n', '')
+replace(picker, '                if modelManager.pipelineMode == .personaplex {\n                    personaplexSections\n                } else {\n                    modularSections\n                }', '                modularSections')
+replace(picker, '.navigationTitle(modelManager.pipelineMode == .personaplex ? "Persona conversation" : "Voice engines")', '.navigationTitle("Voice engines")')
 
 for path, text in changes.items():
     Path(path).write_text(text)

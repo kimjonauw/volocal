@@ -30,7 +30,8 @@ packages:
   swift-transformers:
     url: https://github.com/huggingface/swift-transformers
     from: "1.3.0"
-  # Keep the fork's inline LFM streaming implementation.
+  # Fork of Blaizzy/mlx-audio-swift pinned at the revision tested with Qwen3-TTS.
+  # Persona speech-to-speech (LFM2.5-Audio) has been removed; only MLXAudioTTS/Core are linked.
   mlx-audio-swift:
     url: https://github.com/kimjonauw/mlx-audio-swift.git
     revision: "1d0239f6e7664ab9aa2cee77aaa10ebf768bb661"
@@ -71,8 +72,6 @@ targets:
         product: HuggingFace
       - package: swift-transformers
         product: Tokenizers
-      - package: mlx-audio-swift
-        product: MLXAudioSTS
       - package: mlx-audio-swift
         product: MLXAudioTTS
       - package: mlx-audio-swift

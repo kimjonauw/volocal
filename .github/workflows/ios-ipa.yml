@@ -48,7 +48,7 @@ jobs:
           NOTES="$(cat <<EOF
           Rolling SideStore build \`${GITHUB_SHA:0:7}\`.
 
-          Includes the guarded Qwen3-TTS 4-bit modular integration applied before XcodeGen. Choose Modular mode, then Qwen3-TTS 1.7B (4-bit) in the waveform voice-engine picker. Fixed warm/playful delivery; clause-buffered audio. PocketTTS remains available. Combined memory and interruption behavior need phone testing.
+          Persona speech-to-speech mode is removed. The app is modular only. Includes the guarded Qwen3-TTS 0.6B (4-bit) integration applied before XcodeGen: open the waveform voice-engine picker and choose Qwen3-TTS 0.6B (4-bit). Fixed warm/playful delivery; clause-buffered audio; low-memory guards skip a clause instead of crashing. PocketTTS remains available.
 
           Download **Volocal.ipa** from Assets (not Actions artifacts — those are always a zip).
 

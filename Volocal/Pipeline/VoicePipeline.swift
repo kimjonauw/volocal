@@ -10,8 +10,7 @@ private let logger = Logger(subsystem: "com.volocal.app", category: "pipeline")
 /// buffers into sentences, and sends to TTS for playback.
 /// Supports barge-in: user can speak while AI is talking to interrupt.
 ///
-/// `PipelineMode.personaplex` is different: it is real speech-to-speech (LFM2.5-Audio), so
-/// none of the recognizer, language model or TTS run in that mode.
+/// The former Persona speech-to-speech mode has been removed. This pipeline is always modular.
 @MainActor
 final class VoicePipeline: ObservableObject {
     @Published var state: PipelineState = .idle {
@@ -29,7 +28,6 @@ final class VoicePipeline: ObservableObject {
     let llmManager = LLMManager()
     let ttsManager = TTSManager()
     let sharedAudio = SharedAudioEngine()
-    let s2s = SpeechToSpeechEngine()
     @Published var pipelineMode: PipelineMode = .modular
     @Published var personaVoice: String = PersonaPlexSpec.defaultVoice
     @Published var personaId: String = PersonaPlexSpec.defaultPersonaId
@@ -120,7 +118,8 @@ final class VoicePipeline: ObservableObject {
     ) async {
         configureGeneration += 1
         let gen = configureGeneration
-        self.pipelineMode = mode
+        // The old Persona mode is gone; any saved mode value is ignored.
+        self.pipelineMode = .modular
         self.personaVoice = personaVoice
         self.personaId = personaId
         currentError = nil
@@ -129,39 +128,6 @@ final class VoicePipeline: ObservableObject {
         sttManager.sharedAudio = sharedAudio
         ttsManager.sharedAudio = sharedAudio
         ttsManager.stt = sttManager
-
-        if mode == .personaplex {
-            // Real speech-to-speech. The model replaces the recognizer, the language model
-            // and the TTS voice, so none of them load. Free whatever the cascade was holding.
-            sttManager.stopListening()
-            ttsManager.stop()
-            llmManager.unload()
-            ttsManager.conversationalTone = false
-
-            loadingStatus = "Loading speech-to-speech..."
-            do {
-                try await s2s.load { [weak self] text in
-                    Task { @MainActor in
-                        self?.loadingStatus = text
-                    }
-                }
-            } catch {
-                guard gen == configureGeneration else { return }
-                logger.error("Speech-to-speech load failed: \(error.localizedDescription)")
-                currentError = error.localizedDescription
-                loadingStatus = nil
-                return
-            }
-            guard gen == configureGeneration else { return }
-
-            loadingStatus = nil
-            isReady = true
-            return
-        }
-
-        // Modular mode: release the speech-to-speech model so its memory is free for the cascade.
-        s2s.stop(sharedAudio: sharedAudio)
-        s2s.unload()
 
         guard let path = llmModelPath else {
             currentError = "No GGUF on this iPhone. Pick a language model first."
@@ -283,14 +249,10 @@ final class VoicePipeline: ObservableObject {
         isReady = false
     }
 
+    /// Kept for old call sites. Modular is the only pipeline now.
     func setPipelineMode(_ mode: PipelineMode) {
-        if pipelineMode != mode {
-            if state != .idle {
-                stopListening()
-            }
-            pipelineMode = mode
-            updatePromptForCurrentMode()
-        }
+        _ = mode
+        if pipelineMode != .modular { pipelineMode = .modular }
     }
 
     func setPersonaVoice(_ voice: String) {
@@ -299,16 +261,9 @@ final class VoicePipeline: ObservableObject {
 
     func setPersonaId(_ id: String) {
         personaId = id
-        if pipelineMode == .personaplex {
-            updatePromptForCurrentMode()
-        }
     }
 
     private func updatePromptForCurrentMode() {
-        if pipelineMode == .personaplex {
-            // Speech-to-speech builds its own prompt. Nothing to update.
-            return
-        }
         llmManager.systemPrompt = LLMManager.systemPrompt(
             from: baseInstructions,
             expressions: ttsManager.expressionsEnabled
@@ -316,14 +271,6 @@ final class VoicePipeline: ObservableObject {
     }
 
     func toggleListening() {
-        if pipelineMode == .personaplex {
-            if state == .idle {
-                startSpeechToSpeech()
-            } else {
-                stopSpeechToSpeech()
-            }
-            return
-        }
         switch state {
         case .idle:
             startListening()
@@ -360,54 +307,6 @@ final class VoicePipeline: ObservableObject {
         UIApplication.shared.isIdleTimerDisabled = sceneIsActive && state != .idle
     }
 
-    // MARK: - Speech-to-speech
-
-    private func startSpeechToSpeech() {
-        state = .listening
-        currentError = nil
-        partialTranscript = ""
-        let voice = personaVoice
-        Task { @MainActor in
-            do {
-                try await s2s.start(
-                    sharedAudio: sharedAudio,
-                    voiceId: voice,
-                    onAgentSpeaking: { [weak self] speaking in
-                        Task { @MainActor in
-                            guard let self, self.pipelineMode == .personaplex, self.state != .idle else { return }
-                            self.state = speaking ? .speaking : .listening
-                        }
-                    },
-                    onStepTime: { _ in },
-                    onFinished: { [weak self] message in
-                        Task { @MainActor in
-                            guard let self, self.pipelineMode == .personaplex else { return }
-                            if let message { self.currentError = message }
-                            self.stopSpeechToSpeech()
-                        }
-                    },
-                    onStatus: { [weak self] text in
-                        // The blue line under "Listening" shows what the app hears and does.
-                        Task { @MainActor in
-                            guard let self, self.pipelineMode == .personaplex, self.state != .idle else { return }
-                            self.partialTranscript = text ?? ""
-                        }
-                    }
-                )
-            } catch {
-                currentError = error.localizedDescription
-                partialTranscript = ""
-                state = .idle
-            }
-        }
-    }
-
-    private func stopSpeechToSpeech() {
-        s2s.stop(sharedAudio: sharedAudio)
-        partialTranscript = ""
-        state = .idle
-    }
-
     // MARK: - Pipeline Control
 
     private func startListening() {
@@ -426,20 +325,12 @@ final class VoicePipeline: ObservableObject {
     }
 
     private func stopListening() {
-        if pipelineMode == .personaplex {
-            stopSpeechToSpeech()
-            return
-        }
         cancelDraft()
         sttManager.stopListening()
         state = .idle
     }
 
     private func interrupt() {
-        if pipelineMode == .personaplex {
-            stopSpeechToSpeech()
-            return
-        }
         turnRevision += 1
         cancelDraft()
         ttsManager.stop()
