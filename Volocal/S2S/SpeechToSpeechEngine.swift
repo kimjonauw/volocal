@@ -76,8 +76,9 @@ private enum MonoResampler {
 }
 
 /// Real speech-to-speech with Liquid AI's LFM2.5-Audio-1.5B (6-bit, ~1.3 GB) through the
-/// MLXAudioSTS library of mlx-audio-swift. One model hears your audio and answers in audio, so
-/// the recognizer, the language model and the TTS voice are not used in this mode.
+/// MLXAudioSTS library of mlx-audio-swift (our fork, which adds `generateInterleavedInline`).
+/// One model hears your audio and answers in audio, so the recognizer, the language model and
+/// the TTS voice are not used in this mode.
 ///
 /// It is turn-based, like a voice-assistant call: when you stop talking (energy turn detector)
 /// the model answers, streaming speech. Talking loudly over the reply for about 0.3 s cuts it off.
@@ -88,6 +89,9 @@ private enum MonoResampler {
 ///
 /// Mic audio comes from `SharedAudioEngine` (Voice Processing echo cancellation) and is converted
 /// to 16 kHz mono. The reply is decoded to 24 kHz and plays through the same engine.
+///
+/// All model work (generation and audio decoding) runs one step after another on one thread:
+/// MLX is not thread-safe.
 @MainActor
 final class SpeechToSpeechEngine: ObservableObject {
     /// Same crash fence the language model uses. A jetsam kill during load must not crash-loop.
@@ -102,6 +106,9 @@ final class SpeechToSpeechEngine: ObservableObject {
     /// audio frame. Greedy audio skips all of that. Audio may sound a bit flatter; set this to
     /// false to compare with the library's normal sampling.
     private static let fastSampling = true
+    /// Frames in a typical short reply (about 3.2 s). Used to decide how much audio to hold back
+    /// before playback starts so it does not run dry. A longer reply can pause briefly.
+    private static let expectedReplyFrames = 40.0
 
     @Published private(set) var isLoaded = false
 
@@ -393,11 +400,11 @@ final class SpeechToSpeechEngine: ObservableObject {
         let systemText = Self.systemPrompt(for: voiceId)
         let gate = self.gate
         let speaking = agentSpeakingCallback
-        let finished = finishedCallback
         let status = statusCallback
         let firstChunkFrames = 6
         let chunkFrames = 12
         let overlapFrames = 3
+        let expectedFrames = Self.expectedReplyFrames
         let startedAt = CFAbsoluteTimeGetCurrent()
         let fast = Self.fastSampling
         let config: LFMGenerationConfig = fast
@@ -407,7 +414,7 @@ final class SpeechToSpeechEngine: ObservableObject {
             )
             : LFMGenerationConfig(maxNewTokens: 400)
 
-        responseTask = Task.detached(priority: .userInitiated) { [weak self] in
+        responseTask = Task.detached(priority: .userInitiated) {
             await previous?.value
             if Task.isCancelled { return }
 
@@ -424,10 +431,11 @@ final class SpeechToSpeechEngine: ObservableObject {
             var codes: [MLXArray] = []
             var replyTokens: [Int] = []
             var decodedFrames = 0
-            var announcedSpeaking = false
-            var firstTokenAt: Double?
+            var pendingPCM: [[Float]] = []
+            var playbackStarted = false
             var firstAudioAt: Double?
-            var failure: String?
+            var firstFrameAt: Double?
+            var prefillDoneAt: Double?
 
             // Decode frames [decodedFrames ..< end). A few earlier frames are decoded again for
             // context and their audio is dropped, so chunk seams do not click.
@@ -443,87 +451,122 @@ final class SpeechToSpeechEngine: ObservableObject {
                 return Array(all.dropFirst(overlap * perFrame))
             }
 
-            func play(_ samples: [Float]) async {
-                guard !samples.isEmpty, !Task.isCancelled else { return }
-                await MainActor.run {
-                    sharedAudio.scheduleTTSBuffer(samples)
-                }
-                if !announcedSpeaking {
-                    announcedSpeaking = true
-                    firstAudioAt = CFAbsoluteTimeGetCurrent()
-                    speaking?(true)
+            // Hands audio to the player on the main thread, in order.
+            func schedule(_ samples: [Float]) {
+                guard !samples.isEmpty else { return }
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        sharedAudio.scheduleTTSBuffer(samples)
+                    }
                 }
             }
 
-            do {
-                for try await (token, modality) in model.generateInterleaved(
-                    textTokens: chat.getTextTokens(),
-                    audioFeatures: chat.getAudioFeatures(),
-                    modalities: chat.getModalities(),
-                    config: config
-                ) {
-                    if Task.isCancelled { break }
+            func startPlayback() {
+                guard !playbackStarted else { return }
+                playbackStarted = true
+                firstAudioAt = CFAbsoluteTimeGetCurrent()
+                for chunk in pendingPCM { schedule(chunk) }
+                pendingPCM.removeAll()
+                speaking?(true)
+            }
+
+            // Playback starts once enough audio is ready that it will not run dry: the model
+            // makes `rate` frames per second and speech needs 12.5, so a slower model needs a
+            // bigger head start. A model that keeps up starts after the first chunk.
+            func considerStart() {
+                guard !playbackStarted, let t0 = firstFrameAt else { return }
+                let produced = codes.count
+                let elapsed = CFAbsoluteTimeGetCurrent() - t0
+                guard produced >= 4, elapsed > 0.05 else { return }
+                let rate = Double(produced - 1) / elapsed
+                let needed = max(Double(firstChunkFrames), expectedFrames * max(0, 1 - rate / 12.5))
+                status?(String(
+                    format: "Generating audio at %.1f frames/s (speech needs 12.5). Sound starts once %d frames are ready (%d so far).",
+                    rate, Int(needed.rounded(.up)), decodedFrames
+                ))
+                if Double(decodedFrames) >= needed { startPlayback() }
+            }
+
+            func deliver(_ samples: [Float]) {
+                if playbackStarted {
+                    schedule(samples)
+                } else {
+                    pendingPCM.append(samples)
+                    considerStart()
+                }
+            }
+
+            // The model and the audio decoder both run right here, one step after another.
+            model.generateInterleavedInline(
+                textTokens: chat.getTextTokens(),
+                audioFeatures: chat.getAudioFeatures(),
+                modalities: chat.getModalities(),
+                config: config,
+                onPrefillDone: {
+                    let now = CFAbsoluteTimeGetCurrent()
+                    prefillDoneAt = now
+                    status?(String(format: "Your recording was processed in %.1f s. Generating the reply...", now - startedAt))
+                },
+                onToken: { token, modality in
+                    if Task.isCancelled { return false }
                     eval(token)
-                    if firstTokenAt == nil {
-                        let now = CFAbsoluteTimeGetCurrent()
-                        firstTokenAt = now
-                        status?(String(format: "Model started after %.1f s", now - startedAt))
-                    }
                     if modality == .text {
                         replyTokens.append(token.item(Int.self))
-                        if replyTokens.count % 8 == 0 {
-                            status?("Replying: " + processor.decodeText(replyTokens))
-                        }
                     } else if modality == .audioOut {
-                        // The library's own speech-to-speech example skips the end-of-audio
-                        // frame and keeps reading; only the stream's end ends the reply.
-                        if token[0].item(Int.self) == lfmAudioEOSToken { continue }
+                        // The end-of-audio frame is skipped; only the end of generation ends
+                        // the reply (same as the library's own example).
+                        if token[0].item(Int.self) == lfmAudioEOSToken { return true }
+                        if firstFrameAt == nil { firstFrameAt = CFAbsoluteTimeGetCurrent() }
                         codes.append(token)
-                        // A short first chunk gets sound out quickly; later chunks are bigger.
+                        // A short first chunk, then bigger ones.
                         let target = decodedFrames == 0 ? firstChunkFrames : chunkFrames
                         if codes.count - decodedFrames >= target {
-                            await play(decodeChunk(upTo: codes.count))
+                            deliver(decodeChunk(upTo: codes.count))
                         }
                     }
+                    return true
                 }
-                if !Task.isCancelled, codes.count > decodedFrames {
-                    await play(decodeChunk(upTo: codes.count))
-                }
-            } catch {
-                failure = "Speech-to-speech stopped: \(error.localizedDescription)"
-            }
+            )
 
             if Task.isCancelled { return }
 
-            let replyText = processor.decodeText(replyTokens)
-            if failure == nil {
-                let total = CFAbsoluteTimeGetCurrent() - startedAt
-                let mode = fast ? "fast" : "normal"
-                if codes.isEmpty {
-                    status?(String(format: "No audio came back after %.1f s (%d text tokens, %@ sampling). Text: ", total, replyTokens.count, mode) + replyText)
+            // Decode what is left and make sure everything that is ready gets played.
+            if codes.count > decodedFrames {
+                let tail = decodeChunk(upTo: codes.count)
+                if playbackStarted {
+                    schedule(tail)
                 } else {
-                    // 8-code frames are 0.08 s of speech each.
-                    let audioSeconds = Double(codes.count) * 0.08
-                    let ratio = total / max(audioSeconds, 0.1)
-                    let first = firstAudioAt.map { $0 - startedAt } ?? total
-                    status?(String(format: "Replied in %.1f s for %.1f s of audio (%.1fx the audio length), first sound after %.1f s, %@ sampling: ", total, audioSeconds, ratio, first, mode) + replyText)
+                    pendingPCM.append(tail)
                 }
             }
+            if !playbackStarted, !pendingPCM.isEmpty { startPlayback() }
 
-            // Let the reply finish playing, then listen again.
+            let replyText = processor.decodeText(replyTokens)
+            let doneAt = CFAbsoluteTimeGetCurrent()
+            let total = doneAt - startedAt
+            let mode = fast ? "fast" : "normal"
+            if codes.isEmpty {
+                status?(String(format: "No audio came back after %.1f s (%d text tokens, %@ sampling). Text: ", total, replyTokens.count, mode) + replyText)
+            } else {
+                // 8-code frames are 0.08 s of speech each.
+                let audioSeconds = Double(codes.count) * 0.08
+                let prepared = (prefillDoneAt ?? doneAt) - startedAt
+                let generating = max(total - prepared, 0.01)
+                let fps = Double(codes.count) / generating
+                let first = firstAudioAt.map { $0 - startedAt } ?? total
+                status?(String(
+                    format: "Replied in %.1f s for %.1f s of audio. Recording processed in %.1f s, then %.1f frames/s (speech needs 12.5). First sound after %.1f s, %@ sampling: ",
+                    total, audioSeconds, prepared, fps, first, mode
+                ) + replyText)
+            }
+
+            // Wait for the queued main-thread hand-offs, then for the audio to finish playing.
+            await MainActor.run {}
             await sharedAudio.waitForPlaybackCompletion()
-            if announcedSpeaking { speaking?(false) }
+            if playbackStarted { speaking?(false) }
             try? await Task.sleep(for: .milliseconds(300))
             gate.set(false)
             Memory.clearCache()
-
-            let wasCancelled = Task.isCancelled
-            await MainActor.run {
-                guard let self, self.session == currentSession, !wasCancelled else { return }
-                if let failure {
-                    finished?(failure)
-                }
-            }
         }
     }
 }
