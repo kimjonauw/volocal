@@ -39,8 +39,7 @@ private final class AgentGate: @unchecked Sendable {
 
 private enum MonoResampler {
     static func mono16k(from buffer: AVAudioPCMBuffer) -> [Float] {
-        guard let channel = buffer.floatChannelData?[0], buffer.frameLength > 0,
-              buffer.format.sampleRate > 0 else { return [] }
+        guard let channel = buffer.floatChannelData?[0], buffer.frameLength > 0, buffer.format.sampleRate > 0 else { return [] }
         let n = Int(buffer.frameLength)
         let ratio = buffer.format.sampleRate / 16_000
         let m = Int(Double(n) / ratio)
@@ -57,8 +56,8 @@ private enum MonoResampler {
     }
 }
 
-/// Immediate chunk playback with bounded generation. Prefix decoding retains context; it is
-/// an interim, more expensive alternative to a stateful decoder, not a full-reply prebuffer.
+/// Immediate chunk playback. The optional transcription-only turn verifies the same mic path.
+/// Prefix decoding is an interim alternative to a stateful decoder, not full-reply buffering.
 @MainActor
 final class SpeechToSpeechEngine: ObservableObject {
     static let fenceKey = "speech-to-speech:lfm2.5-audio-1.5b-6bit"
@@ -91,17 +90,14 @@ final class SpeechToSpeechEngine: ObservableObject {
 
     private func recordStop(_ message: String) {
         lastReplyStatus = message
-        let stamp = ISO8601DateFormatter().string(from: Date())
-        UserDefaults.standard.set(stamp + " — " + message, forKey: PersonaConversationSettings.stopKey)
+        UserDefaults.standard.set(ISO8601DateFormatter().string(from: Date()) + " — " + message, forKey: PersonaConversationSettings.stopKey)
         statusCallback?(message)
     }
 
     func load(progress: @escaping @Sendable (String) -> Void) async throws {
         if model != nil { return }
         let old = UserDefaults.standard.string(forKey: Self.stageKey)
-        if LLMLoadFence.shouldSkipLoad(path: Self.fenceKey) {
-            throw SpeechToSpeechError.previousCrash(stage: old)
-        }
+        if LLMLoadFence.shouldSkipLoad(path: Self.fenceKey) { throw SpeechToSpeechError.previousCrash(stage: old) }
         let available = Int(os_proc_available_memory())
         if available > 0, available < 2_200_000_000 {
             throw SpeechToSpeechError.notEnoughMemory(availableMB: available / 1_000_000, neededMB: 2200)
@@ -112,17 +108,19 @@ final class SpeechToSpeechEngine: ObservableObject {
         do {
             progress("Loading LFM2.5-Audio...")
             let loaded = try await LFM2AudioModel.fromPretrained(Self.modelId)
-            guard let p = loaded.processor, let dir = loaded.modelDirectory else {
-                throw SpeechToSpeechError.incompleteModel
-            }
+            // Tensor eval() is not inference mode. train(false) disables Dropout and switches
+            // BatchNorm to inference behavior recursively through the model's child modules.
+            loaded.train(false)
+            guard let p = loaded.processor, let dir = loaded.modelDirectory else { throw SpeechToSpeechError.incompleteModel }
             progress("Loading audio decoder...")
             let decoder = try LFM2AudioDetokenizer.fromPretrained(modelPath: dir)
+            decoder.train(false)
             if let data = try? Data(contentsOf: dir.appendingPathComponent("audio_detokenizer/config.json")),
                let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                let n = json["n_fft"] as? Int, n > 0 { decoderTailSamples = n }
             model = loaded; processor = p; detokenizer = decoder; isLoaded = true
             LLMLoadFence.clear(); Self.setStage(nil)
-            progress("Loaded. \(Int(os_proc_available_memory()) / 1_000_000) MB free.")
+            progress("Loaded in inference mode. \(Int(os_proc_available_memory()) / 1_000_000) MB free.")
             try? await Task.sleep(for: .seconds(2))
         } catch { Self.setStage(nil); LLMLoadFence.clear(); throw error }
     }
@@ -147,11 +145,8 @@ final class SpeechToSpeechEngine: ObservableObject {
         await responseTask?.value
         guard ticket == session else { return }
         self.voiceId = voiceId; sharedAudioRef = sharedAudio
-        speakingCallback = onAgentSpeaking; statusCallback = onStatus
-        lastReplyStatus = ""
-        let (stream, continuation) = AsyncStream.makeStream(
-            of: AVAudioPCMBuffer.self, bufferingPolicy: .bufferingNewest(16)
-        )
+        speakingCallback = onAgentSpeaking; statusCallback = onStatus; lastReplyStatus = ""
+        let (stream, continuation) = AsyncStream.makeStream(of: AVAudioPCMBuffer.self, bufferingPolicy: .bufferingNewest(16))
         micContinuation = continuation
         sharedAudio.bridge.inputContinuation = continuation
         await sharedAudio.beginInputCapture()
@@ -160,7 +155,7 @@ final class SpeechToSpeechEngine: ObservableObject {
             sharedAudio.endInputCapture(); continuation.finish(); throw SpeechToSpeechError.micFailed(e)
         }
         Self.setStage("listening")
-        onStatus?("Listening. Persona prompt & status opens the editor and last stop reason.")
+        onStatus?("Listening. Persona prompt & status opens settings and input verification.")
         let gate = self.gate
         micTask = Task.detached(priority: .userInitiated) { [weak self] in
             let detector = MicTurnDetector()
@@ -171,7 +166,6 @@ final class SpeechToSpeechEngine: ObservableObject {
             var lastStatus = CFAbsoluteTimeGetCurrent()
             for await buffer in stream {
                 if Task.isCancelled { break }
-                // No automatic sound-triggered interruption in this diagnostic build.
                 if gate.active {
                     wasBusy = true; audio.removeAll(); preroll.removeAll(); inTurn = false
                     detector.resetUtterance(); continue
@@ -184,9 +178,7 @@ final class SpeechToSpeechEngine: ObservableObject {
                 if !inTurn {
                     preroll.append(samples)
                     if preroll.count > 6 { preroll.removeFirst() }
-                    if decision.feedAsr {
-                        inTurn = true; audio = preroll.flatMap { $0 }; preroll.removeAll()
-                    }
+                    if decision.feedAsr { inTurn = true; audio = preroll.flatMap { $0 }; preroll.removeAll() }
                 } else { audio.append(contentsOf: samples) }
                 if inTurn, decision.endTurn || audio.count >= 16_000 * 20 {
                     let turn = audio; audio = []; inTurn = false; detector.resetUtterance()
@@ -194,17 +186,14 @@ final class SpeechToSpeechEngine: ObservableObject {
                 }
                 let now = CFAbsoluteTimeGetCurrent()
                 if !gate.active, now - lastStatus > 0.3 {
-                    lastStatus = now
-                    await self?.showMicStatus(inTurn: inTurn, rms: rms, session: ticket)
+                    lastStatus = now; await self?.showMicStatus(inTurn: inTurn, rms: rms, session: ticket)
                 }
             }
         }
     }
 
     private func showMicStatus(inTurn: Bool, rms: Float, session ticket: Int) {
-        guard ticket == session, !gate.active else { return }
-        // A stop reason stays on screen until the next captured turn is submitted.
-        guard lastReplyStatus.isEmpty else { return }
+        guard ticket == session, !gate.active, lastReplyStatus.isEmpty else { return }
         statusCallback?(String(format: inTurn ? "Hearing you (mic %.3f)..." : "Listening (mic %.3f)...", rms))
     }
 
@@ -214,37 +203,86 @@ final class SpeechToSpeechEngine: ObservableObject {
         run?.cancel(); watchdog?.cancel(); watchdog = nil
         responseTask?.cancel(); micTask?.cancel(); micTask = nil
         micContinuation?.finish(); micContinuation = nil
-        sharedAudio.endInputCapture(); sharedAudio.stopPlayback()
-        gate.set(false); Self.setStage(nil)
+        sharedAudio.endInputCapture(); sharedAudio.stopPlayback(); gate.set(false); Self.setStage(nil)
     }
 
     private func submit(_ audio: [Float], session ticket: Int) {
-        guard session == ticket, !gate.active,
-              let model, let processor, let detokenizer, let sharedAudio = sharedAudioRef else { return }
+        guard session == ticket, !gate.active, let model, let processor, let detokenizer, let sharedAudio = sharedAudioRef else { return }
         run?.cancel(); responseTask?.cancel(); watchdog?.cancel()
         let previous = responseTask
         responseRevision += 1
         let revision = responseRevision
-        let token = SpeechRun(); run = token; gate.set(true)
-        lastReplyStatus = ""
+        let token = SpeechRun(); run = token; gate.set(true); lastReplyStatus = ""
+        let testInput = UserDefaults.standard.bool(forKey: PersonaConversationSettings.inputTestKey)
+        if testInput {
+            UserDefaults.standard.set(false, forKey: PersonaConversationSettings.inputTestKey)
+            UserDefaults.standard.set("Input test running. If it times out, see Last reply stop reason.", forKey: PersonaConversationSettings.inputResultKey)
+        }
         let female = voiceId.contains("F")
-        let saved = (UserDefaults.standard.string(forKey: PersonaConversationSettings.promptKey) ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let saved = (UserDefaults.standard.string(forKey: PersonaConversationSettings.promptKey) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let personality = saved.isEmpty ? PersonaConversationSettings.defaultPrompt : saved
         let system = "Respond with interleaved text and speech audio. Use a US \(female ? "female" : "male") voice. " + personality
         let tailGuard = decoderTailSamples
-        statusCallback?("Processing your speech...")
-        Self.setStage("generating reply")
+        statusCallback?(testInput ? "Transcribing captured input (no spoken reply for this test)..." : "Processing your speech...")
+        Self.setStage(testInput ? "input transcription test" : "generating reply")
         watchdog = Task { [weak self] in
             try? await Task.sleep(for: .seconds(30))
             guard !Task.isCancelled else { return }
-            self?.finishResponse(token, revision: revision, session: ticket, forced: true,
-                                 message: "Safety cutoff: 30-second response/playback deadline.")
+            self?.finishResponse(token, revision: revision, session: ticket, forced: true, message: "Safety cutoff: 30-second response/playback deadline.")
         }
         responseTask = Task.detached(priority: .userInitiated) { [weak self] in
             await previous?.value
             guard token.active, !Task.isCancelled else { return }
+            // Reassert before each isolated run; do not change mode concurrently with inference.
+            model.train(false); detokenizer.train(false)
             let started = CFAbsoluteTimeGetCurrent()
+
+            if testInput {
+                let testChat = ChatState(processor: processor)
+                testChat.newTurn(role: "system")
+                testChat.addText("You are a helpful assistant that transcribes audio."); testChat.endTurn()
+                testChat.newTurn(role: "user")
+                testChat.addAudio(MLXArray(audio), sampleRate: 16_000)
+                testChat.addText("Transcribe the audio."); testChat.endTurn()
+                testChat.newTurn(role: "assistant")
+                var words: [Int] = []
+                var generatedAudio = false
+                do {
+                    // The sequential API is synchronous during stream construction. This test
+                    // is deliberately text-only and bounded to 64 tokens on the worker task.
+                    let stream = model.generateSequential(
+                        textTokens: testChat.getTextTokens(), audioFeatures: testChat.getAudioFeatures(),
+                        modalities: testChat.getModalities(),
+                        config: LFMGenerationConfig(maxNewTokens: 64, temperature: 0, topK: 0,
+                                                    audioTemperature: 0, audioTopK: 1)
+                    )
+                    for try await (value, modality) in stream {
+                        guard token.active, !Task.isCancelled else { return }
+                        eval(value)
+                        if modality == .audioOut { generatedAudio = true; break }
+                        if modality == .text {
+                            let id = value.item(Int.self)
+                            if id == lfmImEndToken || id == lfmTextEndToken || id == lfmAudioStartToken { break }
+                            words.append(id)
+                        }
+                    }
+                    guard token.active, !Task.isCancelled else { return }
+                    let text = processor.decodeText(words).trimmingCharacters(in: .whitespacesAndNewlines)
+                    let rms = sqrt(audio.reduce(Float(0)) { $0 + $1 * $1 } / Float(max(1, audio.count)))
+                    var result = String(format: "Captured %.2f s at 16 kHz, RMS %.4f. Test %.1f s. Inference mode enabled.\nTranscript: ",
+                                        Double(audio.count) / 16_000, rms, CFAbsoluteTimeGetCurrent() - started)
+                    result += text.isEmpty ? "[empty]" : text
+                    if generatedAudio { result += "\nWarning: model attempted audio output during a transcription test." }
+                    if words.count >= 63 { result += "\nMay be truncated at the 64-token diagnostic limit." }
+                    await self?.completeInputTest(result, token: token, revision: revision, session: ticket)
+                } catch {
+                    await self?.completeInputTest(
+                        "Transcription test failed: \(error.localizedDescription)", token: token, revision: revision, session: ticket
+                    )
+                }
+                return
+            }
+
             let chat = ChatState(processor: processor)
             chat.newTurn(role: "system"); chat.addText(system); chat.endTurn()
             chat.newTurn(role: "user"); chat.addAudio(MLXArray(audio), sampleRate: 16_000); chat.endTurn()
@@ -257,8 +295,7 @@ final class SpeechToSpeechEngine: ObservableObject {
             var firstQueue: Double?
             var reason: String?
             var deliveredTokens = 0
-            let config = LFMGenerationConfig(maxNewTokens: 180, temperature: 0.7, topK: 50,
-                                             topP: 1, audioTemperature: 0.8, audioTopK: 4)
+            let config = LFMGenerationConfig(maxNewTokens: 180, temperature: 0.7, topK: 50, topP: 1, audioTemperature: 0.8, audioTopK: 4)
 
             func emit(final: Bool) {
                 guard token.active, !Task.isCancelled, !codes.isEmpty else { return }
@@ -283,8 +320,7 @@ final class SpeechToSpeechEngine: ObservableObject {
             }
 
             model.generateInterleavedInline(
-                textTokens: chat.getTextTokens(), audioFeatures: chat.getAudioFeatures(),
-                modalities: chat.getModalities(), config: config,
+                textTokens: chat.getTextTokens(), audioFeatures: chat.getAudioFeatures(), modalities: chat.getModalities(), config: config,
                 onToken: { value, modality in
                     guard token.active, !Task.isCancelled else { return false }
                     deliveredTokens += 1
@@ -316,15 +352,11 @@ final class SpeechToSpeechEngine: ObservableObject {
             let summary: String
             if let reason { summary = "Safety cutoff: " + reason + "." }
             else if emitted == 0 { summary = "Model generation ended without playable audio." }
-            else {
-                summary = String(format: "Model generation ended; %.1f s, first chunk queued %.1f s, %d audio frames.",
-                                 CFAbsoluteTimeGetCurrent() - started, firstQueue ?? -1, codes.count)
-            }
+            else { summary = String(format: "Model generation ended; %.1f s, first chunk queued %.1f s, %d audio frames.", CFAbsoluteTimeGetCurrent() - started, firstQueue ?? -1, codes.count) }
             await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in DispatchQueue.main.async { c.resume() } }
             guard token.active, !Task.isCancelled else { return }
             if reason != nil {
-                await self?.finishResponse(token, revision: revision, session: ticket, forced: true, message: summary)
-                return
+                await self?.finishResponse(token, revision: revision, session: ticket, forced: true, message: summary); return
             }
             await sharedAudio.waitForPlaybackCompletion()
             guard token.active, !Task.isCancelled else { return }
@@ -333,11 +365,16 @@ final class SpeechToSpeechEngine: ObservableObject {
         }
     }
 
+    private func completeInputTest(_ result: String, token: SpeechRun, revision: Int, session ticket: Int) {
+        guard session == ticket, responseRevision == revision, token.active else { return }
+        UserDefaults.standard.set(ISO8601DateFormatter().string(from: Date()) + "\n" + result, forKey: PersonaConversationSettings.inputResultKey)
+        finishResponse(token, revision: revision, session: ticket, forced: false, message: "Input verification completed. Open Persona prompt & status to read the transcript.")
+    }
+
     private func finishResponse(_ token: SpeechRun, revision: Int, session ticket: Int, forced: Bool, message: String) {
         guard session == ticket, responseRevision == revision, token.active else { return }
         token.cancel(); watchdog?.cancel(); watchdog = nil
         if forced { responseTask?.cancel(); sharedAudioRef?.stopPlayback() }
-        speakingCallback?(false); gate.set(false); Self.setStage("listening")
-        recordStop(message)
+        speakingCallback?(false); gate.set(false); Self.setStage("listening"); recordStop(message)
     }
 }
