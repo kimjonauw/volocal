@@ -1,8 +1,8 @@
 """Checked build-time source overlay. Run before XcodeGen.
 
-Qwen uses incremental waveform decoding and playback pacing. No RAM refusal
-thresholds. Existing Persona removal and engine-selection changes are preserved.
-Every source edit must match exactly once before any file is written.
+Qwen uses incremental waveform decoding and bounded one-clause lookahead.
+No RAM refusal thresholds. Existing Persona removal and engine-selection
+changes are preserved. Every edit must match once before any file is written.
 """
 from pathlib import Path
 
@@ -31,26 +31,29 @@ replace(manager, '        await stopAndWait()\n        pocketSmall = nil', '    
 replace(manager, '            case .supertonic3:\n                try await loadSupertonic()', '            case .qwen3Tts:\n                let backend = QwenConversationBackend()\n                try await withGPU { try await backend.load() }\n                qwen = backend\n            case .supertonic3:\n                try await loadSupertonic()')
 replace(manager, '        if let pocketSmall {\n            chunks = try await withGPU {', '''        if let qwen {
             for clause in QwenConversationBackend.clauses(text) {
-                await audio.waitForPlaybackCompletion()
                 try Task.checkCancellation()
                 guard generation == speakGeneration else { throw CancellationError() }
                 GenerationTrace.record("qwen.clause.begin")
                 do {
+                    // One generation may overlap playback, never another generation.
                     let samples = try await withGPU {
                         try await qwen.synthesize(clause, speaker: voice, whisper: whisper)
                     }
                     try Task.checkCancellation()
                     guard generation == speakGeneration else { throw CancellationError() }
+                    // Hold at most this prepared clause plus the prior playback.
+                    // Wait here, not before synthesis, so generation can hide behind speech.
+                    await audio.waitForPlaybackCompletion()
+                    try Task.checkCancellation()
+                    guard generation == speakGeneration else { throw CancellationError() }
+                    GenerationTrace.record("qwen.prior.playback.complete")
                     markFirstInferenceIfNeeded()
                     playbackPhase = .playing
                     GenerationTrace.record("qwen.playback.schedule", count: samples.count)
                     audio.scheduleTTSBuffer(samples)
                 }
                 chunks += 1
-                await audio.waitForPlaybackCompletion()
-                try Task.checkCancellation()
-                guard generation == speakGeneration else { throw CancellationError() }
-                GenerationTrace.record("qwen.playback.complete")
+                // Return/continue immediately so the next clause can prepare during playback.
             }
         } else if let pocketSmall {
             chunks = try await withGPU {''')
