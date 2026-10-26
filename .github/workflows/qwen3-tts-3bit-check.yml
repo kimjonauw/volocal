@@ -2,6 +2,12 @@ name: Qwen3-TTS 3-bit conversion check
 
 on:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish validated public weights as a new GitHub prerelease (not Actions artifacts)'
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -15,9 +21,12 @@ jobs:
     if: github.event.repository.private == false
     runs-on: macos-15
     timeout-minutes: 45
+    permissions:
+      contents: write
     env:
       HF_HUB_DISABLE_TELEMETRY: "1"
       DO_NOT_TRACK: "1"
+      EXPORT_MODEL: ${{ inputs.publish }}
     steps:
       - name: Verify standard Apple Silicon runner
         shell: bash
@@ -25,12 +34,14 @@ jobs:
           set -euo pipefail
           echo "HF_HOME=$RUNNER_TEMP/qwen-hf-cache" >> "$GITHUB_ENV"
           echo "QWEN_OUTPUT=$RUNNER_TEMP/qwen3-tts-1.7b-customvoice-3bit" >> "$GITHUB_ENV"
+          echo "QWEN_ASSETS=$RUNNER_TEMP/qwen-release-assets" >> "$GITHUB_ENV"
+          echo "MODEL_TAG=qwen3-tts-3bit-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
           test "$(uname -s)" = Darwin
           test "$(uname -m)" = arm64
           sw_vers
           sysctl hw.memsize
           df -h "$RUNNER_TEMP"
-          echo 'Manual conversion check only. No model uploads, Actions artifacts, caches, paid-runner fallback, or automatic retries.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Standard runner only. No Actions artifacts, persistent caches, paid-runner fallback, or automatic retries. Public release export requires the publish checkbox.' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -45,13 +56,15 @@ jobs:
         run: |
           set -euo pipefail
           python -u - <<'PY'
+          import hashlib
           import inspect
           import json
           import os
           import time
+          import urllib.request
           from pathlib import Path
           import mlx.core as mx
-          from huggingface_hub import snapshot_download
+          from huggingface_hub import HfApi, hf_hub_download, snapshot_download
           from mlx_audio.convert import convert
           from safetensors import safe_open
           from transformers import AutoTokenizer
@@ -104,8 +117,6 @@ jobs:
                   scales += sum(key.endswith('.scales') for key in handle.keys())
           if scales == 0:
               raise RuntimeError('No quantized scale tensors found in root weights.')
-
-          # Use only the downloaded source, with no remote tokenizer code or fallback repo.
           tokenizer = AutoTokenizer.from_pretrained(str(source_path), use_fast=True,
                                                    trust_remote_code=False, local_files_only=True)
           if not tokenizer.is_fast:
@@ -127,11 +138,68 @@ jobs:
           if not codec_weights:
               raise RuntimeError('Speech codec weights are missing from converted pack.')
           total = inventory('Validated pack', output)
-          summary(f'## Packaging checks passed\n- Quantization: 3-bit, group size 64\n- Quantized scale tensors: {scales}\n- Tokenizer export: token-ID parity passed for {len(probes)} probes\n- Final pack: {total / 1e9:.3f} GB ({total} bytes)\n- Swift compatibility, sound quality, and phone RAM are NOT verified.\n- No model upload or retention. Temporary weights are deleted at job end.\n- The app still uses the working 4-bit checkpoint.')
+          summary(f'## Packaging checks passed\n- Quantization: 3-bit, group size 64\n- Quantized scale tensors: {scales}\n- Tokenizer export: token-ID parity passed for {len(probes)} probes\n- Final pack before attribution files: {total / 1e9:.3f} GB ({total} bytes)\n- Swift compatibility, sound quality, and phone RAM are NOT verified.\n- The app still uses the working 4-bit checkpoint.')
+
+          if os.environ.get('EXPORT_MODEL') == 'true':
+              info = HfApi().model_info(source, revision=revision)
+              license_name = (info.card_data or {}).get('license')
+              if license_name != 'apache-2.0':
+                  raise RuntimeError(f'Unexpected source license {license_name!r}; refusing redistribution.')
+              card = Path(hf_hub_download(source, 'README.md', revision=revision))
+              (output / 'UPSTREAM_README.md').write_bytes(card.read_bytes())
+              with urllib.request.urlopen('https://www.apache.org/licenses/LICENSE-2.0.txt', timeout=30) as response:
+                  license_text = response.read()
+              if b'Apache License' not in license_text or b'Version 2.0' not in license_text:
+                  raise RuntimeError('Apache license download did not validate.')
+              (output / 'LICENSE').write_bytes(license_text)
+              (output / 'NOTICE.txt').write_text(
+                  'Qwen3-TTS by the Qwen Team, Alibaba.\n'
+                  f'Source: https://huggingface.co/{source}/tree/{revision}\n'
+                  'Derived checkpoint: affine 3-bit quantization, group size 64; '
+                  'fast tokenizer serialization exported from the source tokenizer.\n'
+                  'Experimental; no Swift, phone-memory, or sound-quality certification.\n')
+              assets = Path(os.environ['QWEN_ASSETS'])
+              assets.mkdir(parents=True, exist_ok=False)
+              manifest = dict(schema_version=1, source=source, source_revision=revision,
+                              bits=3, group_size=64, release_tag=os.environ['MODEL_TAG'], files=[])
+              names = set()
+              for path in sorted(output.rglob('*')):
+                  if not path.is_file():
+                      continue
+                  relative = path.relative_to(output).as_posix()
+                  asset = relative.replace('/', '__')
+                  if asset in names or asset == 'manifest.json':
+                      raise RuntimeError(f'Asset name collision: {asset}')
+                  names.add(asset)
+                  size = path.stat().st_size
+                  if size >= 2 * 1024**3:
+                      raise RuntimeError(f'Asset exceeds GitHub release limit: {relative}')
+                  digest = hashlib.sha256()
+                  with path.open('rb') as handle:
+                      for chunk in iter(lambda: handle.read(8 * 1024**2), b''):
+                          digest.update(chunk)
+                  manifest['files'].append(dict(path=relative, asset=asset, bytes=size, sha256=digest.hexdigest()))
+                  os.link(path, assets / asset)
+              (assets / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+              summary('## Release export prepared\nChecksums and file sizes recorded in manifest.json. Files will be published separately, each below 2 GiB; no Actions artifacts are used.')
+          else:
+              summary('Publish was not selected: no model uploads; temporary weights will be deleted.')
           PY
+      - name: Publish validated weights as a new prerelease
+        if: inputs.publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          NOTES="Experimental Qwen3-TTS 1.7B CustomVoice affine 3-bit, group size 64. Derived from mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16 at 52f4770fd9726457eae3d3b6aa92047a25a10776. Apache-2.0; upstream attribution and license included. Tokenizer packaging checks passed; Swift compatibility, phone RAM, and speech quality remain unverified. manifest.json maps flattened asset names to model paths and records SHA-256 checksums. This release does not replace the SideStore IPA or the app's working 4-bit model."
+          gh release create "$MODEL_TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft --prerelease --title "Qwen3-TTS 3-bit experimental ($GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT)" --notes "$NOTES"
+          gh release upload "$MODEL_TAG" "$QWEN_ASSETS"/* --repo "$GITHUB_REPOSITORY"
+          gh release edit "$MODEL_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease --latest=false
+          echo "Published model release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$MODEL_TAG" >> "$GITHUB_STEP_SUMMARY"
       - name: Remove temporary model files
         if: always()
         shell: bash
         run: |
-          rm -rf -- "$HF_HOME" "$QWEN_OUTPUT"
-          echo 'Temporary model cache and output removed. No artifact upload or app change was requested.' >> "$GITHUB_STEP_SUMMARY"
+          rm -rf -- "$HF_HOME" "$QWEN_OUTPUT" "$QWEN_ASSETS"
+          echo 'Temporary runner files removed. If publish was selected and completed, weights remain in the public GitHub Release; no Actions artifacts were uploaded.' >> "$GITHUB_STEP_SUMMARY"
