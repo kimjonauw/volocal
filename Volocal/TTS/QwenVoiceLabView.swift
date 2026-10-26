@@ -24,6 +24,12 @@ private enum QwenAuditionError: LocalizedError {
     }
 }
 
+private enum QwenLabSize: String, CaseIterable, Identifiable {
+    case large, small
+    var id: String { rawValue }
+    var label: String { self == .large ? "1.7B" : "0.6B (4-bit)" }
+}
+
 @MainActor
 private final class QwenVoiceLab: ObservableObject {
     @Published private(set) var busy = false
@@ -35,18 +41,21 @@ private final class QwenVoiceLab: ObservableObject {
     private var clip: Data?
     private var stopRequested = false
 
-    func audition(text: String, speaker: String, delivery: String, variant: QwenTrialVariant) {
+    func audition(text: String, speaker: String, delivery: String, variant: QwenTrialVariant, size: QwenLabSize) {
         guard !busy else { return }
         stopPlayback()
         let text = String(text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(160))
         let style = String(delivery.trimmingCharacters(in: .whitespacesAndNewlines).prefix(200))
         guard !text.isEmpty else { status = "Enter a short sentence first."; return }
         let voice = style.isEmpty ? speaker : speaker + ", " + style
+        let modelLabel = size == .small ? "0.6B 4-bit" : "1.7B " + variant.label
         busy = true; stopRequested = false; report = ""
-        status = "Preparing \(variant.label). Only public model files are downloaded; your text stays local."
+        status = "Preparing \(modelLabel). Only public model files are downloaded; your text stays local."
         let work = Task.detached(priority: .userInitiated) { [weak self] () throws -> QwenAudition in
             let source: String
-            if variant == .threeBit {
+            if size == .small {
+                source = "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit"
+            } else if variant == .threeBit {
                 source = try await QwenTrialPack.prepare { [weak self] message in await self?.updateStatus(message) }.path
             } else { source = "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit" }
             try Task.checkCancellation()
@@ -58,14 +67,14 @@ private final class QwenVoiceLab: ObservableObject {
             defer { _ = probe.stop(); Memory.clearCache(); Memory.cacheLimit = previousCacheLimit }
             let before = QwenMemoryProbe.footprint()
             let start = Date()
-            await self?.updateStatus("Loading \(variant.label)...")
+            await self?.updateStatus("Loading \(modelLabel)...")
             let loaded = try await TTS.loadModel(modelRepo: source, modelType: "qwen3_tts")
             try Task.checkCancellation()
             guard let model = loaded as? Qwen3TTSModel else { throw QwenAuditionError.model }
             model.train(false)
             let afterLoad = QwenMemoryProbe.footprint(); probe.sample()
             let loadSeconds = Date().timeIntervalSince(start)
-            await self?.updateStatus("Synthesizing \(variant.label), up to 128 codec frames. One short clip is buffered before playback.")
+            await self?.updateStatus("Synthesizing \(modelLabel), up to 128 codec frames. One short clip is buffered before playback.")
             let generationStart = Date()
             let audio = try await model.generate(
                 text: text, voice: voice, refAudio: nil, refText: nil, language: "English",
@@ -98,10 +107,10 @@ private final class QwenVoiceLab: ObservableObject {
                     self.clip = Self.wav(result.samples, sampleRate: result.sampleRate)
                     let duration = Double(result.samples.count) / Double(result.sampleRate)
                     self.report = String(format: "%@ · %@\nModel load %.1f s; synthesis %.1f s; audio %.1f s\nSynthesis/audio ratio %.2f\n%@\nApp footprint after worker returned + cache clear: %.0f MB\nDelivery: %@",
-                                         variant.label, speaker, result.loadSeconds, result.generationSeconds, duration,
+                                         modelLabel, speaker, result.loadSeconds, result.generationSeconds, duration,
                                          result.generationSeconds / duration, result.memory, Double(released) / 1e6, style.isEmpty ? "none" : style)
                     try self.playClip()
-                    self.status = "Preview playing at 20% player volume. Compare identical text, speaker, and delivery on the other model."
+                    self.status = "Preview playing at 20% player volume. Run neutral and warm/playful delivery on this model and judge whether the delivery audibly changes."
                 } else { self.status = "Stopped; generation has drained." }
             } catch {
                 guard let self else { return }
@@ -154,6 +163,7 @@ struct QwenVoiceLabView: View {
     let onClose: () -> Void
     @StateObject private var lab = QwenVoiceLab()
     @Environment(\.scenePhase) private var scenePhase
+    @State private var size: QwenLabSize = .small
     @State private var variant: QwenTrialVariant = .fourBit
     @State private var text = "Oh, you remembered that? That's actually really sweet."
     @State private var speaker = "Serena"
@@ -163,11 +173,15 @@ struct QwenVoiceLabView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("Qwen3-TTS 1.7B CustomVoice") {
-                    Picker("Model", selection: $variant) { ForEach(QwenTrialVariant.allCases) { Text($0.label).tag($0) } }.disabled(lab.busy || closing)
-                    Text("Standalone audition: the microphone and conversation models remain unloaded. Selecting 3-bit does not change your normal TTS engine.")
-                    Text("3-bit downloads about 2.13 GB from your pinned GitHub release and verifies SHA-256 checksums. 4-bit uses Hugging Face. Text and audio stay local. Files remain cached; models reload for each audition. No cloud inference.").font(.caption)
-                    Text("Compare the same text, speaker, and delivery. Copy each report before the next test; the panel shows only the latest result. Footprint readings of zero mean unavailable. Sampled peaks may miss brief spikes.").font(.caption)
+                Section("Qwen3-TTS CustomVoice") {
+                    Picker("Size", selection: $size) { ForEach(QwenLabSize.allCases) { Text($0.label).tag($0) } }.disabled(lab.busy || closing)
+                    if size == .large {
+                        Picker("1.7B build", selection: $variant) { ForEach(QwenTrialVariant.allCases) { Text($0.label).tag($0) } }.disabled(lab.busy || closing)
+                        Text("The earlier 3-bit build sounded garbled. Use 4-bit as the comparison baseline.").font(.caption)
+                    }
+                    Text("Standalone audition: the microphone and conversation models remain unloaded. This does not change your normal TTS engine.")
+                    Text("The 0.6B test is mainly about two questions: does neutral versus warm/playful delivery sound different, and how much app memory does it use? Public Hugging Face weights download on first use; text and audio stay local. Models reload for each audition.").font(.caption)
+                    Text("Copy each report before the next test. Footprint readings of zero mean unavailable. Sampled peaks may miss brief spikes.").font(.caption)
                 }
                 Section("Words to speak (160 characters)") {
                     TextEditor(text: $text).frame(minHeight: 70)
@@ -181,14 +195,14 @@ struct QwenVoiceLabView: View {
                     Button("Warm and playful") { delivery = "Warm, pleasantly surprised, and gently playful. Speak naturally without shouting." }
                 }.disabled(lab.busy || closing)
                 Section {
-                    Button(lab.busy ? "Working..." : "Generate and play preview") { lab.audition(text: text, speaker: speaker, delivery: delivery, variant: variant) }.disabled(lab.busy || closing)
+                    Button(lab.busy ? "Working..." : "Generate and play preview") { lab.audition(text: text, speaker: speaker, delivery: delivery, variant: variant, size: size) }.disabled(lab.busy || closing)
                     Button("Replay last preview") { lab.replay() }.disabled(lab.busy || closing)
                     Button("Stop", role: .destructive) { lab.stop() }
                 }
                 Section("Status and measurements") {
                     Text(lab.status).textSelection(.enabled)
                     if !lab.report.isEmpty { Text(lab.report).font(.caption.monospaced()).textSelection(.enabled) }
-                    Text("Keep volume low. The 128-frame cap may truncate longer text. Stop is cooperative; loading may not stop immediately. Successful packaging does not guarantee 3-bit quality or Swift compatibility.").font(.caption)
+                    Text("Keep volume low. The 128-frame cap may truncate longer text. Stop is cooperative; loading may not stop immediately.").font(.caption)
                 }
             }
             .navigationTitle("Qwen voice lab")
