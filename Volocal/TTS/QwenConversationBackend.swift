@@ -6,14 +6,20 @@ import MLXAudioCore
 
 /// Used only by modular TTS under the existing GPUExclusive mutex.
 actor QwenConversationBackend {
-    static let repo = "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit"
+    static let repo = "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit"
     private var model: Qwen3TTSModel?
     private static var directory: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("QwenConversation4bit", isDirectory: true)
+            .appendingPathComponent("QwenConversation06B4bit", isDirectory: true)
     }
     private static func failure(_ text: String) -> NSError {
         NSError(domain: "QwenConversation", code: 1, userInfo: [NSLocalizedDescriptionKey: text])
+    }
+    /// The earlier 1.7B build is no longer used by modular mode. Remove its app-owned cache.
+    private static func removeLegacyDownload() {
+        let legacy = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("QwenConversation4bit", isDirectory: true)
+        try? FileManager.default.removeItem(at: legacy)
     }
     static var isDownloaded: Bool {
         guard let data = try? Data(contentsOf: directory.appendingPathComponent("download-complete.json")),
@@ -28,6 +34,7 @@ actor QwenConversationBackend {
         }
     }
     static func prepareFiles() async throws {
+        removeLegacyDownload()
         if isDownloaded { return }
         let root = directory
         let fm = FileManager.default
@@ -67,9 +74,10 @@ actor QwenConversationBackend {
     func load() async throws {
         if model != nil { return }
         try await Self.prepareFiles()
+        // Conservative guesses until phone memory readings are available.
         let free = os_proc_available_memory()
-        guard free == 0 || free >= 3_000_000_000 else {
-            throw Self.failure("Not enough memory to load Qwen alongside this LLM. Choose a smaller LLM or switch back to PocketTTS.")
+        guard free == 0 || free >= 1_500_000_000 else {
+            throw Self.failure("Not enough memory to load Qwen 0.6B alongside this LLM. Choose a smaller LLM or switch back to PocketTTS.")
         }
         let path = Self.directory.path
         let task = Task.detached(priority: .userInitiated) { () throws -> Qwen3TTSModel in
@@ -89,6 +97,11 @@ actor QwenConversationBackend {
     func synthesize(_ text: String, speaker: String, whisper: Bool) async throws -> [Float] {
         try Task.checkCancellation()
         guard let model else { throw Self.failure("Qwen is not loaded.") }
+        // Refuse a clause rather than let iOS terminate the app. Threshold is a guess.
+        let free = os_proc_available_memory()
+        guard free == 0 || free >= 600_000_000 else {
+            throw Self.failure("Low memory (\(Int(free) / 1_000_000) MB free); skipped Qwen speech to avoid a crash.")
+        }
         let supported = ["Serena", "Vivian", "Ryan", "Aiden"]
         let voice = supported.contains(speaker) ? speaker : "Serena"
         let delivery = whisper ? "Speak softly in a gentle whisper without shouting." : "Warm and gently playful. Speak naturally and conversationally without shouting."
@@ -98,10 +111,10 @@ actor QwenConversationBackend {
             try Task.checkCancellation()
             let audio = try await model.generate(text: text, voice: voice + ", " + delivery,
                 refAudio: nil, refText: nil, language: "English",
-                generationParameters: GenerateParameters(maxTokens: 256, temperature: 0.8, topP: 1, repetitionPenalty: 1.1))
+                generationParameters: GenerateParameters(maxTokens: 192, temperature: 0.8, topP: 1, repetitionPenalty: 1.1))
             try Task.checkCancellation()
             let samples = audio.asType(.float32).asArray(Float.self)
-            guard !samples.isEmpty, samples.count <= 24_000 * 22, samples.allSatisfy({ $0.isFinite }) else {
+            guard !samples.isEmpty, samples.count <= 24_000 * 18, samples.allSatisfy({ $0.isFinite }) else {
                 throw Self.failure("Qwen returned invalid audio.")
             }
             let peak = samples.reduce(Float(0)) { max($0, abs($1)) }
@@ -115,7 +128,7 @@ actor QwenConversationBackend {
     nonisolated static func clauses(_ text: String) -> [String] {
         var result: [String] = []; var clause = ""
         for word in text.split(whereSeparator: { $0.isWhitespace }) {
-            if !clause.isEmpty, clause.count + word.count + 1 > 160 { result.append(clause); clause = "" }
+            if !clause.isEmpty, clause.count + word.count + 1 > 120 { result.append(clause); clause = "" }
             if !clause.isEmpty { clause += " " }
             clause += word
         }
