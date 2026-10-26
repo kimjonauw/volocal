@@ -19,8 +19,6 @@ concurrency:
 jobs:
   ipa:
     name: SideStore IPA
-    # speech-swift (PersonaPlex speech-to-speech) uses AVAudioSession.allowBluetoothHFP, which
-    # only exists in the iOS 26 SDK. macos-15 defaults to Xcode 16.4 and cannot compile it.
     runs-on: macos-26
     timeout-minutes: 90
     steps:
@@ -31,6 +29,9 @@ jobs:
         run: |
           xcodebuild -version
           xcode-select -p
+
+      - name: Apply guarded Qwen modular integration
+        run: python3 scripts/integrate-qwen-tts.py
 
       - name: Install XcodeGen
         run: brew install xcodegen
@@ -46,6 +47,8 @@ jobs:
         run: |
           NOTES="$(cat <<EOF
           Rolling SideStore build \`${GITHUB_SHA:0:7}\`.
+
+          Includes the guarded Qwen3-TTS 4-bit modular integration applied before XcodeGen. Choose Modular mode, then Qwen3-TTS 1.7B (4-bit) in the waveform voice-engine picker. Fixed warm/playful delivery; clause-buffered audio. PocketTTS remains available. Combined memory and interruption behavior need phone testing.
 
           Download **Volocal.ipa** from Assets (not Actions artifacts — those are always a zip).
 
