@@ -38,9 +38,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install --no-cache-dir mlx-audio huggingface-hub
+          python -m pip install --no-cache-dir mlx-audio huggingface-hub transformers tokenizers
           python -m pip freeze
-      - name: Convert original BF16 weights and inspect output
+      - name: Convert and validate tokenizer packaging
         shell: bash
         run: |
           set -euo pipefail
@@ -51,26 +51,42 @@ jobs:
           import time
           from pathlib import Path
           import mlx.core as mx
-          from huggingface_hub import HfApi
+          from huggingface_hub import snapshot_download
           from mlx_audio.convert import convert
           from safetensors import safe_open
+          from transformers import AutoTokenizer
+          from tokenizers import Tokenizer
+
+          def summary(text):
+              print(text, flush=True)
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as handle:
+                  handle.write(text + '\n')
+
+          def inventory(label, directory):
+              paths = sorted(p for p in directory.rglob('*') if p.is_file())
+              print(f'--- {label} ---', flush=True)
+              for path in paths:
+                  print(f'{path.relative_to(directory)}: {path.stat().st_size} bytes', flush=True)
+              return sum(p.stat().st_size for p in paths)
 
           source = 'mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16'
+          revision = '52f4770fd9726457eae3d3b6aa92047a25a10776'
           output = Path(os.environ['QWEN_OUTPUT'])
-          revision = HfApi().model_info(source).sha
           required = {'hf_path', 'mlx_path', 'quantize', 'q_bits', 'q_group_size', 'revision'}
           if not required.issubset(inspect.signature(convert).parameters):
               raise RuntimeError('Installed converter API differs; refusing to guess arguments.')
-          # Hosted macOS virtualization may not expose Metal. This is a CPU
-          # weight-conversion test, not a GPU speech-speed benchmark.
           mx.set_default_device(mx.cpu)
           start = time.monotonic()
-          print(f'Source: {source}@{revision}', flush=True)
+          summary(f'## Source\n`{source}@{revision}`')
           kwargs = dict(hf_path=source, mlx_path=str(output), quantize=True,
                         q_bits=3, q_group_size=64, revision=revision)
           if 'model_domain' in inspect.signature(convert).parameters:
               kwargs['model_domain'] = 'tts'
           convert(**kwargs)
+          total = inventory('Converted pack before packaging', output)
+          summary(f'## Weight conversion returned\nPack before tokenizer packaging: {total / 1e9:.3f} GB ({total} bytes).\nDownload + conversion: {time.monotonic() - start:.1f} seconds.\nPackaging validation is not complete yet.')
+          source_path = Path(snapshot_download(source, revision=revision, local_files_only=True))
+          inventory('Pinned source files', source_path)
           config = json.loads((output / 'config.json').read_text())
           quant = config.get('quantization') or config.get('quantization_config') or {}
           if quant.get('bits') != 3:
@@ -83,26 +99,30 @@ jobs:
                   scales += sum(key.endswith('.scales') for key in handle.keys())
           if scales == 0:
               raise RuntimeError('No quantized scale tensors found in root weights.')
+
+          # Use only the downloaded source, with no remote tokenizer code or fallback repo.
+          tokenizer = AutoTokenizer.from_pretrained(str(source_path), use_fast=True,
+                                                   trust_remote_code=False, local_files_only=True)
+          if not tokenizer.is_fast:
+              raise RuntimeError('Source did not produce a fast tokenizer; refusing an unverified export.')
           if not (output / 'tokenizer.json').is_file():
-              raise RuntimeError('Text tokenizer is missing from converted pack.')
+              tokenizer.save_pretrained(str(output))
+              summary('Exported tokenizer.json and its companion files from the pinned source tokenizer.')
+          if not (output / 'tokenizer.json').is_file():
+              raise RuntimeError('Source tokenizer export did not produce tokenizer.json.')
+          exported = Tokenizer.from_file(str(output / 'tokenizer.json'))
+          probes = ['Hello, how are you?', 'Warm and playful.',
+                    '<|im_start|>assistant\nHello.<|im_end|>', 'It\'s 3.1 seconds.']
+          for probe in probes:
+              expected = tokenizer.encode(probe, add_special_tokens=False)
+              actual = exported.encode(probe, add_special_tokens=False).ids
+              if expected != actual:
+                  raise RuntimeError(f'Token IDs changed during export for {probe!r}.')
           codec_weights = list((output / 'speech_tokenizer').rglob('*.safetensors'))
           if not codec_weights:
               raise RuntimeError('Speech codec weights are missing from converted pack.')
-          total = sum(p.stat().st_size for p in output.rglob('*') if p.is_file())
-          seconds = time.monotonic() - start
-          report = (f'## Conversion completed\n'
-                    f'- Source: `{source}`\n'
-                    f'- Source revision: `{revision}`\n'
-                    f'- Quantization: 3-bit, group size 64\n'
-                    f'- Quantized scale tensors: {scales}\n'
-                    f'- Output pack: {total / 1e9:.3f} GB ({total} bytes)\n'
-                    f'- Download + conversion: {seconds:.1f} seconds\n'
-                    '- Structural checks only: Swift compatibility, sound quality, and phone RAM are NOT verified.\n'
-                    '- No weights were uploaded or retained. The temporary output is deleted at job end.\n'
-                    '- The app still uses its working 4-bit checkpoint.\n')
-          print(report, flush=True)
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as handle:
-              handle.write(report)
+          total = inventory('Validated pack', output)
+          summary(f'## Packaging checks passed\n- Quantization: 3-bit, group size 64\n- Quantized scale tensors: {scales}\n- Tokenizer export: token-ID parity passed for {len(probes)} probes\n- Final pack: {total / 1e9:.3f} GB ({total} bytes)\n- Swift compatibility, sound quality, and phone RAM are NOT verified.\n- No model upload or retention. Temporary weights are deleted at job end.\n- The app still uses the working 4-bit checkpoint.')
           PY
       - name: Remove temporary model files
         if: always()
