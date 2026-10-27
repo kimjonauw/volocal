@@ -99,15 +99,25 @@ final class SentenceBuffer {
     /// Emits on a natural major clause boundary (semicolon, colon, em-dash,
     /// or a substantive comma clause of 8+ words) so speech starts without
     /// waiting for long run-on sentences, while avoiding mid-phrase crumbs.
+    /// Silent [delivery=...] metadata is skipped so its words are not counted as speech.
     private func earlyClauseEnd() -> String.Index? {
         guard !hasIncompleteExpression(buffer) else { return nil }
         var words = 0
         var inWord = false
-        for i in buffer.indices {
+        var i = buffer.startIndex
+        while i < buffer.endIndex {
+            if buffer[i] == "[",
+               buffer[i...].lowercased().hasPrefix("[delivery"),
+               let close = buffer[i...].firstIndex(of: "]") {
+                i = buffer.index(after: close)
+                inWord = false
+                continue
+            }
             if isInsideExpression(at: i) { return nil }
             let ch = buffer[i]
             if ch.isWhitespace {
                 inWord = false
+                i = buffer.index(after: i)
                 continue
             }
             if !inWord {
@@ -136,6 +146,7 @@ final class SentenceBuffer {
                     return next
                 }
             }
+            i = buffer.index(after: i)
         }
         return nil
     }

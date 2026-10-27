@@ -52,6 +52,9 @@ enum MLXRuntime {
             throw MLXRuntimeError.emptyPrompt
         }
         let input = try await container.prepare(input: UserInput(chat: messages))
+        // MLX's global random state can repeat across launches, which makes sampled
+        // replies identical. Reseed for every request so the same prompt can vary.
+        MLXRandom.seed(UInt64.random(in: UInt64.min ... UInt64.max))
         let parameters = GenerateParameters(
             maxTokens: 320,
             temperature: 0.7,

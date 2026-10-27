@@ -48,11 +48,11 @@ jobs:
           NOTES="$(cat <<EOF
           Rolling SideStore build \`${GITHUB_SHA:0:7}\`.
 
-          Persona speech-to-speech mode is removed. The app is modular only. Includes the guarded Qwen3-TTS 0.6B (4-bit) integration applied before XcodeGen: open the waveform voice-engine picker and choose Qwen3-TTS 0.6B (4-bit). Fixed warm/playful delivery; clause-buffered audio; low-memory guards skip a clause instead of crashing. PocketTTS remains available.
+          Modular voice pipeline only (Persona mode is removed). Qwen3-TTS CustomVoice is available in the voice-engine picker as 0.6B (4-bit) and 1.7B (4-bit, experimental). Audio uses incremental decoding with one-clause lookahead. With expressions on, the LLM adds per-sentence delivery tags and short directions that are passed to Qwen. There are no memory-based refusal guards. PocketTTS and Supertonic remain available.
 
           Download **Volocal.ipa** from Assets (not Actions artifacts — those are always a zip).
 
-          Install with **SideStore in a real app slot**. LiveContainer guests crash on launch or have broken mic/AEC on iOS 26. If you still try LiveContainer, use **3.6.65+** (required on iOS 26.4+).
+          Install with **SideStore in a real app slot** when you can. LiveContainer also runs it, but guests can have mic/AEC problems on iOS 26. If you use LiveContainer, use **3.6.65+** (required on iOS 26.4+).
 
           This tag is overwritten on every successful build so broken IPAs do not pile up.
           EOF

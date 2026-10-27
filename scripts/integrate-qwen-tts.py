@@ -2,6 +2,7 @@
 
 Both CustomVoice sizes use incremental decoding and bounded clause lookahead.
 Dynamic delivery tags are passed to both; 0.6B instruction following is experimental.
+The 1.7B backend reuses the older QwenConversation4bit cache folder.
 No RAM refusal thresholds. All edits must match before files are written.
 """
 from pathlib import Path
@@ -93,7 +94,7 @@ large_backend = read(backend)
 for old, new in [
     ('actor QwenConversationBackend {', 'actor QwenConversationBackend17B {'),
     ('mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit', 'mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit'),
-    ('"QwenConversation06B4bit"', '"QwenConversation17B4bit"'),
+    ('"QwenConversation06B4bit"', '"QwenConversation4bit"'),
 ]:
     if large_backend.count(old) != 1:
         raise RuntimeError(f'1.7B backend anchor changed: {old}')

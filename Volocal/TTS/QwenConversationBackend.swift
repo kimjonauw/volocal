@@ -115,14 +115,36 @@ actor QwenConversationBackend {
         // Do not release GPUExclusive until the cancelled worker has actually returned.
         return try await withTaskCancellationHandler(operation: { try await task.value }, onCancel: { task.cancel() })
     }
+    /// Split at the last phrase boundary before the length limit so intonation is not
+    /// reset mid-phrase; fall back to a word boundary when there is no punctuation.
     nonisolated static func clauses(_ text: String) -> [String] {
-        var result: [String] = []; var clause = ""
+        let limit = 140
+        let breaks: Set<Character> = [".", ",", ";", ":", "!", "?", "—"]
+        var result: [String] = []
+        var clause = ""
         for word in text.split(whereSeparator: { $0.isWhitespace }) {
-            if !clause.isEmpty, clause.count + word.count + 1 > 120 { result.append(clause); clause = "" }
+            if !clause.isEmpty, clause.count + word.count + 1 > limit {
+                let minCut = clause.count * 2 / 5
+                var cut: String.Index?
+                var offset = 0
+                for index in clause.indices {
+                    offset += 1
+                    if breaks.contains(clause[index]), offset >= minCut {
+                        cut = clause.index(after: index)
+                    }
+                }
+                if let cut, cut < clause.endIndex {
+                    result.append(String(clause[..<cut]).trimmingCharacters(in: .whitespaces))
+                    clause = String(clause[cut...]).trimmingCharacters(in: .whitespaces)
+                } else {
+                    result.append(clause)
+                    clause = ""
+                }
+            }
             if !clause.isEmpty { clause += " " }
             clause += word
         }
         if !clause.isEmpty { result.append(clause) }
-        return result
+        return result.filter { !$0.isEmpty }
     }
 }

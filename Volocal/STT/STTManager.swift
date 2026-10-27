@@ -99,6 +99,18 @@ final class STTManager: ObservableObject {
         isStarting = true
         error = nil
 
+        // Reset recognition state BEFORE any mic audio can reach the processing task.
+        // Resetting afterwards could wipe the first words of the very first utterance.
+        transcript = ""
+        partialResult = ""
+        lastHypothesis = ""
+        hasFiredSpeechDetected = false
+        lastEmittedNormalized = ""
+        eagerEndpoint = false
+        asrPaused = false
+        asrPauseDepth = 0
+        turnDetector.resetUtterance()
+
         let (stream, continuation) = AsyncStream.makeStream(
             of: AVAudioPCMBuffer.self,
             bufferingPolicy: .bufferingNewest(8)
@@ -109,6 +121,16 @@ final class STTManager: ObservableObject {
         let nemotron = nemotronManager
         let detector = turnDetector
         processingTask = Task.detached(priority: .userInitiated) { [weak self] in
+            // Keep a short run of quiet buffers so the first syllable survives the energy gate.
+            var preRoll: [AVAudioPCMBuffer] = []
+            let preRollLimit = 4
+            let feed: (AVAudioPCMBuffer) async throws -> Void = { audio in
+                if let eou {
+                    _ = try await eou.process(audioBuffer: audio)
+                } else if let nemotron {
+                    _ = try await nemotron.process(audioBuffer: audio)
+                }
+            }
             for await buffer in stream {
                 guard !Task.isCancelled else { break }
                 let rms = SharedAudioEngine.rmsEnergy(buffer)
@@ -121,6 +143,8 @@ final class STTManager: ObservableObject {
                     (self?.asrPaused == true, self?.bargeInWhilePaused == true)
                 }
                 if gate.paused {
+                    // Do not replay audio captured while TTS was speaking.
+                    preRoll.removeAll()
                     if gate.barge, rms >= 0.05 {
                         await self?.considerPausedBargeIn()
                     } else {
@@ -128,13 +152,18 @@ final class STTManager: ObservableObject {
                     }
                     continue
                 }
-                guard decision.feedAsr else { continue }
+                guard decision.feedAsr else {
+                    preRoll.append(buffer)
+                    if preRoll.count > preRollLimit { preRoll.removeFirst() }
+                    continue
+                }
                 do {
-                    if let eou {
-                        _ = try await eou.process(audioBuffer: buffer)
-                    } else if let nemotron {
-                        _ = try await nemotron.process(audioBuffer: buffer)
+                    if !preRoll.isEmpty {
+                        let earlier = preRoll
+                        preRoll.removeAll()
+                        for pending in earlier { try await feed(pending) }
                     }
+                    try await feed(buffer)
                 } catch {
                     await self?.reportSTTError(error)
                 }
@@ -154,15 +183,6 @@ final class STTManager: ObservableObject {
         }
 
         isListening = true
-        transcript = ""
-        partialResult = ""
-        lastHypothesis = ""
-        hasFiredSpeechDetected = false
-        lastEmittedNormalized = ""
-        eagerEndpoint = false
-        asrPaused = false
-        asrPauseDepth = 0
-        turnDetector.resetUtterance()
         logger.info("STT listening started (\(self.engine.displayName))")
     }
 
