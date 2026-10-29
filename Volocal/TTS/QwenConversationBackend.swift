@@ -92,7 +92,7 @@ actor QwenConversationBackend {
     func synthesize(_ text: String, speaker: String, whisper: Bool) async throws -> [Float] {
         try Task.checkCancellation()
         guard let model else { throw Self.failure("Qwen is not loaded.") }
-        let supported = ["Serena", "Vivian", "Ryan", "Aiden"]
+        let supported = ["Serena", "Vivian", "Uncle_Fu", "Dylan", "Eric", "Ryan", "Aiden", "Ono_Anna", "Sohee"]
         let voice = supported.contains(speaker) ? speaker : "Serena"
         let delivery = whisper ? "Speak softly in a gentle whisper without shouting." : "Warm and gently playful. Speak naturally and conversationally without shouting."
         let task = Task.detached(priority: .userInitiated) { () throws -> [Float] in
